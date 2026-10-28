@@ -1,0 +1,417 @@
+// cc_diff_ipc.ailang — file diff IPC tool for HalCode9000.
+//
+// Socket: @halcode/Diff
+// Schema: file1 (required), file2 (required)
+// Returns: unified-style diff (--- +++ header, then - / + / space lines).
+//          Sequential line-by-line comparison — no LCS, O(n) with no memory blowup.
+//          Outputs "Files are identical" when there are no differences.
+//
+// File limits: 128KB per file, 4000 lines per file. Output capped at 64KB.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCDiffSys {
+    "SYS_READ":   Initialize=0
+    "SYS_OPEN":   Initialize=2
+    "SYS_CLOSE":  Initialize=3
+    "SYS_MKDIR":  Initialize=83
+    "SYS_UNLINK": Initialize=87
+}
+
+FixedPool.CCDiffConst {
+    "SOCK_PATH":    Initialize="@halcode/Diff", CanChange=True
+    "BACKLOG":      Initialize=8
+    "RESULT_CAP":   Initialize=65536
+    "FILE_BUF_SIZE":Initialize=131072
+    "MAX_LINES":    Initialize=4000
+}
+
+FixedPool.CCDiffState {
+    "schema":       Initialize=0,  CanChange=True
+    "listen_fd":    Initialize=-1, CanChange=True
+    "running":      Initialize=1,  CanChange=True
+    "result_buf":   Initialize=0,  CanChange=True
+    "result_pos":   Initialize=0,  CanChange=True
+    "truncated":    Initialize=0,  CanChange=True
+    "file1_buf":    Initialize=0,  CanChange=True
+    "file2_buf":    Initialize=0,  CanChange=True
+    "lines1":       Initialize=0,  CanChange=True
+    "lines2":       Initialize=0,  CanChange=True
+}
+
+// =============================================================================
+// OUTPUT HELPERS
+// =============================================================================
+
+Function.CCDiff_AppendStr {
+    Input: s: Address
+    Body: {
+        len = StringLength(s)
+        space = Subtract(CCDiffConst.RESULT_CAP, CCDiffState.result_pos)
+        IfCondition LessEqual(space, 0) ThenBlock: {
+            CCDiffState.truncated = 1
+        } ElseBlock: {
+            copy = len
+            IfCondition GreaterThan(copy, space) ThenBlock: { copy = space  CCDiffState.truncated = 1 }
+            MemoryCopy(Add(CCDiffState.result_buf, CCDiffState.result_pos), s, copy)
+            CCDiffState.result_pos = Add(CCDiffState.result_pos, copy)
+        }
+    }
+}
+
+Function.CCDiff_AppendByte {
+    Input: b: Integer
+    Body: {
+        IfCondition LessThan(CCDiffState.result_pos, CCDiffConst.RESULT_CAP) ThenBlock: {
+            SetByte(CCDiffState.result_buf, CCDiffState.result_pos, b)
+            CCDiffState.result_pos = Add(CCDiffState.result_pos, 1)
+        } ElseBlock: {
+            CCDiffState.truncated = 1
+        }
+    }
+}
+
+// =============================================================================
+// FILE READER
+// =============================================================================
+
+// Read file at path into file_buf (CCDiffConst.FILE_BUF_SIZE bytes max).
+// Replace each \n with \0 and store line-start pointers into line_arr.
+// Write line count to *count_ptr (8 bytes at address).
+// Returns bytes_read on success, -1 on open failure.
+Function.CCDiff_ReadLines {
+    Input: path: Address
+    Input: file_buf: Address
+    Input: line_arr: Address
+    Input: count_ptr: Address
+    Output: Integer
+    Body: {
+        StoreValue(count_ptr, 0)
+        fd = SystemCall(CCDiffSys.SYS_OPEN, path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(-1) }
+
+        total = 0
+        cap = CCDiffConst.FILE_BUF_SIZE
+        WhileLoop LessThan(total, cap) {
+            remain = Subtract(cap, total)
+            n = SystemCall(CCDiffSys.SYS_READ, fd, Add(file_buf, total), remain)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            total = Add(total, n)
+        }
+        SystemCall(CCDiffSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        // Null-terminate raw buffer
+        end_pos = total
+        IfCondition GreaterEqual(end_pos, cap) ThenBlock: { end_pos = Subtract(cap, 1) }
+        SetByte(file_buf, end_pos, 0)
+
+        // Scan: replace \n with \0, store line pointers
+        line_count = 0
+        max_lines = CCDiffConst.MAX_LINES
+        i = 0
+        line_start = file_buf
+        WhileLoop LessThan(i, total) {
+            ch = GetByte(file_buf, i)
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                SetByte(file_buf, i, 0)
+                IfCondition LessThan(line_count, max_lines) ThenBlock: {
+                    StoreValue(Add(line_arr, Multiply(line_count, 8)), line_start)
+                    line_count = Add(line_count, 1)
+                }
+                line_start = Add(file_buf, Add(i, 1))
+            }
+            i = Add(i, 1)
+        }
+        // Last line without trailing newline
+        last_len = Subtract(Add(file_buf, total), line_start)
+        IfCondition And(GreaterThan(last_len, 0), LessThan(line_count, max_lines)) ThenBlock: {
+            StoreValue(Add(line_arr, Multiply(line_count, 8)), line_start)
+            line_count = Add(line_count, 1)
+        }
+
+        StoreValue(count_ptr, line_count)
+        ReturnValue(total)
+    }
+}
+
+// =============================================================================
+// DIFF ENGINE
+// =============================================================================
+
+// Compare line1 and line2 returning 1 if equal, 0 if different.
+// Handles null pointers safely (null == null, null != non-null).
+Function.CCDiff_LinesEqual {
+    Input: l1: Address
+    Input: l2: Address
+    Output: Integer
+    Body: {
+        IfCondition And(EqualTo(l1, 0), EqualTo(l2, 0)) ThenBlock: { ReturnValue(1) }
+        IfCondition Or(EqualTo(l1, 0), EqualTo(l2, 0))  ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(l1, l2), 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// Run diff: fill result_buf. Returns 0 ok, -1 file1 error, -2 file2 error.
+Function.CCDiff_Compare {
+    Input: file1: Address
+    Input: file2: Address
+    Output: Integer
+    Body: {
+        CCDiffState.result_pos = 0
+        CCDiffState.truncated  = 0
+
+        c1_ptr = Allocate(8)
+        c2_ptr = Allocate(8)
+        StoreValue(c1_ptr, 0)
+        StoreValue(c2_ptr, 0)
+
+        r1 = CCDiff_ReadLines(file1, CCDiffState.file1_buf, CCDiffState.lines1, c1_ptr)
+        IfCondition LessThan(r1, 0) ThenBlock: {
+            Deallocate(c1_ptr, 8)  Deallocate(c2_ptr, 8)
+            ReturnValue(-1)
+        }
+        r2 = CCDiff_ReadLines(file2, CCDiffState.file2_buf, CCDiffState.lines2, c2_ptr)
+        IfCondition LessThan(r2, 0) ThenBlock: {
+            Deallocate(c1_ptr, 8)  Deallocate(c2_ptr, 8)
+            ReturnValue(-2)
+        }
+
+        count1 = Dereference(c1_ptr)
+        count2 = Dereference(c2_ptr)
+        Deallocate(c1_ptr, 8)
+        Deallocate(c2_ptr, 8)
+
+        // Quick identical check
+        same = 0
+        IfCondition EqualTo(count1, count2) ThenBlock: {
+            same = 1
+            k = 0
+            WhileLoop LessThan(k, count1) {
+                l1 = Dereference(Add(CCDiffState.lines1, Multiply(k, 8)))
+                l2 = Dereference(Add(CCDiffState.lines2, Multiply(k, 8)))
+                IfCondition EqualTo(CCDiff_LinesEqual(l1, l2), 0) ThenBlock: {
+                    same = 0
+                    BreakLoop
+                }
+                k = Add(k, 1)
+            }
+        }
+        IfCondition EqualTo(same, 1) ThenBlock: {
+            CCDiff_AppendStr("Files are identical\n")
+            SetByte(CCDiffState.result_buf, CCDiffState.result_pos, 0)
+            ReturnValue(0)
+        }
+
+        // Header
+        CCDiff_AppendStr("--- ")  CCDiff_AppendStr(file1)  CCDiff_AppendByte(10)
+        CCDiff_AppendStr("+++ ")  CCDiff_AppendStr(file2)  CCDiff_AppendByte(10)
+
+        // Sequential line-by-line comparison
+        i = 0
+        j = 0
+        WhileLoop Or(LessThan(i, count1), LessThan(j, count2)) {
+            IfCondition EqualTo(CCDiffState.truncated, 1) ThenBlock: { BreakLoop }
+            IfCondition And(LessThan(i, count1), LessThan(j, count2)) ThenBlock: {
+                l1 = Dereference(Add(CCDiffState.lines1, Multiply(i, 8)))
+                l2 = Dereference(Add(CCDiffState.lines2, Multiply(j, 8)))
+                IfCondition EqualTo(CCDiff_LinesEqual(l1, l2), 1) ThenBlock: {
+                    CCDiff_AppendStr(" ")
+                    CCDiff_AppendStr(l1)
+                    CCDiff_AppendByte(10)
+                } ElseBlock: {
+                    CCDiff_AppendStr("-")
+                    CCDiff_AppendStr(l1)
+                    CCDiff_AppendByte(10)
+                    CCDiff_AppendStr("+")
+                    CCDiff_AppendStr(l2)
+                    CCDiff_AppendByte(10)
+                }
+                i = Add(i, 1)
+                j = Add(j, 1)
+            } ElseBlock: {
+                IfCondition LessThan(i, count1) ThenBlock: {
+                    l1 = Dereference(Add(CCDiffState.lines1, Multiply(i, 8)))
+                    CCDiff_AppendStr("-")
+                    CCDiff_AppendStr(l1)
+                    CCDiff_AppendByte(10)
+                    i = Add(i, 1)
+                } ElseBlock: {
+                    l2 = Dereference(Add(CCDiffState.lines2, Multiply(j, 8)))
+                    CCDiff_AppendStr("+")
+                    CCDiff_AppendStr(l2)
+                    CCDiff_AppendByte(10)
+                    j = Add(j, 1)
+                }
+            }
+        }
+
+        SetByte(CCDiffState.result_buf, CCDiffState.result_pos, 0)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// IPC LAYER
+// =============================================================================
+
+Function.CCDiff_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Diff", "Compare two files line by line (sequential diff, unified-style output)")
+        UtilArgs_AddField(s, "file1", "path", 1, "First file (shown with --- lines)", "file1")
+        UtilArgs_AddField(s, "file2", "path", 1, "Second file (shown with +++ lines)", "file2")
+        ReturnValue(s)
+    }
+}
+
+Function.CCDiff_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCDiff_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: truncated: Integer
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", CCDiffState.result_buf)
+        IfCondition EqualTo(truncated, 1) ThenBlock: { JSON.SetBool(resp, "truncated", 1) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCDiff_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCDiffState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCDiff_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCDiff_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCDiff_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCDiff_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCDiff_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id   = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCDiffState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCDiff_SendError(client_fd, id, "missing required arguments: file1, file2")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            file1 = UtilArgs_GetString(validated, "file1")
+            file2 = UtilArgs_GetString(validated, "file2")
+            IfCondition Or(EqualTo(file1, 0), EqualTo(file2, 0)) ThenBlock: {
+                CCDiff_SendError(client_fd, id, "file1 and file2 are required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            rc = CCDiff_Compare(file1, file2)
+            IfCondition EqualTo(rc, -1) ThenBlock: {
+                err = StringConcat("cannot open file1: ", file1)
+                CCDiff_SendError(client_fd, id, err)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(rc, -2) ThenBlock: {
+                err = StringConcat("cannot open file2: ", file2)
+                CCDiff_SendError(client_fd, id, err)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            CCDiff_SendResult(client_fd, id, CCDiffState.truncated)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCDiff_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+SubRoutine.Main {
+    CCDiffConst.SOCK_PATH   = "@halcode/Diff"
+    CCDiffState.schema      = CCDiff_BuildSchema()
+    CCDiffState.result_buf  = Allocate(Add(CCDiffConst.RESULT_CAP, 1))
+    CCDiffState.file1_buf   = Allocate(CCDiffConst.FILE_BUF_SIZE)
+    CCDiffState.file2_buf   = Allocate(CCDiffConst.FILE_BUF_SIZE)
+    lines1_size = Multiply(CCDiffConst.MAX_LINES, 8)
+    lines2_size = Multiply(CCDiffConst.MAX_LINES, 8)
+    CCDiffState.lines1      = Allocate(lines1_size)
+    CCDiffState.lines2      = Allocate(lines2_size)
+
+    SystemCall(CCDiffSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCDiffSys.SYS_UNLINK, CCDiffConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_diff_ipc] socket create failed\n")
+        Exit(1)
+    }
+    Socket.BindUnix(fd, CCDiffConst.SOCK_PATH)
+    Socket.Listen(fd, CCDiffConst.BACKLOG)
+    CCDiffState.listen_fd = fd
+    PrintMessage("[cc_diff_ipc] listening on @halcode/Diff\n")
+
+    WhileLoop EqualTo(CCDiffState.running, 1) {
+        client_fd = Socket.Accept(CCDiffState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCDiff_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCDiffState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

@@ -1,0 +1,101 @@
+{
+  "name": "Google",
+  "backend": "gemini",
+  "base_url": "https://generativelanguage.googleapis.com",
+  "api_path": "/v1beta/openai/chat/completions",
+  "models_endpoint": "/v1beta/models",
+  "auth": "bearer",
+  "key_env": "GEMINI_API_KEY",
+  "key_hint": "gemini",
+  "tier": 1,
+  "models": [
+    {
+      "id": "gemini-3.8-flash",
+      "display": "Gemini 3.8 Flash"
+    },
+    {
+      "id": "gemini-flash-latest",
+      "display": "Gemini Flash Latest"
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "display": "Gemini 3.7 Flash"
+    },
+    {
+      "id": "gemini-flash-lite-latest",
+      "display": "Gemini Flash-Lite Latest"
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "display": "Gemini 3.6 Flash"
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "display": "Gemini 3.5 Flash Lite"
+    },
+    {
+      "id": "gemini-3.5-live-translate-preview",
+      "display": "Gemini 3.5 Live Translate Preview"
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "display": "Gemini 3.5 Flash"
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "display": "Gemini 3.1 Flash Lite"
+    },
+    {
+      "id": "deep-research-preview-04-2026",
+      "display": "Deep Research Preview (Apr-21-2026)"
+    },
+    {
+      "id": "deep-research-max-preview-04-2026",
+      "display": "Deep Research Max Preview (Apr-21-2026)"
+    },
+    {
+      "id": "gemma-4-31b-it",
+      "display": "Gemma 4 31B IT"
+    },
+    {
+      "id": "gemma-4-26b-a4b-it",
+      "display": "Gemma 4 26B A4B IT"
+    },
+    {
+      "id": "gemini-3.1-flash-live-preview",
+      "display": "Gemini 3.1 Flash Live Preview"
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "display": "Gemini 3.1 Pro Preview"
+    },
+    {
+      "id": "gemini-3.1-pro-preview-customtools",
+      "display": "Gemini 3.1 Pro Preview Custom Tools"
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "display": "Gemini 3 Flash Preview"
+    },
+    {
+      "id": "gemini-2.5-computer-use-preview-10-2025",
+      "display": "Gemini 2.5 Computer Use Preview 10-2025"
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "display": "Gemini 2.5 Pro"
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "display": "Gemini 2.5 Flash"
+    },
+    {
+      "id": "gemini-2.5-flash-lite",
+      "display": "Gemini 2.5 Flash-Lite"
+    }
+  ],
+  "default_model": "gemma-4-31b-it",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:55Z",
+  "note": "no GEMINI_API_KEY set \u2014 models.dev catalog"
+}

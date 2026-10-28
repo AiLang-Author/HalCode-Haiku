@@ -1,0 +1,176 @@
+{
+  "name": "OpenRouter",
+  "backend": "openai",
+  "base_url": "https://openrouter.ai/api",
+  "api_path": "/v1/chat/completions",
+  "models_endpoint": "/v1/models",
+  "auth": "bearer",
+  "key_env": "OPENROUTER_API_KEY",
+  "key_hint": "openrouter",
+  "tier": 1,
+  "models": [
+    {
+      "id": "anthropic/claude-sonnet-5.5",
+      "display": "Anthropic: Claude Sonnet 5.5"
+    },
+    {
+      "id": "anthropic/claude-opus-5.5",
+      "display": "Anthropic: Claude Opus 5.5"
+    },
+    {
+      "id": "anthropic/claude-fable-5.1",
+      "display": "Anthropic: Claude Fable 5.1"
+    },
+    {
+      "id": "anthropic/claude-opus-5",
+      "display": "Anthropic: Claude Opus 5"
+    },
+    {
+      "id": "openai/gpt-6.1-sol-pro",
+      "display": "OpenAI: GPT-6.1 Sol Pro"
+    },
+    {
+      "id": "openai/gpt-6.1-sol",
+      "display": "OpenAI: GPT-6.1 Sol"
+    },
+    {
+      "id": "openai/gpt-6-luna-pro",
+      "display": "OpenAI: GPT-6 Luna Pro"
+    },
+    {
+      "id": "openai/gpt-6-luna",
+      "display": "OpenAI: GPT-6 Luna"
+    },
+    {
+      "id": "google/gemini-3.8-flash",
+      "display": "Google: Gemini 3.8 Flash"
+    },
+    {
+      "id": "google/gemini-3.7-flash",
+      "display": "Google: Gemini 3.7 Flash"
+    },
+    {
+      "id": "google/gemini-3.6-flash",
+      "display": "Google: Gemini 3.6 Flash"
+    },
+    {
+      "id": "google/gemini-3.5-flash-lite",
+      "display": "Google: Gemini 3.5 Flash Lite"
+    },
+    {
+      "id": "x-ai/grok-4.7",
+      "display": "SpaceXAI: Grok 4.7"
+    },
+    {
+      "id": "x-ai/grok-4.6",
+      "display": "SpaceXAI: Grok 4.6"
+    },
+    {
+      "id": "x-ai/grok-4.5",
+      "display": "SpaceXAI: Grok 4.5"
+    },
+    {
+      "id": "x-ai/grok-build-0.1",
+      "display": "SpaceXAI: Grok Build 0.1"
+    },
+    {
+      "id": "deepseek/deepseek-v4-pro",
+      "display": "DeepSeek: DeepSeek V4 Pro 0423"
+    },
+    {
+      "id": "deepseek/deepseek-v3.2",
+      "display": "DeepSeek: DeepSeek V3.2"
+    },
+    {
+      "id": "deepseek/deepseek-v3.1-terminus",
+      "display": "DeepSeek: DeepSeek V3.1 Terminus"
+    },
+    {
+      "id": "deepseek/deepseek-chat-v3.1",
+      "display": "DeepSeek: DeepSeek V3.1"
+    },
+    {
+      "id": "qwen/qwen3.8-max-prime",
+      "display": "Qwen: Qwen3.8 Max Prime"
+    },
+    {
+      "id": "qwen/qwen3.8-max-0902",
+      "display": "Qwen: Qwen3.8 Max (0902)"
+    },
+    {
+      "id": "qwen/qwen3.8-27b",
+      "display": "Qwen: Qwen3.8 27B"
+    },
+    {
+      "id": "qwen/qwen3.8-2.4t-a95b",
+      "display": "Qwen: Qwen3.8 2.4T A95B"
+    },
+    {
+      "id": "mistralai/mistral-large-4-0",
+      "display": "Mistral: Mistral Large 4"
+    },
+    {
+      "id": "mistralai/mistral-medium-3-5",
+      "display": "Mistral: Mistral Medium 3.5"
+    },
+    {
+      "id": "mistralai/devstral-2512",
+      "display": "Mistral: Devstral 2 2512"
+    },
+    {
+      "id": "mistralai/mistral-medium-3.1",
+      "display": "Mistral: Mistral Medium 3.1"
+    },
+    {
+      "id": "meta-llama/llama-4-maverick",
+      "display": "Meta: Llama 4 Maverick"
+    },
+    {
+      "id": "meta-llama/llama-4-scout",
+      "display": "Meta: Llama 4 Scout"
+    },
+    {
+      "id": "meta-llama/llama-3.3-70b-instruct",
+      "display": "Meta: Llama 3.3 70B Instruct"
+    },
+    {
+      "id": "meta-llama/llama-3.2-1b-instruct",
+      "display": "Meta: Llama 3.2 1B Instruct"
+    },
+    {
+      "id": "cohere/command-a-plus",
+      "display": "Cohere: Command A+"
+    },
+    {
+      "id": "cohere/command-a",
+      "display": "Cohere: Command A"
+    },
+    {
+      "id": "cohere/command-r7b-12-2024",
+      "display": "Cohere: Command R7B (12-2024)"
+    },
+    {
+      "id": "cohere/command-r-08-2024",
+      "display": "Cohere: Command R (08-2024)"
+    },
+    {
+      "id": "minimax/minimax-m3",
+      "display": "MiniMax: MiniMax M3"
+    },
+    {
+      "id": "minimax/minimax-m2.7",
+      "display": "MiniMax: MiniMax M2.7"
+    },
+    {
+      "id": "minimax/minimax-m2.5",
+      "display": "MiniMax: MiniMax M2.5"
+    },
+    {
+      "id": "minimax/minimax-m2-her",
+      "display": "MiniMax: MiniMax M2-her"
+    }
+  ],
+  "default_model": "anthropic/claude-sonnet-5.5",
+  "source": "live",
+  "fetched_at": "2026-10-09T19:08:55Z"
+}

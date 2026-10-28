@@ -1,0 +1,600 @@
+// cc_skills_ipc.ailang — Skills tool: list and read skill markdown files.
+//
+// Skills live in <app_dir>/skills/{ailang,halcode,tools,general}/<name>/SKILL.md
+// The app dir is derived from argv[0] (the binary path) so skills always live
+// next to the binary regardless of which user runs it.
+//
+// ops:
+//   list           — return newline-separated skill names (category/name)
+//   read name=<n>  — return full markdown content of <n>/SKILL.md
+//
+// Build: ./ailang.x cc_tools/cc_skills_ipc.ailang cc_skills_ipc.x
+// Run:   ./cc_skills_ipc.x   (binds @halcode/Skills)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCSkillsSys {
+    "SYS_READ":   Initialize=0
+    "SYS_OPEN":   Initialize=2
+    "SYS_CLOSE":  Initialize=3
+    "SYS_MKDIR":  Initialize=83
+    "SYS_UNLINK": Initialize=87
+    "SYS_PIPE":   Initialize=22
+    "SYS_DUP2":   Initialize=33
+    "SYS_FORK":   Initialize=57
+    "SYS_EXECVE": Initialize=59
+    "SYS_WAIT4":  Initialize=61
+}
+
+FixedPool.CCSkillsConst {
+    "SOCK_PATH":  Initialize=0, CanChange=True
+    "SOCK_DIR":   Initialize=0, CanChange=True
+    "SKILLS_DIR": Initialize=0, CanChange=True
+    "MAX_SKILL":  Initialize=65536
+    "MAX_LIST":   Initialize=8192
+    "READ_CHUNK": Initialize=4096
+    "BACKLOG":    Initialize=8
+}
+
+FixedPool.CCSkillsState {
+    "schema":    Initialize=0, CanChange=True
+    "listen_fd": Initialize=-1, CanChange=True
+    "running":   Initialize=1, CanChange=True
+}
+
+Function.CCSkills_BuildSchema {
+    Input: tool_name: Address
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema(tool_name, "List or read skill markdown files from <app>/skills/{ailang,halcode,tools,general}/")
+        UtilArgs_AddField(s, "op",   "string", 1, "Operation: list | read",                     "op")
+        UtilArgs_AddField(s, "name", "string", 0, "Skill name without .md (required for read)", "name")
+        ReturnValue(s)
+    }
+}
+
+// Read argv[target_index] from /proc/self/cmdline (null-separated args).
+// Returns heap-allocated string, or 0 if index is out of range.
+Function.CCSkills_GetArg {
+    Input: target_index: Integer
+    Output: Address
+    Body: {
+        fd = SystemCall(CCSkillsSys.SYS_OPEN, "/proc/self/cmdline", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(4096)
+        n = SystemCall(CCSkillsSys.SYS_READ, fd, buf, 4096, 0, 0)
+        SystemCall(CCSkillsSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 4096)
+            ReturnValue(0)
+        }
+        cur = 0
+        off = 0
+        WhileLoop LessThan(cur, target_index) {
+            WhileLoop LessThan(off, n) {
+                ch = GetByte(buf, off)
+                off = Add(off, 1)
+                IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            }
+            cur = Add(cur, 1)
+        }
+        IfCondition GreaterEqual(off, n) ThenBlock: {
+            Deallocate(buf, 4096)
+            ReturnValue(0)
+        }
+        start = off
+        len = 0
+        WhileLoop LessThan(off, n) {
+            ch = GetByte(buf, off)
+            IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            len = Add(len, 1)
+            off = Add(off, 1)
+        }
+        IfCondition EqualTo(len, 0) ThenBlock: {
+            Deallocate(buf, 4096)
+            ReturnValue(0)
+        }
+        out = Allocate(Add(len, 1))
+        i = 0
+        WhileLoop LessThan(i, len) {
+            SetByte(out, i, GetByte(buf, Add(start, i)))
+            i = Add(i, 1)
+        }
+        SetByte(out, len, 0)
+        Deallocate(buf, 4096)
+        ReturnValue(out)
+    }
+}
+
+// Read $HOME from /proc/self/environ. Returns 0 if not set.
+Function.CCSkills_GetHome {
+    Output: Address
+    Body: {
+        fd = SystemCall(CCSkillsSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(8192)
+        n = SystemCall(CCSkillsSys.SYS_READ, fd, buf, 8192, 0, 0)
+        SystemCall(CCSkillsSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 8192)
+            ReturnValue(0)
+        }
+        // Scan for H=72 O=79 M=77 E=69 ==61
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 72) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, 1)), 79) ThenBlock: {
+                    IfCondition EqualTo(GetByte(buf, Add(i, 2)), 77) ThenBlock: {
+                        IfCondition EqualTo(GetByte(buf, Add(i, 3)), 69) ThenBlock: {
+                            IfCondition EqualTo(GetByte(buf, Add(i, 4)), 61) ThenBlock: {
+                                val_start = Add(i, 5)
+                                val_end = val_start
+                                WhileLoop LessThan(val_end, n) {
+                                    IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                                    val_end = Add(val_end, 1)
+                                }
+                                val_len = Subtract(val_end, val_start)
+                                out = Allocate(Add(val_len, 1))
+                                k = 0
+                                WhileLoop LessThan(k, val_len) {
+                                    SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                                    k = Add(k, 1)
+                                }
+                                SetByte(out, val_len, 0)
+                                Deallocate(buf, 8192)
+                                ReturnValue(out)
+                            }
+                        }
+                    }
+                }
+            }
+            // Advance past null terminator to next env entry
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 8192)
+        ReturnValue(0)
+    }
+}
+
+// Strip the filename from a path: "/a/b/foo.x" → "/a/b".
+// Returns 0 if no slash found (no directory component).
+Function.CCSkills_Dirname {
+    Input: path: Address
+    Output: Address
+    Body: {
+        len = StringLength(path)
+        i = Subtract(len, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            ch = GetByte(path, i)
+            IfCondition EqualTo(ch, 47) ThenBlock: { BreakLoop }
+            i = Subtract(i, 1)
+        }
+        IfCondition LessThan(i, 0) ThenBlock: { ReturnValue(0) }
+        out = Allocate(Add(i, 1))
+        j = 0
+        WhileLoop LessThan(j, i) {
+            SetByte(out, j, GetByte(path, j))
+            j = Add(j, 1)
+        }
+        SetByte(out, i, 0)
+        ReturnValue(out)
+    }
+}
+
+// Trim trailing \n and \r from a heap string in-place.
+Function.CCSkills_TrimNewline {
+    Input: s: Address
+    Body: {
+        len = StringLength(s)
+        i = Subtract(len, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            ch = GetByte(s, i)
+            IfCondition EqualTo(ch, 10) ThenBlock: { SetByte(s, i, 0) }
+            IfCondition EqualTo(ch, 13) ThenBlock: { SetByte(s, i, 0) }
+            IfCondition NotEqual(ch, 10) ThenBlock: {
+                IfCondition NotEqual(ch, 13) ThenBlock: { BreakLoop }
+            }
+            i = Subtract(i, 1)
+        }
+    }
+}
+
+// Fork /bin/sh -c <cmd>; capture stdout into a heap string (up to max_out bytes).
+Function.CCSkills_ShellCapture {
+    Input: cmd: Address
+    Input: max_out: Integer
+    Output: Address
+    Body: {
+        pf = Allocate(8)
+        pr = SystemCall(CCSkillsSys.SYS_PIPE, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: { Deallocate(pf, 8)  ReturnValue(0) }
+        pipe_r = Dereference(pf, "dword")
+        pipe_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0), "/bin/sh")
+        StoreValue(Add(argv, 8), "-c")
+        StoreValue(Add(argv, 16), cmd)
+        StoreValue(Add(argv, 24), 0)
+
+        pid = SystemCall(CCSkillsSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(CCSkillsSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCSkillsSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            Deallocate(argv, 32)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(CCSkillsSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCSkillsSys.SYS_DUP2, pipe_w, 1, 0, 0, 0)
+            SystemCall(CCSkillsSys.SYS_DUP2, pipe_w, 2, 0, 0, 0)
+            SystemCall(CCSkillsSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            SystemCall(CCSkillsSys.SYS_EXECVE, "/bin/sh", argv, 0)
+            Exit(127)
+        }
+        SystemCall(CCSkillsSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+
+        out = Allocate(Add(max_out, 1))
+        used = 0
+        chunk = Allocate(CCSkillsConst.READ_CHUNK)
+        WhileLoop 1 {
+            want = CCSkillsConst.READ_CHUNK
+            free = Subtract(max_out, used)
+            IfCondition LessEqual(free, 0) ThenBlock: {
+                // Drain pipe so child exits cleanly
+                WhileLoop 1 {
+                    dn = SystemCall(CCSkillsSys.SYS_READ, pipe_r, chunk, CCSkillsConst.READ_CHUNK, 0, 0)
+                    IfCondition LessEqual(dn, 0) ThenBlock: { BreakLoop }
+                }
+                BreakLoop
+            }
+            IfCondition GreaterThan(want, free) ThenBlock: { want = free }
+            n = SystemCall(CCSkillsSys.SYS_READ, pipe_r, chunk, want, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            i = 0
+            WhileLoop LessThan(i, n) {
+                SetByte(out, Add(used, i), GetByte(chunk, i))
+                i = Add(i, 1)
+            }
+            used = Add(used, n)
+        }
+        SetByte(out, used, 0)
+        Deallocate(chunk, CCSkillsConst.READ_CHUNK)
+        SystemCall(CCSkillsSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+        status_buf = Allocate(8)
+        SystemCall(CCSkillsSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+        Deallocate(status_buf, 8)
+        Deallocate(argv, 32)
+        ReturnValue(out)
+    }
+}
+
+// Copy non-empty lines from raw shell output into a heap string.
+// The shell command already strips extensions and trailing slashes, so
+// each line is a bare skill name ready to use.
+Function.CCSkills_ParseLsOutput {
+    Input: raw: Address
+    Output: Address
+    Body: {
+        out = Allocate(CCSkillsConst.MAX_LIST)
+        out_used = 0
+        i = 0
+        raw_len = StringLength(raw)
+        WhileLoop LessThan(i, raw_len) {
+            line_start = i
+            WhileLoop LessThan(i, raw_len) {
+                ch = GetByte(raw, i)
+                IfCondition EqualTo(ch, 10) ThenBlock: { BreakLoop }
+                IfCondition EqualTo(ch, 0)  ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            line_len = Subtract(i, line_start)
+            IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                k = 0
+                WhileLoop LessThan(k, line_len) {
+                    IfCondition LessThan(out_used, CCSkillsConst.MAX_LIST) ThenBlock: {
+                        SetByte(out, out_used, GetByte(raw, Add(line_start, k)))
+                        out_used = Add(out_used, 1)
+                    }
+                    k = Add(k, 1)
+                }
+                IfCondition LessThan(out_used, CCSkillsConst.MAX_LIST) ThenBlock: {
+                    SetByte(out, out_used, 10)
+                    out_used = Add(out_used, 1)
+                }
+            }
+            IfCondition EqualTo(GetByte(raw, i), 10) ThenBlock: { i = Add(i, 1) }
+        }
+        SetByte(out, out_used, 0)
+        ReturnValue(out)
+    }
+}
+
+// Check skill name is safe: non-empty, ≤64 chars, no leading dot, no slashes.
+Function.CCSkills_ValidateName {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        len = StringLength(name)
+        IfCondition EqualTo(len, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(len, 64) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GetByte(name, 0), 46) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(name, i)
+            // Allow a-z, 0-9, hyphen, and '/' (category/name separator)
+            IfCondition EqualTo(ch, 46) ThenBlock: {
+                IfCondition EqualTo(i, 0) ThenBlock: { ReturnValue(0) }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.CCSkills_WriteErr {
+    Input: err_buf: Address
+    Input: msg: Address
+    Body: {
+        mlen = StringLength(msg)
+        i = 0
+        WhileLoop LessThan(i, mlen) {
+            SetByte(err_buf, i, GetByte(msg, i))
+            i = Add(i, 1)
+        }
+        SetByte(err_buf, mlen, 0)
+    }
+}
+
+Function.CCSkills_DoList {
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        // Recurse two levels: skills/<category>/<name>/SKILL.md
+        // Emit "category/name" lines via sed — avoids nested-quote shell complexity.
+        cmd = StringConcat("find ", CCSkillsConst.SKILLS_DIR)
+        cmd = StringConcat(cmd, " -mindepth 3 -maxdepth 3 -name 'SKILL.md' 2>/dev/null | sed 's|.*/\([^/]*/[^/]*\)/SKILL.md$|\1|' | sort")
+        raw = CCSkills_ShellCapture(cmd, CCSkillsConst.MAX_LIST)
+        IfCondition EqualTo(raw, 0) ThenBlock: {
+            CCSkills_WriteErr(err_buf, "shell capture failed")
+            ReturnValue(0)
+        }
+        result = CCSkills_ParseLsOutput(raw)
+        ReturnValue(result)
+    }
+}
+
+Function.CCSkills_DoRead {
+    Input: name: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(CCSkills_ValidateName(name), 0) ThenBlock: {
+            CCSkills_WriteErr(err_buf, "invalid skill name")
+            ReturnValue(0)
+        }
+        // Find skill anywhere under skills/<category>/<name>/SKILL.md
+        find_cmd = StringConcat("find ", CCSkillsConst.SKILLS_DIR)
+        find_cmd = StringConcat(find_cmd, " -mindepth 3 -maxdepth 3 -name 'SKILL.md' -path '*/")
+        find_cmd = StringConcat(find_cmd, name)
+        find_cmd = StringConcat(find_cmd, "/SKILL.md' 2>/dev/null | head -1")
+        found = CCSkills_ShellCapture(find_cmd, 4096)
+        IfCondition EqualTo(found, 0) ThenBlock: {
+            CCSkills_WriteErr(err_buf, StringConcat("skill not found: ", name))
+            ReturnValue(0)
+        }
+        CCSkills_TrimNewline(found)
+        path = found
+        fd = SystemCall(CCSkillsSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            CCSkills_WriteErr(err_buf, StringConcat("skill not found: ", name))
+            ReturnValue(0)
+        }
+        out = Allocate(Add(CCSkillsConst.MAX_SKILL, 1))
+        used = 0
+        chunk = Allocate(CCSkillsConst.READ_CHUNK)
+        WhileLoop 1 {
+            want = CCSkillsConst.READ_CHUNK
+            free = Subtract(CCSkillsConst.MAX_SKILL, used)
+            IfCondition LessEqual(free, 0) ThenBlock: { BreakLoop }
+            IfCondition GreaterThan(want, free) ThenBlock: { want = free }
+            n = SystemCall(CCSkillsSys.SYS_READ, fd, chunk, want, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            i = 0
+            WhileLoop LessThan(i, n) {
+                SetByte(out, Add(used, i), GetByte(chunk, i))
+                i = Add(i, 1)
+            }
+            used = Add(used, n)
+        }
+        SetByte(out, used, 0)
+        Deallocate(chunk, CCSkillsConst.READ_CHUNK)
+        SystemCall(CCSkillsSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        ReturnValue(out)
+    }
+}
+
+Function.CCSkills_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCSkills_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCSkills_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCSkillsState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCSkills_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCSkills_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCSkills_SendError(client_fd, 0, "request must be a JSON object")
+            ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCSkills_SendError(client_fd, 0, "missing method")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCSkills_SendSchema(client_fd)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id   = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCSkillsState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCSkills_SendError(client_fd, id, "missing required argument 'op'")
+                ReturnValue(0)
+            }
+            op = UtilArgs_GetString(validated, "op")
+            IfCondition EqualTo(op, 0) ThenBlock: {
+                CCSkills_SendError(client_fd, id, "missing op")
+                ReturnValue(0)
+            }
+            err_buf = Allocate(256)
+            SetByte(err_buf, 0, 0)
+            content = 0
+            IfCondition EqualTo(StringCompare(op, "list"), 0) ThenBlock: {
+                content = CCSkills_DoList(err_buf)
+            }
+            IfCondition EqualTo(StringCompare(op, "read"), 0) ThenBlock: {
+                name = UtilArgs_GetString(validated, "name")
+                IfCondition EqualTo(name, 0) ThenBlock: {
+                    CCSkills_SendError(client_fd, id, "op=read requires name")
+                    Deallocate(err_buf, 256)
+                    ReturnValue(0)
+                }
+                content = CCSkills_DoRead(name, err_buf)
+            }
+            IfCondition EqualTo(content, 0) ThenBlock: {
+                IfCondition EqualTo(GetByte(err_buf, 0), 0) ThenBlock: {
+                    CCSkills_SendError(client_fd, id, "unknown op: use list or read")
+                } ElseBlock: {
+                    CCSkills_SendError(client_fd, id, err_buf)
+                }
+            } ElseBlock: {
+                CCSkills_SendResult(client_fd, id, content)
+            }
+            Deallocate(err_buf, 256)
+            ReturnValue(0)
+        }
+        CCSkills_SendError(client_fd, 0, "unknown method")
+    }
+}
+
+SubRoutine.Main {
+    // Name and socket come from argv[1]/argv[2] passed by CC_LaunchTool.
+    // Fall back to sensible defaults so the binary can be run standalone for testing.
+    tool_name   = CCSkills_GetArg(1)
+    tool_socket = CCSkills_GetArg(2)
+    IfCondition EqualTo(tool_name,   0) ThenBlock: { tool_name   = "Skills"          }
+    IfCondition EqualTo(tool_socket, 0) ThenBlock: { tool_socket = "@halcode/Skills" }
+
+    // Derive skills dir from the binary's own location (argv[0]).
+    // This makes skills live next to the binary regardless of user.
+    bin_path = CCSkills_GetArg(0)
+    IfCondition NotEqual(bin_path, 0) ThenBlock: {
+        app_dir = CCSkills_Dirname(bin_path)
+        IfCondition NotEqual(app_dir, 0) ThenBlock: {
+            CCSkillsConst.SKILLS_DIR = StringConcat(app_dir, "/skills")
+        }
+    }
+    // Fallback if argv[0] resolution failed
+    IfCondition EqualTo(CCSkillsConst.SKILLS_DIR, 0) ThenBlock: {
+        home = CCSkills_GetHome()
+        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
+        CCSkillsConst.SKILLS_DIR = StringConcat(home, "/.halcode/skills")
+    }
+
+    CCSkillsConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    CCSkillsConst.SOCK_PATH = tool_socket
+    CCSkillsState.schema    = CCSkills_BuildSchema(tool_name)
+
+    SystemCall(CCSkillsSys.SYS_MKDIR, CCSkillsConst.SOCK_DIR, 493, 0, 0, 0)
+    SystemCall(CCSkillsSys.SYS_UNLINK, CCSkillsConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
+    Socket.BindUnix(fd, CCSkillsConst.SOCK_PATH)
+    Socket.Listen(fd, CCSkillsConst.BACKLOG)
+    CCSkillsState.listen_fd = fd
+
+    PrintMessage("[cc_skills_ipc] listening on ")
+    PrintMessage(CCSkillsConst.SOCK_PATH)
+    PrintMessage("\n")
+    PrintMessage("[cc_skills_ipc] skills dir: ")
+    PrintMessage(CCSkillsConst.SKILLS_DIR)
+    PrintMessage("\n")
+
+    WhileLoop EqualTo(CCSkillsState.running, 1) {
+        client_fd = Socket.Accept(CCSkillsState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCSkills_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Exit(0)
+}
+
+RunTask(Main)

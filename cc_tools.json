@@ -1,0 +1,30 @@
+{
+  "tools": [
+    {"binary": "./cc_read_ipc.x",     "name": "Read",     "socket": "@halcode/Read"},
+    {"binary": "./cc_head_ipc.x",     "name": "Head",     "socket": "@halcode/Head"},
+    {"binary": "./cc_ls_ipc.x",       "name": "LS",       "socket": "@halcode/LS"},
+    {"binary": "./cc_write_ipc.x",    "name": "Write",    "socket": "@halcode/Write"},
+    {"binary": "./cc_bash_ipc.x",     "name": "Bash",     "socket": "@halcode/Bash"},
+    {"binary": "./cc_webfetch_ipc.x", "name": "WebFetch", "socket": "@halcode/WebFetch"},
+    {"binary": "./cc_relmem_ipc.x",   "name": "Relmem",   "socket": "@halcode/Relmem"},
+    {"binary": "./cc_pgmem_ipc.x",    "name": "Pgmem",    "socket": "@halcode/Pgmem"},
+    {"binary": "./cc_agent_ipc.x",    "name": "Agent",    "socket": "@halcode/Agent"},
+    {"binary": "./cc_edit_ipc.x",     "name": "Edit",     "socket": "@halcode/Edit"},
+    {"binary": "./cc_undo_ipc.x",     "name": "Undo",     "socket": "@halcode/Undo"},
+    {"binary": "./cc_find_ipc.x",     "name": "Find",     "socket": "@halcode/Find"},
+    {"binary": "./cc_grep_ipc.x",     "name": "Grep",     "socket": "@halcode/Grep"},
+    {"binary": "./cc_git_ipc.x",      "name": "Git",      "socket": "@halcode/Git"},
+    {"binary": "./cc_stat_ipc.x",     "name": "Stat",     "socket": "@halcode/Stat"},
+    {"binary": "./cc_wc_ipc.x",       "name": "Wc",       "socket": "@halcode/Wc"},
+    {"binary": "./cc_du_ipc.x",       "name": "Du",       "socket": "@halcode/Du"},
+    {"binary": "./cc_diff_ipc.x",     "name": "Diff",     "socket": "@halcode/Diff"},
+    {"binary": "./cc_olympus_ipc.x",  "name": "Olympus",  "socket": "@halcode/Olympus"},
+    {"binary": "./cc_sleep_ipc.x",    "name": "Sleep",    "socket": "@halcode/Sleep"},
+    {"binary": "./cc_mcp_ipc.x",      "name": "MCP",      "socket": "@halcode/MCP"},
+    {"binary": "./cc_skills_ipc.x",   "name": "Skills",   "socket": "@halcode/Skills"},
+    {"binary": "./cc_ailang_ipc.x",      "name": "Ailang",    "socket": "@halcode/Ailang"},
+    {"binary": "./cc_ailang_lsp_ipc.x",  "name": "AilangLSP", "socket": "@halcode/AilangLSP"},
+    {"binary": "./cc_packager_ipc.x",   "name": "Packager",  "socket": "@halcode/Packager"},
+    {"binary": "./cc_vision_ipc.x",     "name": "Vision",    "socket": "@halcode/Vision"}
+  ]
+}

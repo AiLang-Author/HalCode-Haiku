@@ -1,0 +1,189 @@
+// cc_js_ipc.ailang — Native JavaScript VM Tool
+//
+// Exposes the lightning-fast AILang JavaScript VM to the orchestrator model.
+//
+// Schema: code (string)
+//
+// Build: ./ailang.x Applications/HalCode9000/cc_tools/cc_js_ipc.ailang Applications/HalCode9000/cc_js_ipc.x
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+LibraryImport.Browser.JSRuntime
+LibraryImport.Browser.JSValidate
+LibraryImport.Browser.JSLexer
+LibraryImport.Browser.JSParser
+LibraryImport.Browser.JSCompiler
+LibraryImport.Browser.JSVM
+LibraryImport.Browser.JSBridge
+LibraryImport.Browser.JSEngine
+
+FixedPool.CCJsSys {
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+}
+
+FixedPool.CCJsConst {
+    "SOCK_PATH":     Initialize=0, CanChange=True
+    "SOCK_DIR":      Initialize=0, CanChange=True
+    "BACKLOG":       Initialize=8
+}
+
+FixedPool.CCJsState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+}
+
+Function.CCJs_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("JS", "Execute JavaScript code natively on the internal high-performance VM. Returns console output or the final evaluated value.")
+        UtilArgs_AddField(s, "code", "string", 1, "The JavaScript code to execute.", "code")
+        UtilArgs_AddField(s, "max_steps", "int", 0, "Maximum VM steps to execute (default 5000000). Increase for heavy workloads.", "max_steps")
+        ReturnValue(s)
+    }
+}
+
+Function.CCJs_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCJs_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCJs_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCJsState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCJs_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Output: Integer
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { CCJs_SendError(client_fd, 0, "invalid JSON")  ReturnValue(0) }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: { CCJs_SendError(client_fd, 0, "request must be a JSON object")  ReturnValue(0) }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: { CCJs_SendError(client_fd, 0, "missing method")  ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: { CCJs_SendSchema(client_fd)  ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCJsState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCJs_SendError(client_fd, id, "missing required argument 'code'")  ReturnValue(0)
+            }
+            
+            js_code = UtilArgs_GetString(validated, "code")
+            
+            // Apply execution safety limit (max steps)
+            step_str = UtilArgs_GetString(validated, "max_steps")
+            step_limit = 5000000 // 5M step default limit
+            IfCondition NotEqual(step_str, 0) ThenBlock: {
+                parsed_steps = StringToInt(step_str)
+                IfCondition GreaterThan(parsed_steps, 0) ThenBlock: { step_limit = parsed_steps }
+            }
+            JSVM_SetMaxSteps(step_limit)
+
+            // Execute native JavaScript on the AILang VM
+            // NOTE: JSEngine_Run resets Lex/Comp/VM but not JSRT.
+            // Without this, val_pool and str_slab accumulate across
+            // requests until they wrap and corrupt live pointers → SIGSEGV.
+            JSRT_Reset()
+            code_len = StringLength(js_code)
+            js_val = JSEngine_EvalString(js_code, code_len)
+
+            IfCondition EqualTo(js_val, 0) ThenBlock: {
+                IfCondition EqualTo(JSEngine_GetError(), 1) ThenBlock: {
+                    result = "[VM ERROR: Execution failed. Step limit exceeded or runtime exception.]"
+                } ElseBlock: {
+                    result = "undefined"
+                }
+            } ElseBlock: {
+                str_val = JSRT_ToString(js_val)
+                IfCondition EqualTo(str_val, 0) ThenBlock: {
+                    result = "undefined"
+                } ElseBlock: {
+                    result = Dereference(Add(str_val, 8))
+                }
+            }
+            
+            CCJs_SendResult(client_fd, id, result)
+            ReturnValue(0)
+        }
+        CCJs_SendError(client_fd, 0, "unknown method")
+    }
+}
+
+SubRoutine.Main {
+    CCJsConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    CCJsConst.SOCK_PATH = "@halcode/JS"
+    
+    // Initialize the full JS engine (handles all subsystem init in dependency order)
+    JSEngine_Init()
+    
+    CCJsState.schema = CCJs_BuildSchema()
+    SystemCall(CCJsSys.SYS_MKDIR, CCJsConst.SOCK_DIR, 493, 0, 0, 0)
+    SystemCall(CCJsSys.SYS_UNLINK, CCJsConst.SOCK_PATH, 0, 0, 0, 0)
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
+    Socket.BindUnix(fd, CCJsConst.SOCK_PATH)
+    Socket.Listen(fd, CCJsConst.BACKLOG)
+    CCJsState.listen_fd = fd
+    PrintMessage("[cc_js_ipc] listening on ")  PrintMessage(CCJsConst.SOCK_PATH)  PrintMessage("\n")
+    WhileLoop EqualTo(CCJsState.running, 1) {
+        client_fd = Socket.Accept(CCJsState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCJs_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Exit(0)
+}
+
+RunTask(Main)

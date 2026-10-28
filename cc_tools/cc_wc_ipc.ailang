@@ -1,0 +1,305 @@
+// cc_wc_ipc.ailang — word/line/byte count IPC tool for HalCode9000.
+//
+// Socket: @halcode/Wc
+// Schema: path (required)
+// Returns: "lines: N\nwords: N\nbytes: N\n"
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCWcSys {
+    "SYS_READ":   Initialize=0
+    "SYS_OPEN":   Initialize=2
+    "SYS_CLOSE":  Initialize=3
+    "SYS_FSTAT":  Initialize=5
+    "SYS_MKDIR":  Initialize=83
+    "SYS_UNLINK": Initialize=87
+}
+
+FixedPool.CCWcConst {
+    "SOCK_PATH":   Initialize="@halcode/Wc", CanChange=True
+    "BACKLOG":     Initialize=8
+    "READ_CHUNK":  Initialize=65536
+    "OUT_CAP":     Initialize=128
+}
+
+FixedPool.CCWcState {
+    "schema":    Initialize=0,  CanChange=True
+    "listen_fd": Initialize=-1, CanChange=True
+    "running":   Initialize=1,  CanChange=True
+    "lines":     Initialize=0,  CanChange=True
+    "words":     Initialize=0,  CanChange=True
+    "bytes":     Initialize=0,  CanChange=True
+    "out_buf":   Initialize=0,  CanChange=True
+    "out_pos":   Initialize=0,  CanChange=True
+}
+
+// =============================================================================
+// OUTPUT HELPERS
+// =============================================================================
+
+Function.CCWc_AppendStr {
+    Input: s: Address
+    Body: {
+        len = StringLength(s)
+        avail = Subtract(CCWcConst.OUT_CAP, CCWcState.out_pos)
+        copy = len
+        IfCondition GreaterThan(copy, avail) ThenBlock: { copy = avail }
+        IfCondition GreaterThan(copy, 0) ThenBlock: {
+            MemoryCopy(Add(CCWcState.out_buf, CCWcState.out_pos), s, copy)
+            CCWcState.out_pos = Add(CCWcState.out_pos, copy)
+        }
+    }
+}
+
+Function.CCWc_AppendInt {
+    Input: num: Integer
+    Body: {
+        IfCondition EqualTo(num, 0) ThenBlock: { CCWc_AppendStr("0")  ReturnValue(0) }
+        tmp = Allocate(24)
+        ndig = 0
+        n = num
+        WhileLoop GreaterThan(n, 0) {
+            SetByte(tmp, ndig, Add(48, Modulo(n, 10)))
+            ndig = Add(ndig, 1)
+            n = Divide(n, 10)
+        }
+        i = Subtract(ndig, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            avail = Subtract(CCWcConst.OUT_CAP, CCWcState.out_pos)
+            IfCondition GreaterThan(avail, 0) ThenBlock: {
+                SetByte(CCWcState.out_buf, CCWcState.out_pos, GetByte(tmp, i))
+                CCWcState.out_pos = Add(CCWcState.out_pos, 1)
+            }
+            i = Subtract(i, 1)
+        }
+        Deallocate(tmp, 24)
+    }
+}
+
+// =============================================================================
+// COUNT ENGINE
+// =============================================================================
+
+// Read file at path, count lines/words/bytes; returns 1 on success, 0 on error
+Function.CCWc_DoCount {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        fd = SystemCall(CCWcSys.SYS_OPEN, path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        st = Allocate(144)
+        fs = SystemCall(CCWcSys.SYS_FSTAT, fd, st, 0, 0)
+        is_dir = 0
+        IfCondition GreaterEqual(fs, 0) ThenBlock: {
+            mode = Add(GetByte(st, 24), Multiply(GetByte(st, 25), 256))
+            IfCondition EqualTo(BitwiseAnd(mode, 61440), 16384) ThenBlock: { is_dir = 1 }
+        }
+        Deallocate(st, 144)
+        IfCondition EqualTo(is_dir, 1) ThenBlock: {
+            SystemCall(CCWcSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        buf = Allocate(CCWcConst.READ_CHUNK)
+        lines = 0
+        words = 0
+        bytes = 0
+        in_word = 0
+
+        WhileLoop 1 {
+            n = SystemCall(CCWcSys.SYS_READ, fd, buf, CCWcConst.READ_CHUNK)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            bytes = Add(bytes, n)
+            i = 0
+            WhileLoop LessThan(i, n) {
+                ch = GetByte(buf, i)
+                IfCondition EqualTo(ch, 10) ThenBlock: { lines = Add(lines, 1) }
+                // whitespace = space(32) tab(9) newline(10) CR(13)
+                is_ws = 0
+                IfCondition EqualTo(ch, 32) ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(ch, 9)  ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(ch, 10) ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(ch, 13) ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(is_ws, 1) ThenBlock: {
+                    in_word = 0
+                } ElseBlock: {
+                    IfCondition EqualTo(in_word, 0) ThenBlock: {
+                        words = Add(words, 1)
+                        in_word = 1
+                    }
+                }
+                i = Add(i, 1)
+            }
+        }
+
+        Deallocate(buf, CCWcConst.READ_CHUNK)
+        SystemCall(CCWcSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        CCWcState.lines = lines
+        CCWcState.words = words
+        CCWcState.bytes = bytes
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// IPC LAYER
+// =============================================================================
+
+Function.CCWc_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Wc", "Count lines, words, and bytes in a file")
+        UtilArgs_AddField(s, "path", "path", 1, "Absolute path to the file", "path")
+        ReturnValue(s)
+    }
+}
+
+Function.CCWc_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWc_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWc_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCWcState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWc_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCWc_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCWc_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCWc_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCWc_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id   = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCWcState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCWc_SendError(client_fd, id, "missing required argument 'path'")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            path = UtilArgs_GetString(validated, "path")
+            IfCondition EqualTo(path, 0) ThenBlock: {
+                CCWc_SendError(client_fd, id, "path is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            ok = CCWc_DoCount(path)
+            IfCondition EqualTo(ok, 0) ThenBlock: {
+                err = StringConcat("open failed: ", path)
+                CCWc_SendError(client_fd, id, err)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition LessThan(ok, 0) ThenBlock: {
+                err = StringConcat("is a directory: ", path)
+                CCWc_SendError(client_fd, id, err)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            CCWcState.out_pos = 0
+            CCWc_AppendStr("lines: ")  CCWc_AppendInt(CCWcState.lines)  CCWc_AppendStr("\n")
+            CCWc_AppendStr("words: ")  CCWc_AppendInt(CCWcState.words)  CCWc_AppendStr("\n")
+            CCWc_AppendStr("bytes: ")  CCWc_AppendInt(CCWcState.bytes)  CCWc_AppendStr("\n")
+            SetByte(CCWcState.out_buf, CCWcState.out_pos, 0)
+            CCWc_SendResult(client_fd, id, CCWcState.out_buf)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCWc_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+SubRoutine.Main {
+    CCWcConst.SOCK_PATH = "@halcode/Wc"
+    CCWcState.schema  = CCWc_BuildSchema()
+    CCWcState.out_buf = Allocate(Add(CCWcConst.OUT_CAP, 1))
+
+    SystemCall(CCWcSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCWcSys.SYS_UNLINK, CCWcConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_wc_ipc] socket create failed\n")
+        Exit(1)
+    }
+    Socket.BindUnix(fd, CCWcConst.SOCK_PATH)
+    Socket.Listen(fd, CCWcConst.BACKLOG)
+    CCWcState.listen_fd = fd
+    PrintMessage("[cc_wc_ipc] listening on @halcode/Wc\n")
+
+    WhileLoop EqualTo(CCWcState.running, 1) {
+        client_fd = Socket.Accept(CCWcState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCWc_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCWcState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

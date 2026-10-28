@@ -1,0 +1,73 @@
+{
+  "name": "Chutes",
+  "backend": "openai",
+  "base_url": "https://llm.chutes.ai/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "CHUTES_API_KEY",
+  "key_hint": "chutes",
+  "tier": 2,
+  "models": [
+    {
+      "id": "Qwen/Qwen3.8-27B-TEE",
+      "display": "Qwen3.8 27B TEE"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Flash-0731-TEE",
+      "display": "DeepSeek V4 Flash 0731 TEE"
+    },
+    {
+      "id": "moonshotai/Kimi-K3-TEE",
+      "display": "Kimi K3 TEE"
+    },
+    {
+      "id": "Nemotron-3-Nano-Omni-30B-TEE",
+      "display": "Nemotron 3 Nano Omni 30B TEE"
+    },
+    {
+      "id": "zai-org/GLM-5.2-TEE",
+      "display": "GLM 5.2 TEE"
+    },
+    {
+      "id": "Qwen/Qwen3.6-27B-TEE",
+      "display": "Qwen3.6 27B TEE"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.6-TEE",
+      "display": "Kimi K2.6 TEE"
+    },
+    {
+      "id": "zai-org/GLM-5.1-TEE",
+      "display": "GLM 5.1 TEE"
+    },
+    {
+      "id": "google/gemma-4-31B-turbo-TEE",
+      "display": "gemma 4 31B turbo TEE"
+    },
+    {
+      "id": "Qwen/Qwen3.5-397B-A17B-TEE",
+      "display": "Qwen3.5 397B A17B TEE"
+    },
+    {
+      "id": "unsloth/Mistral-Nemo-Instruct-2407-TEE",
+      "display": "Mistral Nemo Instruct 2407 TEE"
+    },
+    {
+      "id": "Qwen/Qwen3-32B-TEE",
+      "display": "Qwen3 32B TEE"
+    },
+    {
+      "id": "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE",
+      "display": "Qwen3 235B A22B Thinking 2507 TEE"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3.2-TEE",
+      "display": "DeepSeek V3.2 TEE"
+    }
+  ],
+  "default_model": "Qwen/Qwen3.8-27B-TEE",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no CHUTES_API_KEY set \u2014 models.dev catalog"
+}

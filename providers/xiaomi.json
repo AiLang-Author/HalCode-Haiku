@@ -1,0 +1,41 @@
+{
+  "name": "Xiaomi",
+  "backend": "openai",
+  "base_url": "https://api.xiaomimimo.com/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "XIAOMI_API_KEY",
+  "key_hint": "xiaomi",
+  "tier": 2,
+  "models": [
+    {
+      "id": "mimo-v2.6-pro",
+      "display": "MiMo-V2.6-Pro"
+    },
+    {
+      "id": "mimo-v2.6-flash",
+      "display": "MiMo-V2.6-Flash"
+    },
+    {
+      "id": "mimo-v2.6-pro-ultraspeed",
+      "display": "MiMo-V2.6-Pro-UltraSpeed"
+    },
+    {
+      "id": "mimo-v2.5-pro-ultraspeed",
+      "display": "MiMo-V2.5-Pro-UltraSpeed"
+    },
+    {
+      "id": "mimo-v2.5",
+      "display": "MiMo-V2.5"
+    },
+    {
+      "id": "mimo-v2.5-pro",
+      "display": "MiMo-V2.5-Pro"
+    }
+  ],
+  "default_model": "mimo-v2.6-pro",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no XIAOMI_API_KEY set \u2014 models.dev catalog"
+}

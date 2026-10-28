@@ -1,0 +1,363 @@
+// cc_stat_ipc.ailang — file metadata IPC tool for HalCode9000.
+//
+// Socket: @halcode/Stat
+// Schema: path (required)
+// Returns: type, size, perms (octal + symbolic), inode, links, uid, gid, mtime
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCStatSys {
+    "SYS_CLOSE":   Initialize=3
+    "SYS_MKDIR":   Initialize=83
+    "SYS_UNLINK":  Initialize=87
+    "SYS_FSTATAT": Initialize=262
+    "AT_FDCWD":    Initialize=-100
+    "S_IFMT":      Initialize=61440
+    "S_IFREG":     Initialize=32768
+    "S_IFDIR":     Initialize=16384
+    "S_IFLNK":     Initialize=40960
+    "S_IFCHR":     Initialize=8192
+    "S_IFBLK":     Initialize=24576
+    "S_IFIFO":     Initialize=4096
+    "S_IFSOCK":    Initialize=49152
+}
+
+FixedPool.CCStatConst {
+    "SOCK_PATH":  Initialize="@halcode/Stat", CanChange=True
+    "BACKLOG":    Initialize=8
+    "STAT_SIZE":  Initialize=144
+    "OUT_CAP":    Initialize=1024
+}
+
+FixedPool.CCStatState {
+    "schema":    Initialize=0,  CanChange=True
+    "listen_fd": Initialize=-1, CanChange=True
+    "running":   Initialize=1,  CanChange=True
+    "out_buf":   Initialize=0,  CanChange=True
+    "out_pos":   Initialize=0,  CanChange=True
+    "perm_buf":  Initialize=0,  CanChange=True
+    "oct_buf":   Initialize=0,  CanChange=True
+}
+
+// =============================================================================
+// OUTPUT HELPERS (write to CCStatState.out_buf at out_pos)
+// =============================================================================
+
+Function.CCStat_AppendStr {
+    Input: s: Address
+    Body: {
+        len = StringLength(s)
+        avail = Subtract(CCStatConst.OUT_CAP, CCStatState.out_pos)
+        copy = len
+        IfCondition GreaterThan(copy, avail) ThenBlock: { copy = avail }
+        IfCondition GreaterThan(copy, 0) ThenBlock: {
+            MemoryCopy(Add(CCStatState.out_buf, CCStatState.out_pos), s, copy)
+            CCStatState.out_pos = Add(CCStatState.out_pos, copy)
+        }
+    }
+}
+
+Function.CCStat_AppendInt {
+    Input: num: Integer
+    Body: {
+        IfCondition EqualTo(num, 0) ThenBlock: { CCStat_AppendStr("0")  ReturnValue(0) }
+        tmp = Allocate(24)
+        ndig = 0
+        n = num
+        WhileLoop GreaterThan(n, 0) {
+            SetByte(tmp, ndig, Add(48, Modulo(n, 10)))
+            ndig = Add(ndig, 1)
+            n = Divide(n, 10)
+        }
+        i = Subtract(ndig, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            avail = Subtract(CCStatConst.OUT_CAP, CCStatState.out_pos)
+            IfCondition GreaterThan(avail, 0) ThenBlock: {
+                SetByte(CCStatState.out_buf, CCStatState.out_pos, GetByte(tmp, i))
+                CCStatState.out_pos = Add(CCStatState.out_pos, 1)
+            }
+            i = Subtract(i, 1)
+        }
+        Deallocate(tmp, 24)
+    }
+}
+
+// =============================================================================
+// STAT HELPERS
+// =============================================================================
+
+// Read 4-byte LE int from buf+off
+Function.CCStat_U32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        p = Add(buf, off)
+        v = Add(GetByte(p, 0), Multiply(GetByte(p, 1), 256))
+        v = Add(v, Multiply(GetByte(p, 2), 65536))
+        v = Add(v, Multiply(GetByte(p, 3), 16777216))
+        ReturnValue(v)
+    }
+}
+
+// Read lower 4 bytes of an 8-byte LE field
+Function.CCStat_U64 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        p = Add(buf, off)
+        v = Add(GetByte(p, 0), Multiply(GetByte(p, 1), 256))
+        v = Add(v, Multiply(GetByte(p, 2), 65536))
+        v = Add(v, Multiply(GetByte(p, 3), 16777216))
+        ReturnValue(v)
+    }
+}
+
+// Write "drwxr-xr-x" into CCStatState.perm_buf
+Function.CCStat_BuildPerms {
+    Input: mode: Integer
+    Body: {
+        ft = BitwiseAnd(mode, CCStatSys.S_IFMT)
+        tc = 45
+        IfCondition EqualTo(ft, CCStatSys.S_IFDIR)  ThenBlock: { tc = 100 }
+        IfCondition EqualTo(ft, CCStatSys.S_IFLNK)  ThenBlock: { tc = 108 }
+        IfCondition EqualTo(ft, CCStatSys.S_IFCHR)  ThenBlock: { tc = 99  }
+        IfCondition EqualTo(ft, CCStatSys.S_IFBLK)  ThenBlock: { tc = 98  }
+        IfCondition EqualTo(ft, CCStatSys.S_IFIFO)  ThenBlock: { tc = 112 }
+        IfCondition EqualTo(ft, CCStatSys.S_IFSOCK) ThenBlock: { tc = 115 }
+        SetByte(CCStatState.perm_buf, 0, tc)
+        bits = BitwiseAnd(mode, 511)
+        i = 0
+        WhileLoop LessThan(i, 9) {
+            bit = BitwiseAnd(RightShift(bits, Subtract(8, i)), 1)
+            goff = Modulo(i, 3)
+            ch = 45
+            IfCondition EqualTo(bit, 1) ThenBlock: {
+                IfCondition EqualTo(goff, 0) ThenBlock: { ch = 114 }
+                IfCondition EqualTo(goff, 1) ThenBlock: { ch = 119 }
+                IfCondition EqualTo(goff, 2) ThenBlock: { ch = 120 }
+            }
+            SetByte(CCStatState.perm_buf, Add(i, 1), ch)
+            i = Add(i, 1)
+        }
+        SetByte(CCStatState.perm_buf, 10, 0)
+    }
+}
+
+// Write "0755" into CCStatState.oct_buf
+Function.CCStat_BuildOctal {
+    Input: mode: Integer
+    Body: {
+        bits = BitwiseAnd(mode, 511)
+        special = BitwiseAnd(RightShift(mode, 9), 7)
+        SetByte(CCStatState.oct_buf, 0, 48)
+        SetByte(CCStatState.oct_buf, 1, Add(48, special))
+        SetByte(CCStatState.oct_buf, 2, Add(48, BitwiseAnd(RightShift(bits, 6), 7)))
+        SetByte(CCStatState.oct_buf, 3, Add(48, BitwiseAnd(RightShift(bits, 3), 7)))
+        SetByte(CCStatState.oct_buf, 4, Add(48, BitwiseAnd(bits, 7)))
+        SetByte(CCStatState.oct_buf, 5, 0)
+    }
+}
+
+// Run fstatat, fill out_buf, return 1 on success 0 on error
+Function.CCStat_DoStat {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        statbuf = Allocate(CCStatConst.STAT_SIZE)
+        rc = SystemCall(CCStatSys.SYS_FSTATAT, CCStatSys.AT_FDCWD, path, statbuf, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            Deallocate(statbuf, CCStatConst.STAT_SIZE)
+            ReturnValue(0)
+        }
+        mode  = CCStat_U32(statbuf, 24)
+        uid   = CCStat_U32(statbuf, 28)
+        gid   = CCStat_U32(statbuf, 32)
+        size  = CCStat_U64(statbuf, 48)
+        inode = CCStat_U64(statbuf, 8)
+        nlink = CCStat_U64(statbuf, 16)
+        mtime = CCStat_U64(statbuf, 88)
+        Deallocate(statbuf, CCStatConst.STAT_SIZE)
+
+        ft = BitwiseAnd(mode, CCStatSys.S_IFMT)
+        type_str = "unknown"
+        IfCondition EqualTo(ft, CCStatSys.S_IFREG)  ThenBlock: { type_str = "regular file" }
+        IfCondition EqualTo(ft, CCStatSys.S_IFDIR)  ThenBlock: { type_str = "directory" }
+        IfCondition EqualTo(ft, CCStatSys.S_IFLNK)  ThenBlock: { type_str = "symbolic link" }
+        IfCondition EqualTo(ft, CCStatSys.S_IFCHR)  ThenBlock: { type_str = "character device" }
+        IfCondition EqualTo(ft, CCStatSys.S_IFBLK)  ThenBlock: { type_str = "block device" }
+        IfCondition EqualTo(ft, CCStatSys.S_IFIFO)  ThenBlock: { type_str = "fifo" }
+        IfCondition EqualTo(ft, CCStatSys.S_IFSOCK) ThenBlock: { type_str = "socket" }
+
+        CCStat_BuildPerms(mode)
+        CCStat_BuildOctal(mode)
+
+        CCStatState.out_pos = 0
+        CCStat_AppendStr("File:  ")  CCStat_AppendStr(path)           CCStat_AppendStr("\n")
+        CCStat_AppendStr("Type:  ")  CCStat_AppendStr(type_str)        CCStat_AppendStr("\n")
+        CCStat_AppendStr("Size:  ")  CCStat_AppendInt(size)            CCStat_AppendStr("\n")
+        CCStat_AppendStr("Perms: ")  CCStat_AppendStr(CCStatState.oct_buf)
+        CCStat_AppendStr(" (")       CCStat_AppendStr(CCStatState.perm_buf)  CCStat_AppendStr(")\n")
+        CCStat_AppendStr("Inode: ")  CCStat_AppendInt(inode)           CCStat_AppendStr("\n")
+        CCStat_AppendStr("Links: ")  CCStat_AppendInt(nlink)           CCStat_AppendStr("\n")
+        CCStat_AppendStr("UID:   ")  CCStat_AppendInt(uid)             CCStat_AppendStr("\n")
+        CCStat_AppendStr("GID:   ")  CCStat_AppendInt(gid)             CCStat_AppendStr("\n")
+        CCStat_AppendStr("mtime: ")  CCStat_AppendInt(mtime)           CCStat_AppendStr("\n")
+        SetByte(CCStatState.out_buf, CCStatState.out_pos, 0)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// IPC LAYER
+// =============================================================================
+
+Function.CCStat_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Stat", "Get file metadata: type, size, permissions, inode, uid, gid, mtime")
+        UtilArgs_AddField(s, "path", "path", 1, "Absolute path to file or directory", "path")
+        ReturnValue(s)
+    }
+}
+
+Function.CCStat_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCStat_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCStat_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCStatState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCStat_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCStat_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCStat_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCStat_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCStat_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id   = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCStatState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCStat_SendError(client_fd, id, "missing required argument 'path'")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            path = UtilArgs_GetString(validated, "path")
+            IfCondition EqualTo(path, 0) ThenBlock: {
+                CCStat_SendError(client_fd, id, "path is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            ok = CCStat_DoStat(path)
+            IfCondition EqualTo(ok, 0) ThenBlock: {
+                err = StringConcat("stat failed: ", path)
+                CCStat_SendError(client_fd, id, err)
+            } ElseBlock: {
+                CCStat_SendResult(client_fd, id, CCStatState.out_buf)
+            }
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCStat_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+SubRoutine.Main {
+    CCStatConst.SOCK_PATH = "@halcode/Stat"
+    CCStatState.schema   = CCStat_BuildSchema()
+    CCStatState.out_buf  = Allocate(Add(CCStatConst.OUT_CAP, 1))
+    CCStatState.perm_buf = Allocate(12)
+    CCStatState.oct_buf  = Allocate(8)
+
+    SystemCall(CCStatSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCStatSys.SYS_UNLINK, CCStatConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_stat_ipc] socket create failed\n")
+        Exit(1)
+    }
+    Socket.BindUnix(fd, CCStatConst.SOCK_PATH)
+    Socket.Listen(fd, CCStatConst.BACKLOG)
+    CCStatState.listen_fd = fd
+    PrintMessage("[cc_stat_ipc] listening on @halcode/Stat\n")
+
+    WhileLoop EqualTo(CCStatState.running, 1) {
+        client_fd = Socket.Accept(CCStatState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCStat_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCStatState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

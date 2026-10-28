@@ -1,0 +1,639 @@
+// cc_mcp_ipc.ailang — HalCode9000 MCP Bridge (dual-mode)
+//
+// Mode 1 — IPC daemon (argv[2] present, launched by CC_LaunchTool):
+//   Binds @halcode/MCP and serves HalCode9000's internal model.
+//   Schema: {server_cmd, server_args, tool_name, tool_args}
+//
+// Mode 2 — stdio MCP server (no argv, invoked standalone):
+//   Speaks NDJSON MCP protocol to Claude Code / any MCP client.
+//   Routes tool calls to @halcode/Agent, Bash, Relmem, Pgmem.
+//   Register: claude mcp add -s user halcode9000 -- /path/to/cc_mcp_ipc.x
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+
+FixedPool.MCPSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_GETPID":    Initialize=39
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_TIME":      Initialize=201
+}
+
+FixedPool.MCPState {
+    "running": Initialize=1, CanChange=True
+}
+
+// IPC daemon mode state
+FixedPool.CCMcpConst {
+    "BACKLOG": Initialize=8
+}
+FixedPool.CCMcpState {
+    "listen_fd": Initialize=-1, CanChange=True
+    "running":   Initialize=1, CanChange=True
+}
+
+// =============================================================================
+// ARGV HELPER — read one argument from /proc/self/cmdline (null-separated)
+// =============================================================================
+
+Function.CCMcp_GetArg {
+    Input: target_index: Integer
+    Output: Address
+    Body: {
+        fd = SystemCall(MCPSys.SYS_OPEN, "/proc/self/cmdline", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(4096)
+        n   = SystemCall(MCPSys.SYS_READ, fd, buf, 4096, 0, 0)
+        SystemCall(MCPSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 4096)
+            ReturnValue(0)
+        }
+        cur = 0
+        off = 0
+        WhileLoop LessThan(cur, target_index) {
+            WhileLoop LessThan(off, n) {
+                ch  = GetByte(buf, off)
+                off = Add(off, 1)
+                IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            }
+            cur = Add(cur, 1)
+        }
+        IfCondition GreaterEqual(off, n) ThenBlock: {
+            Deallocate(buf, 4096)
+            ReturnValue(0)
+        }
+        start = off
+        len   = 0
+        WhileLoop LessThan(off, n) {
+            ch  = GetByte(buf, off)
+            IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            len = Add(len, 1)
+            off = Add(off, 1)
+        }
+        IfCondition EqualTo(len, 0) ThenBlock: {
+            Deallocate(buf, 4096)
+            ReturnValue(0)
+        }
+        out = Allocate(Add(len, 1))
+        i   = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(buf, Add(start, i))
+            SetByte(out, i, ch)
+            i  = Add(i, 1)
+        }
+        SetByte(out, len, 0)
+        Deallocate(buf, 4096)
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// STDIO MCP SERVER — FRAMING (NDJSON)
+//
+// Claude Code sends raw JSON terminated by \n — no Content-Length headers.
+// MCP_ReadFrame reads until \n; MCP_WriteFrame appends \n.
+// =============================================================================
+
+Function.MCP_WriteFrame {
+    Input: fd: Integer
+    Input: body: Address
+    Body: {
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        body_len = StringLength(body)
+        SystemCall(MCPSys.SYS_WRITE, fd, body, body_len, 0, 0)
+        nl = Allocate(2)
+        SetByte(nl, 0, 10)
+        SetByte(nl, 1, 0)
+        SystemCall(MCPSys.SYS_WRITE, fd, nl, 1, 0, 0)
+    }
+}
+
+// Read one newline-terminated JSON line from fd.
+// Returns null-terminated string (newline stripped), or 0 on EOF/error.
+Function.MCP_ReadFrame {
+    Input: fd: Integer
+    Output: Address
+    Body: {
+        cap  = 4096
+        buf  = Allocate(cap)
+        used = 0
+        one  = Allocate(2)
+
+        WhileLoop EqualTo(1, 1) {
+            n = SystemCall(MCPSys.SYS_READ, fd, one, 1, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                IfCondition EqualTo(used, 0) ThenBlock: { ReturnValue(0) }
+                BreakLoop
+            }
+            b = GetByte(one, 0)
+            IfCondition EqualTo(b, 10) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(b, 13) ThenBlock: { ContinueLoop }
+
+            need = Add(used, 2)
+            IfCondition GreaterEqual(need, cap) ThenBlock: {
+                IfCondition GreaterEqual(cap, 1048576) ThenBlock: { ReturnValue(0) }
+                new_cap = Multiply(cap, 2)
+                new_buf = Allocate(new_cap)
+                MemoryCopy(new_buf, buf, used)
+                Deallocate(buf, cap)
+                buf = new_buf
+                cap = new_cap
+            }
+            SetByte(buf, used, b)
+            used = Add(used, 1)
+        }
+
+        SetByte(buf, used, 0)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// STDIO MCP SERVER — JSON-RPC RESPONSE HELPERS
+// =============================================================================
+
+// Returns pre-serialized JSON id fragment preserving the original type.
+Function.MCP_GetIdFrag {
+    Input: obj: Address
+    Output: Address
+    Body: {
+        t = JSON.GetType(obj, "id")
+        IfCondition EqualTo(t, JType.STRING) ThenBlock: {
+            s    = JSON.GetString(obj, "id")
+            esc  = JSON.EscapeString(s)
+            frag = StringConcat("\"", esc)
+            frag = StringConcat(frag, "\"")
+            ReturnValue(frag)
+        }
+        IfCondition EqualTo(t, JType.NUMBER) ThenBlock: {
+            n = JSON.GetNumber(obj, "id")
+            ReturnValue(NumberToString(n))
+        }
+        ReturnValue("null")
+    }
+}
+
+Function.MCP_WriteResult {
+    Input: id: Address
+    Input: result_json: Address
+    Body: {
+        body = StringConcat("{\"jsonrpc\":\"2.0\",\"id\":", id)
+        body = StringConcat(body, ",\"result\":")
+        body = StringConcat(body, result_json)
+        body = StringConcat(body, "}")
+        MCP_WriteFrame(1, body)
+    }
+}
+
+Function.MCP_WriteError {
+    Input: id: Address
+    Input: message: Address
+    Body: {
+        esc  = JSON.EscapeString(message)
+        body = StringConcat("{\"jsonrpc\":\"2.0\",\"id\":", id)
+        body = StringConcat(body, ",\"error\":{\"code\":-32000,\"message\":\"")
+        body = StringConcat(body, esc)
+        body = StringConcat(body, "\"}}")
+        MCP_WriteFrame(1, body)
+    }
+}
+
+Function.MCP_WriteToolResult {
+    Input: id: Address
+    Input: text: Address
+    Body: {
+        safe = text
+        IfCondition EqualTo(safe, 0) ThenBlock: { safe = "" }
+        esc  = JSON.EscapeString(safe)
+        body = StringConcat("{\"jsonrpc\":\"2.0\",\"id\":", id)
+        body = StringConcat(body, ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"")
+        body = StringConcat(body, esc)
+        body = StringConcat(body, "\"}]}}")
+        MCP_WriteFrame(1, body)
+    }
+}
+
+Function.MCP_WriteToolError {
+    Input: id: Address
+    Input: message: Address
+    Body: {
+        esc  = JSON.EscapeString(message)
+        body = StringConcat("{\"jsonrpc\":\"2.0\",\"id\":", id)
+        body = StringConcat(body, ",\"result\":{\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"")
+        body = StringConcat(body, esc)
+        body = StringConcat(body, "\"}]}}")
+        MCP_WriteFrame(1, body)
+    }
+}
+
+// =============================================================================
+// STDIO MCP SERVER — IPC HELPERS (@halcode/* daemons)
+// =============================================================================
+
+Function.HC_CallTool {
+    Input: sock_path: Address
+    Input: args_json: Address
+    Input: timeout_ms: Integer
+    Output: Address
+    Body: {
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        rc = Socket.ConnectUnix(fd, sock_path)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+        Socket.SetRecvTimeout(fd, timeout_ms)
+
+        envelope = StringConcat("{\"method\":\"call\",\"id\":\"1\",\"args\":", args_json)
+        envelope = StringConcat(envelope, "}")
+        Socket.SendMsg(fd, envelope)
+
+        resp_str = Socket.RecvMsg(fd)
+        Socket.Close(fd)
+        IfCondition EqualTo(resp_str, 0) ThenBlock: { ReturnValue(0) }
+
+        parsed   = ParseJSON(resp_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        resp_obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(resp_obj, 0) ThenBlock: { ReturnValue(0) }
+
+        ok = JSON.GetBool(resp_obj, "ok")
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            err = JSON.GetString(resp_obj, "error")
+            IfCondition NotEqual(err, 0) ThenBlock: { ReturnValue(err) }
+            ReturnValue("IPC call failed")
+        }
+        ReturnValue(JSON.GetString(resp_obj, "content"))
+    }
+}
+
+Function.HC_PollPgmem {
+    Input: key: Address
+    Output: Address
+    Body: {
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        rc = Socket.ConnectUnix(fd, "@halcode/Pgmem")
+        IfCondition LessThan(rc, 0) ThenBlock: { Socket.Close(fd) ReturnValue(0) }
+        Socket.SetRecvTimeout(fd, 5000)
+
+        pg_args  = StringConcat("{\"op\":\"pickup\",\"key\":\"", key)
+        pg_args  = StringConcat(pg_args, "\"}")
+        envelope = StringConcat("{\"method\":\"call\",\"id\":\"1\",\"args\":", pg_args)
+        envelope = StringConcat(envelope, "}")
+        Socket.SendMsg(fd, envelope)
+
+        resp_str = Socket.RecvMsg(fd)
+        Socket.Close(fd)
+        IfCondition EqualTo(resp_str, 0) ThenBlock: { ReturnValue(0) }
+
+        parsed   = ParseJSON(resp_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        resp_obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(resp_obj, 0) ThenBlock: { ReturnValue(0) }
+
+        ok = JSON.GetBool(resp_obj, "ok")
+        IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+
+        ReturnValue(JSON.GetString(resp_obj, "content"))
+    }
+}
+
+Function.MCP_UniqueKey {
+    Output: Address
+    Body: {
+        t   = SystemCall(MCPSys.SYS_TIME, 0, 0, 0, 0, 0)
+        p   = SystemCall(MCPSys.SYS_GETPID, 0, 0, 0, 0, 0)
+        key = StringConcat("cc_mcp_", NumberToString(t))
+        key = StringConcat(key, "_")
+        key = StringConcat(key, NumberToString(p))
+        ReturnValue(key)
+    }
+}
+
+// =============================================================================
+// STDIO MCP SERVER — TOOL HANDLERS
+// =============================================================================
+
+Function.Tool_DeepSeek {
+    Input: id: Address
+    Input: args_obj: Address
+    Body: {
+        prompt = JSON.GetString(args_obj, "prompt")
+        IfCondition EqualTo(prompt, 0) ThenBlock: {
+            MCP_WriteToolError(id, "missing required field: prompt")
+            ReturnValue(0)
+        }
+
+        r_key   = MCP_UniqueKey()
+        ctx_key = StringConcat("_ctx_", r_key)
+
+        esc_prompt = JSON.EscapeString(prompt)
+        agent_args = StringConcat("{\"task_prompt\":\"", esc_prompt)
+        agent_args = StringConcat(agent_args, "\",\"context_key\":\"")
+        agent_args = StringConcat(agent_args, ctx_key)
+        agent_args = StringConcat(agent_args, "\",\"result_key\":\"")
+        agent_args = StringConcat(agent_args, r_key)
+        agent_args = StringConcat(agent_args, "\"}")
+
+        spawn = HC_CallTool("@halcode/Agent", agent_args, 10000)
+        IfCondition EqualTo(spawn, 0) ThenBlock: {
+            MCP_WriteToolError(id, "DeepSeek agent unavailable — is HalCode9000 running?")
+            ReturnValue(0)
+        }
+
+        poll_i = 0
+        result = 0
+        WhileLoop LessThan(poll_i, 60) {
+            ts = Allocate(16)
+            StoreValue(ts, 2)
+            StoreValue(Add(ts, 8), 0)
+            SystemCall(MCPSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+            Deallocate(ts, 16)
+
+            result = HC_PollPgmem(r_key)
+            IfCondition NotEqual(result, 0) ThenBlock: { BreakLoop }
+            poll_i = Add(poll_i, 1)
+        }
+
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            MCP_WriteToolError(id, "DeepSeek timed out after 120s. Check /tmp/hal_agent_*.log for details.")
+        } ElseBlock: {
+            MCP_WriteToolResult(id, result)
+        }
+    }
+}
+
+Function.Tool_Bash {
+    Input: id: Address
+    Input: args_obj: Address
+    Body: {
+        cmd = JSON.GetString(args_obj, "command")
+        IfCondition EqualTo(cmd, 0) ThenBlock: {
+            MCP_WriteToolError(id, "missing required field: command")
+            ReturnValue(0)
+        }
+        esc_cmd   = JSON.EscapeString(cmd)
+        bash_args = StringConcat("{\"command\":\"", esc_cmd)
+        bash_args = StringConcat(bash_args, "\",\"timeout_secs\":30}")
+        content   = HC_CallTool("@halcode/Bash", bash_args, 60000)
+        IfCondition EqualTo(content, 0) ThenBlock: {
+            MCP_WriteToolError(id, "Bash daemon unavailable — is HalCode9000 running?")
+        } ElseBlock: {
+            MCP_WriteToolResult(id, content)
+        }
+    }
+}
+
+Function.Tool_Relmem {
+    Input: id: Address
+    Input: args_obj: Address
+    Body: {
+        op = JSON.GetString(args_obj, "op")
+        IfCondition EqualTo(op, 0) ThenBlock: {
+            MCP_WriteToolError(id, "missing required field: op (search|graph|imports|dependents|status)")
+            ReturnValue(0)
+        }
+        args_json = JSON.SerializeObject(args_obj)
+        content   = HC_CallTool("@halcode/Relmem", args_json, 30000)
+        IfCondition EqualTo(content, 0) ThenBlock: {
+            MCP_WriteToolError(id, "Relmem daemon unavailable — is HalCode9000 running?")
+        } ElseBlock: {
+            MCP_WriteToolResult(id, content)
+        }
+    }
+}
+
+Function.MCP_HandleToolCall {
+    Input: id: Address
+    Input: name: Address
+    Input: args_obj: Address
+    Body: {
+        IfCondition EqualTo(StringCompare(name, "DeepSeek"), 0) ThenBlock: {
+            Tool_DeepSeek(id, args_obj)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(name, "Bash"), 0) ThenBlock: {
+            Tool_Bash(id, args_obj)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(name, "Relmem"), 0) ThenBlock: {
+            Tool_Relmem(id, args_obj)
+            ReturnValue(0)
+        }
+        MCP_WriteError(id, "Unknown tool. Available: DeepSeek Bash Relmem")
+    }
+}
+
+// =============================================================================
+// IPC DAEMON MODE — @halcode/MCP
+// Serves HalCode9000's internal model. Schema: {server_cmd, server_args,
+// tool_name, tool_args}. Subprocess MCP spawning is a future feature.
+// =============================================================================
+
+Function.CCMcp_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        esc = JSON.EscapeString(error_msg)
+        IfCondition NotEqual(id, 0) ThenBlock: {
+            esc_id  = JSON.EscapeString(id)
+            resp    = StringConcat("{\"method\":\"result\",\"id\":\"", esc_id)
+            resp    = StringConcat(resp, "\",\"ok\":false,\"error\":\"")
+            resp    = StringConcat(resp, esc)
+            resp    = StringConcat(resp, "\"}")
+            Socket.SendMsg(client_fd, resp)
+            ReturnValue(0)
+        }
+        resp = StringConcat("{\"method\":\"result\",\"ok\":false,\"error\":\"", esc)
+        resp = StringConcat(resp, "\"}")
+        Socket.SendMsg(client_fd, resp)
+    }
+}
+
+Function.CCMcp_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        safe = content
+        IfCondition EqualTo(safe, 0) ThenBlock: { safe = "" }
+        esc_c = JSON.EscapeString(safe)
+        IfCondition NotEqual(id, 0) ThenBlock: {
+            esc_id = JSON.EscapeString(id)
+            resp   = StringConcat("{\"method\":\"result\",\"id\":\"", esc_id)
+            resp   = StringConcat(resp, "\",\"ok\":true,\"content\":\"")
+            resp   = StringConcat(resp, esc_c)
+            resp   = StringConcat(resp, "\"}")
+            Socket.SendMsg(client_fd, resp)
+            ReturnValue(0)
+        }
+        resp = StringConcat("{\"method\":\"result\",\"ok\":true,\"content\":\"", esc_c)
+        resp = StringConcat(resp, "\"}")
+        Socket.SendMsg(client_fd, resp)
+    }
+}
+
+Function.CCMcp_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = "{\"name\":\"MCP\",\"description\":\"Model Context Protocol bridge. Launches an MCP server as a subprocess and calls the specified tool.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"server_cmd\":{\"type\":\"string\"},\"server_args\":{\"type\":\"string\"},\"tool_name\":{\"type\":\"string\"},\"tool_args\":{\"type\":\"object\"}},\"required\":[\"server_cmd\",\"server_args\",\"tool_name\",\"tool_args\"]}}"
+        resp = StringConcat("{\"method\":\"schema_response\",\"schema\":", schema_str)
+        resp = StringConcat(resp, "}")
+        Socket.SendMsg(client_fd, resp)
+    }
+}
+
+Function.CCMcp_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCMcp_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCMcp_SendError(client_fd, 0, "request must be a JSON object")
+            ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCMcp_SendError(client_fd, 0, "missing method")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCMcp_SendSchema(client_fd)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id   = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            IfCondition EqualTo(args, 0) ThenBlock: {
+                CCMcp_SendError(client_fd, id, "missing args")
+                ReturnValue(0)
+            }
+            t_name = JSON.GetString(args, "tool_name")
+            IfCondition EqualTo(t_name, 0) ThenBlock: {
+                CCMcp_SendError(client_fd, id, "missing tool_name in args")
+                ReturnValue(0)
+            }
+            // MCP subprocess spawning — future feature
+            msg = StringConcat("[MCP Bridge] Received request for tool: ", t_name)
+            CCMcp_SendResult(client_fd, id, msg)
+            ReturnValue(0)
+        }
+        CCMcp_SendError(client_fd, 0, "unknown method")
+    }
+}
+
+Function.CCMcp_RunDaemon {
+    Input: sock_path: Address
+    Body: {
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
+        Socket.BindUnix(fd, sock_path)
+        Socket.Listen(fd, CCMcpConst.BACKLOG)
+        CCMcpState.listen_fd = fd
+
+        WhileLoop EqualTo(CCMcpState.running, 1) {
+            client_fd = Socket.Accept(CCMcpState.listen_fd)
+            IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+                done = 0
+                WhileLoop EqualTo(done, 0) {
+                    req = Socket.RecvMsg(client_fd)
+                    IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                    IfCondition NotEqual(req, 0) ThenBlock: {
+                        CCMcp_HandleRequest(client_fd, req)
+                    }
+                }
+                Socket.Close(client_fd)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// MAIN — mode detection
+// argv[2] present → IPC daemon on argv[2] socket
+// no argv         → stdio NDJSON MCP server
+// =============================================================================
+
+SubRoutine.Main {
+    arg2 = CCMcp_GetArg(2)
+    IfCondition NotEqual(arg2, 0) ThenBlock: {
+        arg2_len = StringLength(arg2)
+        IfCondition GreaterThan(arg2_len, 0) ThenBlock: {
+            CCMcp_RunDaemon(arg2)
+            Exit(0)
+        }
+    }
+
+    // stdio MCP server mode
+    init_result  = "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"HalCode9000\",\"version\":\"1.0\"}}"
+    tools_result = "{\"tools\":[{\"name\":\"DeepSeek\",\"description\":\"Run a prompt through DeepSeek AI via HalCode9000. Use for heavy analysis, code generation, or research tasks to spare Anthropic tokens. Async — polls up to 120s for result.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":\"string\",\"description\":\"The task, question, or code to analyse\"},\"system\":{\"type\":\"string\",\"description\":\"Optional system prompt override\"}},\"required\":[\"prompt\"]}},{\"name\":\"Bash\",\"description\":\"Run a shell command via HalCode9000 sandboxed Bash. Hard-blocks: rm mv dd kill sudo pipe-to-shell find / or /mnt. Safe for builds, file reads, git, grep.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell command to execute\"},\"timeout_secs\":{\"type\":\"integer\",\"description\":\"Wall-clock timeout 1-55s (default 30)\"}},\"required\":[\"command\"]}},{\"name\":\"Relmem\",\"description\":\"Query the HalCode9000 symbol graph (ctags + AILang parser). Ops: search query=<text> | graph name=<sym> | imports file=<path> | dependents name=<sym> | status\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"op\":{\"type\":\"string\",\"description\":\"search | graph | imports | dependents | status\"},\"query\":{\"type\":\"string\",\"description\":\"Full-text search query (op=search)\"},\"name\":{\"type\":\"string\",\"description\":\"Symbol name (op=graph or dependents)\"},\"file\":{\"type\":\"string\",\"description\":\"File path (op=imports)\"}},\"required\":[\"op\"]}}]}"
+
+    WhileLoop EqualTo(MCPState.running, 1) {
+        frame = MCP_ReadFrame(0)
+        IfCondition EqualTo(frame, 0) ThenBlock: { BreakLoop }
+
+        parsed = ParseJSON(frame)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ContinueLoop }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: { ContinueLoop }
+
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: { ContinueLoop }
+
+        id = MCP_GetIdFrag(obj)
+
+        IfCondition EqualTo(StringCompare(method, "initialize"), 0) ThenBlock: {
+            MCP_WriteResult(id, init_result)
+            ContinueLoop
+        }
+
+        IfCondition EqualTo(StringCompare(method, "notifications/initialized"), 0) ThenBlock: {
+            ContinueLoop
+        }
+
+        IfCondition EqualTo(StringCompare(method, "tools/list"), 0) ThenBlock: {
+            MCP_WriteResult(id, tools_result)
+            ContinueLoop
+        }
+
+        IfCondition EqualTo(StringCompare(method, "tools/call"), 0) ThenBlock: {
+            params = JSON.GetObject(obj, "params")
+            IfCondition EqualTo(params, 0) ThenBlock: {
+                MCP_WriteError(id, "missing params")
+                ContinueLoop
+            }
+            name = JSON.GetString(params, "name")
+            IfCondition EqualTo(name, 0) ThenBlock: {
+                MCP_WriteError(id, "missing tool name in params")
+                ContinueLoop
+            }
+            args_obj = JSON.GetObject(params, "arguments")
+            IfCondition EqualTo(args_obj, 0) ThenBlock: {
+                args_obj = JSON.NewObject()
+            }
+            MCP_HandleToolCall(id, name, args_obj)
+            ContinueLoop
+        }
+
+        // Unrecognised methods (ping, resources/list, etc.) — ignore silently
+    }
+    Exit(0)
+}
+
+RunTask(Main)

@@ -1,0 +1,177 @@
+{
+  "name": "Hugging Face",
+  "backend": "openai",
+  "base_url": "https://router.huggingface.co/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "HF_TOKEN",
+  "key_hint": "huggingface",
+  "tier": 2,
+  "models": [
+    {
+      "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "display": "DeepSeek V4.1 Flash"
+    },
+    {
+      "id": "tencent/Hy4-preview",
+      "display": "Hy4 preview"
+    },
+    {
+      "id": "zai-org/GLM-5.3-Flash",
+      "display": "GLM-5.3-Flash"
+    },
+    {
+      "id": "Qwen/Qwen3.8-27B",
+      "display": "Qwen3.8 27B"
+    },
+    {
+      "id": "zai-org/GLM-5.3",
+      "display": "GLM-5.3"
+    },
+    {
+      "id": "Qwen/Qwen3.8-2.4T-A95B",
+      "display": "Qwen3.8 2.4T A95B"
+    },
+    {
+      "id": "thinkingmachines/Inkling-Small",
+      "display": "Inkling Small"
+    },
+    {
+      "id": "moonshotai/Kimi-K3",
+      "display": "Kimi K3"
+    },
+    {
+      "id": "thinkingmachines/Inkling",
+      "display": "Inkling"
+    },
+    {
+      "id": "tencent/Hy3",
+      "display": "Hy3"
+    },
+    {
+      "id": "zai-org/GLM-5.2",
+      "display": "GLM-5.2"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.7-Code",
+      "display": "Kimi K2.7 Code"
+    },
+    {
+      "id": "MiniMaxAI/MiniMax-M3",
+      "display": "MiniMax-M3"
+    },
+    {
+      "id": "stepfun-ai/Step-3.7-Flash",
+      "display": "Step 3.7 Flash"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Flash",
+      "display": "DeepSeek V4 Flash"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Pro",
+      "display": "DeepSeek V4 Pro"
+    },
+    {
+      "id": "XiaomiMiMo/MiMo-V2.5-Pro",
+      "display": "MiMo-V2.5-Pro"
+    },
+    {
+      "id": "XiaomiMiMo/MiMo-V2.5",
+      "display": "MiMo-V2.5"
+    },
+    {
+      "id": "Qwen/Qwen3.6-27B",
+      "display": "Qwen3.6 27B"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.6",
+      "display": "Kimi-K2.6"
+    },
+    {
+      "id": "Qwen/Qwen3.6-35B-A3B",
+      "display": "Qwen3.6 35B-A3B"
+    },
+    {
+      "id": "zai-org/GLM-5.1",
+      "display": "GLM-5.1"
+    },
+    {
+      "id": "google/gemma-4-31B-it",
+      "display": "Gemma 4 31B IT"
+    },
+    {
+      "id": "google/gemma-4-26B-A4B-it",
+      "display": "Gemma 4 26B A4B IT"
+    },
+    {
+      "id": "MiniMaxAI/MiniMax-M2.7",
+      "display": "MiniMax-M2.7"
+    },
+    {
+      "id": "Qwen/Qwen3.5-27B",
+      "display": "Qwen3.5 27B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-35B-A3B",
+      "display": "Qwen3.5 35B-A3B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-122B-A10B",
+      "display": "Qwen3.5 122B-A10B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-9B",
+      "display": "Qwen3.5 9B"
+    },
+    {
+      "id": "MiniMaxAI/MiniMax-M2.5",
+      "display": "MiniMax-M2.5"
+    },
+    {
+      "id": "zai-org/GLM-5",
+      "display": "GLM-5"
+    },
+    {
+      "id": "Qwen/Qwen3-Coder-Next",
+      "display": "Qwen3-Coder-Next"
+    },
+    {
+      "id": "Qwen/Qwen3.5-397B-A17B",
+      "display": "Qwen3.5-397B-A17B"
+    },
+    {
+      "id": "stepfun-ai/Step-3.5-Flash",
+      "display": "Step 3.5 Flash"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.5",
+      "display": "Kimi-K2.5"
+    },
+    {
+      "id": "MiniMaxAI/MiniMax-M2.1",
+      "display": "MiniMax-M2.1"
+    },
+    {
+      "id": "zai-org/GLM-4.7",
+      "display": "GLM-4.7"
+    },
+    {
+      "id": "XiaomiMiMo/MiMo-V2-Flash",
+      "display": "MiMo-V2-Flash"
+    },
+    {
+      "id": "zai-org/AutoGLM-Phone-9B-Multilingual",
+      "display": "AutoGLM Phone 9B Multilingual"
+    },
+    {
+      "id": "zai-org/GLM-4.6V-Flash",
+      "display": "GLM-4.6V-Flash"
+    }
+  ],
+  "default_model": "Qwen/Qwen3.8-27B",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no HF_TOKEN set \u2014 models.dev catalog"
+}

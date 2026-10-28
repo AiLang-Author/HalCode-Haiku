@@ -1,0 +1,43 @@
+# ── Private tool sources ─────────────────────────────────────────────────────
+cc_tools/cc_pgmem_ipc.ailang
+cc_tools/cc_pgmem_ipc.ailang.bak
+cc_tools/cc_relmem_ipc.ailang
+cc_tools/*.ailang.bak
+
+# ── Scratch / dev notes ──────────────────────────────────────────────────────
+deepseek_agent_docs.md
+GEMINI_PROMPT_wire_backend.txt
+backends/GEMINI_PROMPT_openai_backend.txt
+hal_tool_test.txt
+"deepseek anthropic connector info.txt"
+deepseek\ anthropic\ connector\ info.txt
+model\ rating\ template.txt
+psuedocodemodelselector.txt
+sql.sql
+stuff.php
+paperclip_optimizer.py
+pluto-*
+workspace.code-workspace
+
+# ── Build / object files ─────────────────────────────────────────────────────
+*.o
+*.a
+*.bak
+*.zip
+__pycache__/
+*.pyc
+nohup.out
+
+# ── OS junk ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Local window build (compile on Haiku) ────────────────────────────────────
+shell/halcode_shell_haiku
+shell/write_hello_frame
+
+# ── Dev screenshots / scratch ────────────────────────────────────────────────
+Screenshot*.png
+failed text boundry .png
+/tmp/
+debug.log

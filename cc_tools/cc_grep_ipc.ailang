@@ -1,0 +1,1297 @@
+// cc_grep_ipc.ailang — pattern search IPC tool for HalCode9000.
+//
+// Forked from AiLang_CoreUtils/dist/grep_util/grep.ailang.
+// Argument zoo removed; UtilArgs schema replaces cmdline parser.
+// Added: context lines (-C), recursive dir search, --include glob.
+//
+// Socket: @halcode/Grep
+// Schema: pattern (required), path (required), context (int, default 2),
+//         recursive (int, default 0), fixed (int, default 0),
+//         ignore_case (int, default 0), include (string, optional),
+//         max_results (int, default 0 = unlimited; per-file like grep -m)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Regex_Thompson
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCGrepSys {
+    "SYS_READ":       Initialize=0
+    "SYS_CLOSE":      Initialize=3
+    "SYS_MKDIR":      Initialize=83
+    "SYS_UNLINK":     Initialize=87
+    "SYS_OPENAT":     Initialize=257
+    "SYS_GETDENTS64": Initialize=217
+    "AT_FDCWD":       Initialize=-100
+    "O_RDONLY":       Initialize=0
+    "O_DIRECTORY":    Initialize=65536
+    "DT_DIR":         Initialize=4
+    "DT_REG":         Initialize=8
+}
+
+FixedPool.CCGrepConst {
+    "SOCK_PATH":    Initialize="@halcode/Grep", CanChange=True
+    "BACKLOG":      Initialize=8
+    "MAX_PATTERNS": Initialize=256
+    "BUF_SIZE":     Initialize=1048576
+    "LINE_MAX":     Initialize=4096
+    "RESULT_CAP":   Initialize=524288
+    "MAX_RESULTS":  Initialize=0
+    "DIRBUF_SIZE":  Initialize=32768
+    "MAX_DEPTH":    Initialize=20
+    "MAX_CTX":      Initialize=10
+    "LINE_SLOT":    Initialize=2048
+}
+
+FixedPool.GrepConfig {
+    "case_insensitive": Initialize=0, CanChange=True
+    "invert":           Initialize=0, CanChange=True
+    "line_numbers":     Initialize=1, CanChange=True
+    "fixed":            Initialize=0, CanChange=True
+    "whole_line":       Initialize=0, CanChange=True
+    "word_match":       Initialize=0, CanChange=True
+    "before_ctx":       Initialize=0, CanChange=True
+    "after_ctx":        Initialize=0, CanChange=True
+    "recursive":        Initialize=0, CanChange=True
+    "include_pat":      Initialize=0, CanChange=True
+    "show_prefix":      Initialize=1, CanChange=True
+}
+
+FixedPool.CCGrepState {
+    "schema":       Initialize=0,   CanChange=True
+    "listen_fd":    Initialize=-1,  CanChange=True
+    "running":      Initialize=1,   CanChange=True
+    "result_buf":   Initialize=0,   CanChange=True
+    "result_pos":   Initialize=0,   CanChange=True
+    "match_count":  Initialize=0,   CanChange=True
+    "max_results":  Initialize=0,   CanChange=True
+    "truncated":    Initialize=0,   CanChange=True
+}
+
+// Context ring for before-context lines (circular buffer, slots pre-allocated at startup)
+FixedPool.CCGrepCtx {
+    "ring_slots":  Initialize=0, CanChange=True   // MAX_CTX * LINE_SLOT bytes
+    "ring_lens":   Initialize=0, CanChange=True   // MAX_CTX * 8 byte int array
+    "ring_nos":    Initialize=0, CanChange=True   // MAX_CTX * 8 byte int array
+    "ring_head":   Initialize=0, CanChange=True
+    "ring_count":  Initialize=0, CanChange=True
+    "after_rem":   Initialize=0, CanChange=True
+    "prev_end":    Initialize=0, CanChange=True
+}
+
+FixedPool.Patterns {
+    "ptrs":           Initialize=0, CanChange=True
+    "lens":           Initialize=0, CanChange=True
+    "count":          Initialize=0, CanChange=True
+    "lc_ptrs":        Initialize=0, CanChange=True
+    "longest":        Initialize=0, CanChange=True
+    "regex":          Initialize=0, CanChange=True
+    "bc_tables":      Initialize=0, CanChange=True
+    "rx_prefix":      Initialize=0, CanChange=True
+    "rx_prefix_len":  Initialize=0, CanChange=True
+    "rx_prefix_bc":   Initialize=0, CanChange=True
+    "dfa_ok":         Initialize=0, CanChange=True
+    "strategy":       Initialize=0, CanChange=True
+    "fast_literal_ok":Initialize=0, CanChange=True
+    "fast_pat":       Initialize=0, CanChange=True
+    "fast_plen":      Initialize=0, CanChange=True
+    "fast_first_byte":Initialize=0, CanChange=True
+}
+
+FixedPool.STRATEGY {
+    "EMPTY":              Initialize=0
+    "WHOLE_LINE":         Initialize=1
+    "WORD_MATCH":         Initialize=2
+    "REGEX_PREFIX_BM":    Initialize=3
+    "REGEX_DFA":          Initialize=4
+    "REGEX_NFA":          Initialize=5
+    "REGEX_INSENSITIVE":  Initialize=6
+    "LITERAL_BM":         Initialize=7
+    "LITERAL_INSENSITIVE":Initialize=8
+}
+
+FixedPool.Scratch {
+    "rx":    Initialize=0, CanChange=True
+    "rx_lc": Initialize=0, CanChange=True
+    "digits":Initialize=0, CanChange=True
+    "ready": Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// RESULT BUFFER
+// =============================================================================
+
+Function.CCGrep_Append {
+    Input: data: Address
+    Input: len: Integer
+    Body: {
+        space = Subtract(CCGrepConst.RESULT_CAP, CCGrepState.result_pos)
+        IfCondition LessEqual(space, 0) ThenBlock: {
+            CCGrepState.truncated = 1
+        } ElseBlock: {
+            copy_len = len
+            IfCondition GreaterThan(copy_len, space) ThenBlock: {
+                copy_len = space
+                CCGrepState.truncated = 1
+            }
+            MemoryCopy(Add(CCGrepState.result_buf, CCGrepState.result_pos), data, copy_len)
+            CCGrepState.result_pos = Add(CCGrepState.result_pos, copy_len)
+        }
+    }
+}
+
+Function.CCGrep_AppendStr {
+    Input: str: Address
+    Body: { CCGrep_Append(str, StringLength(str)) }
+}
+
+Function.CCGrep_AppendByte {
+    Input: b: Integer
+    Body: {
+        IfCondition LessThan(CCGrepState.result_pos, CCGrepConst.RESULT_CAP) ThenBlock: {
+            SetByte(CCGrepState.result_buf, CCGrepState.result_pos, b)
+            CCGrepState.result_pos = Add(CCGrepState.result_pos, 1)
+        } ElseBlock: {
+            CCGrepState.truncated = 1
+        }
+    }
+}
+
+Function.CCGrep_AppendUInt {
+    Input: v: Integer
+    Body: {
+        IfCondition EqualTo(v, 0) ThenBlock: {
+            CCGrep_AppendByte(48)
+        } ElseBlock: {
+            n = 0
+            val = v
+            WhileLoop GreaterThan(val, 0) {
+                SetByte(Scratch.digits, n, Add(48, Modulo(val, 10)))
+                val = Divide(val, 10)
+                n = Add(n, 1)
+            }
+            i = Subtract(n, 1)
+            WhileLoop GreaterEqual(i, 0) {
+                CCGrep_AppendByte(GetByte(Scratch.digits, i))
+                i = Subtract(i, 1)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// CONTEXT RING
+// =============================================================================
+
+Function.CCGrep_PushRing {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: line_no: Integer
+    Body: {
+        cap = GrepConfig.before_ctx
+        IfCondition GreaterThan(cap, CCGrepConst.MAX_CTX) ThenBlock: { cap = CCGrepConst.MAX_CTX }
+        IfCondition EqualTo(cap, 0) ThenBlock: { ReturnValue(0) }
+
+        IfCondition LessThan(CCGrepCtx.ring_count, cap) ThenBlock: {
+            slot_idx = Add(CCGrepCtx.ring_head, CCGrepCtx.ring_count)
+            slot_idx = Modulo(slot_idx, cap)
+            CCGrepCtx.ring_count = Add(CCGrepCtx.ring_count, 1)
+        } ElseBlock: {
+            slot_idx = CCGrepCtx.ring_head
+            CCGrepCtx.ring_head = Add(CCGrepCtx.ring_head, 1)
+            CCGrepCtx.ring_head = Modulo(CCGrepCtx.ring_head, cap)
+        }
+
+        slot = Add(CCGrepCtx.ring_slots, Multiply(slot_idx, CCGrepConst.LINE_SLOT))
+        copy_len = line_len
+        IfCondition GreaterEqual(copy_len, CCGrepConst.LINE_SLOT) ThenBlock: {
+            copy_len = Subtract(CCGrepConst.LINE_SLOT, 1)
+        }
+        MemoryCopy(slot, line, copy_len)
+        StoreValue(Add(CCGrepCtx.ring_lens, Multiply(slot_idx, 8)), copy_len)
+        StoreValue(Add(CCGrepCtx.ring_nos,  Multiply(slot_idx, 8)), line_no)
+    }
+}
+
+Function.CCGrep_EmitRing {
+    Input: label: Address
+    Body: {
+        wrap = GrepConfig.before_ctx
+        IfCondition LessThan(wrap, 1) ThenBlock: { wrap = 1 }
+        IfCondition GreaterThan(wrap, CCGrepConst.MAX_CTX) ThenBlock: { wrap = CCGrepConst.MAX_CTX }
+        i = 0
+        WhileLoop LessThan(i, CCGrepCtx.ring_count) {
+            slot_idx = Add(CCGrepCtx.ring_head, i)
+            slot_idx = Modulo(slot_idx, wrap)
+            slot = Add(CCGrepCtx.ring_slots, Multiply(slot_idx, CCGrepConst.LINE_SLOT))
+            slen = Dereference(Add(CCGrepCtx.ring_lens, Multiply(slot_idx, 8)))
+            sno  = Dereference(Add(CCGrepCtx.ring_nos,  Multiply(slot_idx, 8)))
+            IfCondition And(EqualTo(GrepConfig.show_prefix, 1), NotEqual(label, 0)) ThenBlock: {
+                CCGrep_AppendStr(label)
+                CCGrep_AppendByte(45)  // '-'
+            }
+            IfCondition EqualTo(GrepConfig.line_numbers, 1) ThenBlock: {
+                CCGrep_AppendUInt(sno)
+                CCGrep_AppendByte(45)
+            }
+            CCGrep_Append(slot, slen)
+            CCGrep_AppendByte(10)
+            CCGrepCtx.prev_end = sno
+            i = Add(i, 1)
+        }
+        CCGrepCtx.ring_head  = 0
+        CCGrepCtx.ring_count = 0
+    }
+}
+
+Function.CCGrep_EmitLine {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: line_no: Integer
+    Input: label: Address
+    Input: sep: Integer
+    Body: {
+        IfCondition And(EqualTo(GrepConfig.show_prefix, 1), NotEqual(label, 0)) ThenBlock: {
+            CCGrep_AppendStr(label)
+            CCGrep_AppendByte(sep)
+        }
+        IfCondition EqualTo(GrepConfig.line_numbers, 1) ThenBlock: {
+            CCGrep_AppendUInt(line_no)
+            CCGrep_AppendByte(sep)
+        }
+        CCGrep_Append(line, line_len)
+        CCGrep_AppendByte(10)
+        CCGrepCtx.prev_end = line_no
+    }
+}
+
+// =============================================================================
+// GREP ENGINE — forked from AiLang_CoreUtils/dist/grep_util/grep.ailang
+// =============================================================================
+
+Function.ToLowerByte {
+    Input: c: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(c, 65), LessEqual(c, 90)) ThenBlock: {
+            ReturnValue(Add(c, 32))
+        }
+        ReturnValue(c)
+    }
+}
+
+Function.IsWordChar {
+    Input: c: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(c, 48), LessEqual(c, 57))  ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(c, 65), LessEqual(c, 90))  ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(c, 97), LessEqual(c, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 95) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.BuildBadCharTable {
+    Input: pat: Address
+    Input: plen: Integer
+    Output: Address
+    Body: {
+        table = Allocate(256)
+        i = 0
+        WhileLoop LessThan(i, 256) {
+            SetByte(table, i, plen)
+            i = Add(i, 1)
+        }
+        i = 0
+        last = Subtract(plen, 1)
+        WhileLoop LessThan(i, last) {
+            ch = GetByte(pat, i)
+            SetByte(table, ch, Subtract(last, i))
+            i = Add(i, 1)
+        }
+        ReturnValue(table)
+    }
+}
+
+Function.SearchBoyerMoore {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pat: Address
+    Input: plen: Integer
+    Input: table: Address
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(plen, 1) ThenBlock: {
+            ReturnValue(MemChr(line, GetByte(pat, 0), line_len))
+        }
+        first_pat = GetByte(pat, 0)
+        max_start = Subtract(line_len, plen)
+        pos = 0
+        WhileLoop LessEqual(pos, max_start) {
+            remaining = Subtract(line_len, pos)
+            off = MemChr(Add(line, pos), first_pat, remaining)
+            IfCondition LessThan(off, 0) ThenBlock: { ReturnValue(-1) }
+            cand = Add(pos, off)
+            IfCondition GreaterThan(cand, max_start) ThenBlock: { ReturnValue(-1) }
+            IfCondition EqualTo(MemCompare(Add(line, cand), pat, plen), 0) ThenBlock: {
+                ReturnValue(cand)
+            }
+            skip = GetByte(table, GetByte(line, Add(cand, Subtract(plen, 1))))
+            IfCondition EqualTo(skip, 0) ThenBlock: { skip = 1 }
+            pos = Add(cand, skip)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.CompareAt {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pos: Integer
+    Input: pat: Address
+    Input: pat_lc: Address
+    Input: plen: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(Add(pos, plen), line_len) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+            i = 0
+            WhileLoop LessThan(i, plen) {
+                c = ToLowerByte(GetByte(line, Add(pos, i)))
+                IfCondition NotEqual(c, GetByte(pat_lc, i)) ThenBlock: { ReturnValue(0) }
+                i = Add(i, 1)
+            }
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(MemCompare(Add(line, pos), pat, plen), 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.RegexLineSearch {
+    Input: handle: Address
+    Input: scratch: Address
+    Input: line_len: Integer
+    Input: prefix: Address
+    Input: prefix_len: Integer
+    Input: prefix_bc: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(prefix_len, 2) ThenBlock: {
+            search_from = 0
+            WhileLoop LessEqual(search_from, Subtract(line_len, prefix_len)) {
+                found = SearchBoyerMoore(Add(scratch, search_from), Subtract(line_len, search_from),
+                                         prefix, prefix_len, prefix_bc)
+                IfCondition LessThan(found, 0) ThenBlock: { BreakLoop }
+                cand = Add(search_from, found)
+                m = Regex_Match(handle, scratch, cand)
+                IfCondition GreaterEqual(m, 0) ThenBlock: { ReturnValue(1) }
+                search_from = Add(cand, 1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(Patterns.dfa_ok, 1) ThenBlock: {
+            d = Regex_DFASearch(scratch, line_len)
+            // DFASearch: 1 = match, 0 = no match, -1 = overflow (fall through).
+            IfCondition GreaterThan(d, 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(d, 0) ThenBlock: { ReturnValue(0) }
+        }
+        ReturnValue(Regex_Search(handle, scratch, line_len))
+    }
+}
+
+Function.Match_RegexPrefixBM {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        rhandle    = Dereference(Add(Patterns.regex,         Multiply(pi, 8)))
+        rx_pfx     = Dereference(Add(Patterns.rx_prefix,     Multiply(pi, 8)))
+        rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
+        rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
+        pbm_from = 0
+        WhileLoop LessEqual(pbm_from, Subtract(line_len, rx_pfx_len)) {
+            hit = SearchBoyerMoore(Add(line, pbm_from), Subtract(line_len, pbm_from),
+                                   rx_pfx, rx_pfx_len, rx_pfx_bc)
+            IfCondition LessThan(hit, 0) ThenBlock: { BreakLoop }
+            cand = Add(pbm_from, hit)
+            MemoryCopy(Scratch.rx, line, line_len)
+            SetByte(Scratch.rx, line_len, 0)
+            m = Regex_Match(rhandle, Scratch.rx, cand)
+            IfCondition GreaterEqual(m, 0) ThenBlock: { ReturnValue(1) }
+            pbm_from = Add(cand, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_RegexDFA {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        d = Regex_DFASearch(line, line_len)
+        // 1 = match, 0 = no match, -1 = DFA overflow → NFA.
+        IfCondition GreaterThan(d, 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(d, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Match_RegexNFA(line, line_len, pi))
+    }
+}
+
+Function.Match_RegexNFA {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        rhandle = Dereference(Add(Patterns.regex, Multiply(pi, 8)))
+        IfCondition EqualTo(rhandle, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Regex_Search(rhandle, line, line_len))
+    }
+}
+
+Function.Match_RegexInsensitive {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        rhandle    = Dereference(Add(Patterns.regex,         Multiply(pi, 8)))
+        rx_pfx     = Dereference(Add(Patterns.rx_prefix,     Multiply(pi, 8)))
+        rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
+        rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
+        si = 0
+        WhileLoop LessThan(si, line_len) {
+            SetByte(Scratch.rx_lc, si, ToLowerByte(GetByte(line, si)))
+            si = Add(si, 1)
+        }
+        SetByte(Scratch.rx_lc, line_len, 0)
+        IfCondition EqualTo(rhandle, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(RegexLineSearch(rhandle, Scratch.rx_lc, line_len, rx_pfx, rx_pfx_len, rx_pfx_bc))
+    }
+}
+
+Function.Match_LiteralBM {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,      Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,      Multiply(pi, 8)))
+        bc_tbl = Dereference(Add(Patterns.bc_tables, Multiply(pi, 8)))
+        search_from = 0
+        WhileLoop LessEqual(search_from, Subtract(line_len, plen)) {
+            found = SearchBoyerMoore(Add(line, search_from), Subtract(line_len, search_from),
+                                     pat, plen, bc_tbl)
+            IfCondition LessThan(found, 0) ThenBlock: { BreakLoop }
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_LiteralInsensitive {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
+        pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
+        pos = 0
+        WhileLoop LessEqual(pos, Subtract(line_len, plen)) {
+            IfCondition EqualTo(CompareAt(line, line_len, pos, pat, pat_lc, plen), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            pos = Add(pos, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_WholeLine {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
+        pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
+        IfCondition EqualTo(plen, line_len) ThenBlock: {
+            ReturnValue(CompareAt(line, line_len, 0, pat, pat_lc, plen))
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_WordMatch {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
+        pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
+        pos = 0
+        WhileLoop LessEqual(pos, Subtract(line_len, plen)) {
+            IfCondition EqualTo(CompareAt(line, line_len, pos, pat, pat_lc, plen), 1) ThenBlock: {
+                left_ok = EqualTo(pos, 0)
+                IfCondition EqualTo(left_ok, 0) ThenBlock: {
+                    left_ok = EqualTo(IsWordChar(GetByte(line, Subtract(pos, 1))), 0)
+                }
+                end_pos = Add(pos, plen)
+                right_ok = GreaterEqual(end_pos, line_len)
+                IfCondition EqualTo(right_ok, 0) ThenBlock: {
+                    right_ok = EqualTo(IsWordChar(GetByte(line, end_pos)), 0)
+                }
+                IfCondition And(EqualTo(left_ok, 1), EqualTo(right_ok, 1)) ThenBlock: { ReturnValue(1) }
+            }
+            pos = Add(pos, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.LineMatches {
+    Input: line: Address
+    Input: line_len: Integer
+    Output: Integer
+    Body: {
+        pcount = Patterns.count
+        IfCondition LessEqual(pcount, 0) ThenBlock: { ReturnValue(0) }
+        pi = 0
+        WhileLoop LessThan(pi, pcount) {
+            strat = Dereference(Add(Patterns.strategy, Multiply(pi, 8)))
+            hit = 0
+            Branch strat {
+                Case 0: { hit = 1 }
+                Case 1: { hit = Match_WholeLine(line, line_len, pi) }
+                Case 2: { hit = Match_WordMatch(line, line_len, pi) }
+                Case 3: { hit = Match_RegexPrefixBM(line, line_len, pi) }
+                Case 4: { hit = Match_RegexDFA(line, line_len, pi) }
+                Case 5: { hit = Match_RegexNFA(line, line_len, pi) }
+                Case 6: { hit = Match_RegexInsensitive(line, line_len, pi) }
+                Case 7: { hit = Match_LiteralBM(line, line_len, pi) }
+                Case 8: { hit = Match_LiteralInsensitive(line, line_len, pi) }
+            }
+            IfCondition EqualTo(hit, 1) ThenBlock: { ReturnValue(1) }
+            pi = Add(pi, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PATTERN MANAGEMENT
+// =============================================================================
+
+Function.CCGrep_FreePatterns {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, Patterns.count) {
+            p = Dereference(Add(Patterns.ptrs, Multiply(i, 8)))
+            plen = Dereference(Add(Patterns.lens, Multiply(i, 8)))
+            IfCondition NotEqual(p, 0) ThenBlock: {
+                Deallocate(p, Add(plen, 1))
+                StoreValue(Add(Patterns.ptrs, Multiply(i, 8)), 0)
+            }
+            l = Dereference(Add(Patterns.lc_ptrs, Multiply(i, 8)))
+            IfCondition NotEqual(l, 0) ThenBlock: {
+                Deallocate(l, Add(plen, 1))
+                StoreValue(Add(Patterns.lc_ptrs, Multiply(i, 8)), 0)
+            }
+            r = Dereference(Add(Patterns.regex, Multiply(i, 8)))
+            IfCondition NotEqual(r, 0) ThenBlock: {
+                Regex_Free(r)
+                StoreValue(Add(Patterns.regex, Multiply(i, 8)), 0)
+            }
+            b = Dereference(Add(Patterns.bc_tables, Multiply(i, 8)))
+            IfCondition NotEqual(b, 0) ThenBlock: {
+                Deallocate(b, 256)
+                StoreValue(Add(Patterns.bc_tables, Multiply(i, 8)), 0)
+            }
+            pfx = Dereference(Add(Patterns.rx_prefix, Multiply(i, 8)))
+            IfCondition NotEqual(pfx, 0) ThenBlock: {
+                Deallocate(pfx, 32)
+                StoreValue(Add(Patterns.rx_prefix, Multiply(i, 8)), 0)
+            }
+            pbc = Dereference(Add(Patterns.rx_prefix_bc, Multiply(i, 8)))
+            IfCondition NotEqual(pbc, 0) ThenBlock: {
+                Deallocate(pbc, 256)
+                StoreValue(Add(Patterns.rx_prefix_bc, Multiply(i, 8)), 0)
+            }
+            i = Add(i, 1)
+        }
+        Patterns.count = 0
+    }
+}
+
+Function.CCGrep_InitPatterns {
+    Body: {
+        n = CCGrepConst.MAX_PATTERNS
+        Patterns.ptrs          = Allocate(Multiply(n, 8))
+        Patterns.lens          = Allocate(Multiply(n, 8))
+        Patterns.lc_ptrs       = Allocate(Multiply(n, 8))
+        Patterns.regex         = Allocate(Multiply(n, 8))
+        Patterns.bc_tables     = Allocate(Multiply(n, 8))
+        Patterns.rx_prefix     = Allocate(Multiply(n, 8))
+        Patterns.rx_prefix_len = Allocate(Multiply(n, 8))
+        Patterns.rx_prefix_bc  = Allocate(Multiply(n, 8))
+        Patterns.strategy      = Allocate(Multiply(n, 8))
+        Patterns.count   = 0
+        Patterns.longest = 0
+    }
+}
+
+Function.CCGrep_AddPattern {
+    Input: str: Address
+    Body: {
+        n = Patterns.count
+        IfCondition GreaterEqual(n, CCGrepConst.MAX_PATTERNS) ThenBlock: { ReturnValue(0) }
+        plen = StringLength(str)
+        own = Allocate(Add(plen, 1))
+        lc  = Allocate(Add(plen, 1))
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            c = GetByte(str, i)
+            SetByte(own, i, c)
+            SetByte(lc, i, ToLowerByte(c))
+            i = Add(i, 1)
+        }
+        SetByte(own, plen, 0)
+        SetByte(lc, plen, 0)
+        StoreValue(Add(Patterns.ptrs,    Multiply(n, 8)), own)
+        StoreValue(Add(Patterns.lc_ptrs, Multiply(n, 8)), lc)
+        StoreValue(Add(Patterns.lens,    Multiply(n, 8)), plen)
+        StoreValue(Add(Patterns.regex,   Multiply(n, 8)), 0)
+        Patterns.count = Add(n, 1)
+        IfCondition GreaterThan(plen, Patterns.longest) ThenBlock: { Patterns.longest = plen }
+    }
+}
+
+Function.CCGrep_CompilePatterns {
+    Body: {
+        IfCondition EqualTo(GrepConfig.fixed, 0) ThenBlock: {
+            i = 0
+            WhileLoop LessThan(i, Patterns.count) {
+                IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+                    pat = Dereference(Add(Patterns.lc_ptrs, Multiply(i, 8)))
+                } ElseBlock: {
+                    pat = Dereference(Add(Patterns.ptrs, Multiply(i, 8)))
+                }
+                handle = Regex_Compile(pat, 0)
+                StoreValue(Add(Patterns.regex, Multiply(i, 8)), handle)
+                IfCondition NotEqual(handle, 0) ThenBlock: {
+                    prefix_buf = Allocate(32)
+                    prefix_len = Regex_GetPrefix(handle, prefix_buf, 32)
+                    StoreValue(Add(Patterns.rx_prefix,     Multiply(i, 8)), prefix_buf)
+                    StoreValue(Add(Patterns.rx_prefix_len, Multiply(i, 8)), prefix_len)
+                    IfCondition GreaterEqual(prefix_len, 2) ThenBlock: {
+                        tbl = BuildBadCharTable(prefix_buf, prefix_len)
+                        StoreValue(Add(Patterns.rx_prefix_bc, Multiply(i, 8)), tbl)
+                    }
+                }
+                i = Add(i, 1)
+            }
+        }
+        bi = 0
+        WhileLoop LessThan(bi, Patterns.count) {
+            pat  = Dereference(Add(Patterns.ptrs, Multiply(bi, 8)))
+            plen = Dereference(Add(Patterns.lens, Multiply(bi, 8)))
+            IfCondition GreaterThan(plen, 0) ThenBlock: {
+                tbl = BuildBadCharTable(pat, plen)
+                StoreValue(Add(Patterns.bc_tables, Multiply(bi, 8)), tbl)
+            }
+            bi = Add(bi, 1)
+        }
+        Patterns.dfa_ok = 0
+        IfCondition EqualTo(Patterns.count, 1) ThenBlock: {
+            h = Dereference(Patterns.regex)
+            IfCondition NotEqual(h, 0) ThenBlock: { Patterns.dfa_ok = Regex_DFAInit(h) }
+        }
+        si = 0
+        WhileLoop LessThan(si, Patterns.count) {
+            s_plen   = Dereference(Add(Patterns.lens,          Multiply(si, 8)))
+            s_rhand  = Dereference(Add(Patterns.regex,         Multiply(si, 8)))
+            s_pfxlen = Dereference(Add(Patterns.rx_prefix_len, Multiply(si, 8)))
+            strat = STRATEGY.LITERAL_BM
+            IfCondition EqualTo(s_plen, 0) ThenBlock: {
+                strat = STRATEGY.EMPTY
+            } ElseBlock: {
+                IfCondition EqualTo(GrepConfig.whole_line, 1) ThenBlock: {
+                    strat = STRATEGY.WHOLE_LINE
+                } ElseBlock: {
+                    IfCondition EqualTo(GrepConfig.word_match, 1) ThenBlock: {
+                        strat = STRATEGY.WORD_MATCH
+                    } ElseBlock: {
+                        IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+                            IfCondition NotEqual(s_rhand, 0) ThenBlock: {
+                                strat = STRATEGY.REGEX_INSENSITIVE
+                            } ElseBlock: {
+                                strat = STRATEGY.LITERAL_INSENSITIVE
+                            }
+                        } ElseBlock: {
+                            IfCondition NotEqual(s_rhand, 0) ThenBlock: {
+                                IfCondition GreaterEqual(s_pfxlen, 2) ThenBlock: {
+                                    strat = STRATEGY.REGEX_PREFIX_BM
+                                } ElseBlock: {
+                                    IfCondition EqualTo(Patterns.dfa_ok, 1) ThenBlock: {
+                                        strat = STRATEGY.REGEX_DFA
+                                    } ElseBlock: {
+                                        strat = STRATEGY.REGEX_NFA
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            StoreValue(Add(Patterns.strategy, Multiply(si, 8)), strat)
+            si = Add(si, 1)
+        }
+    }
+}
+
+// =============================================================================
+// STREAM PROCESSOR — with context ring support
+// =============================================================================
+
+Function.CCGrep_ProcessStream {
+    Input: fd: Integer
+    Input: label: Address
+    Output: Integer
+    Body: {
+        read_buf = Allocate(CCGrepConst.BUF_SIZE)
+        line_buf = Allocate(CCGrepConst.LINE_MAX)
+        line_len = 0
+        line_no  = 0
+        match_count = 0
+        stop_early  = 0
+        is_binary   = 0
+        first_chunk = 1
+
+        // Reset context ring for this file
+        CCGrepCtx.ring_head  = 0
+        CCGrepCtx.ring_count = 0
+        CCGrepCtx.after_rem  = 0
+        CCGrepCtx.prev_end   = 0
+
+        WhileLoop 1 {
+            IfCondition EqualTo(stop_early, 1) ThenBlock: { BreakLoop }
+            n = SystemCall(CCGrepSys.SYS_READ, fd, read_buf, CCGrepConst.BUF_SIZE)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+
+            IfCondition EqualTo(first_chunk, 1) ThenBlock: {
+                first_chunk = 0
+                IfCondition NotEqual(MemChr(read_buf, 0, n), -1) ThenBlock: { is_binary = 1 }
+            }
+
+            i = 0
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(stop_early, 1) ThenBlock: { BreakLoop }
+                remaining  = Subtract(n, i)
+                search_ptr = Add(read_buf, i)
+                nl_offset  = MemChr(search_ptr, 10, remaining)
+
+                IfCondition EqualTo(nl_offset, -1) ThenBlock: {
+                    space_left = Subtract(CCGrepConst.LINE_MAX, line_len)
+                    copy_bytes = remaining
+                    IfCondition GreaterThan(copy_bytes, space_left) ThenBlock: { copy_bytes = space_left }
+                    IfCondition GreaterThan(copy_bytes, 0) ThenBlock: {
+                        MemoryCopy(Add(line_buf, line_len), search_ptr, copy_bytes)
+                        line_len = Add(line_len, copy_bytes)
+                    }
+                    BreakLoop
+                }
+
+                space_left = Subtract(CCGrepConst.LINE_MAX, line_len)
+                copy_bytes = nl_offset
+                IfCondition GreaterThan(copy_bytes, space_left) ThenBlock: { copy_bytes = space_left }
+                IfCondition GreaterThan(copy_bytes, 0) ThenBlock: {
+                    MemoryCopy(Add(line_buf, line_len), search_ptr, copy_bytes)
+                    line_len = Add(line_len, copy_bytes)
+                }
+
+                line_no  = Add(line_no, 1)
+                raw_match = LineMatches(line_buf, line_len)
+                effective = raw_match
+                IfCondition EqualTo(GrepConfig.invert, 1) ThenBlock: {
+                    IfCondition EqualTo(raw_match, 1) ThenBlock: { effective = 0 } ElseBlock: { effective = 1 }
+                }
+
+                IfCondition EqualTo(effective, 1) ThenBlock: {
+                    IfCondition EqualTo(is_binary, 1) ThenBlock: {
+                        IfCondition NotEqual(label, 0) ThenBlock: {
+                            CCGrep_AppendStr("Binary file ")
+                            CCGrep_AppendStr(label)
+                            CCGrep_AppendStr(" matches\n")
+                        }
+                        stop_early = 1
+                    } ElseBlock: {
+                        // Emit separator "--" if gap since last context group
+                        IfCondition And(NotEqual(CCGrepCtx.prev_end, 0),
+                                        GreaterThan(Add(GrepConfig.before_ctx, GrepConfig.after_ctx), 0)) ThenBlock: {
+                            first_grp = line_no
+                            IfCondition GreaterThan(CCGrepCtx.ring_count, 0) ThenBlock: {
+                                first_grp = Dereference(Add(CCGrepCtx.ring_nos, Multiply(CCGrepCtx.ring_head, 8)))
+                            }
+                            IfCondition GreaterThan(first_grp, Add(CCGrepCtx.prev_end, 1)) ThenBlock: {
+                                CCGrep_AppendStr("--\n")
+                            }
+                        }
+                        // Emit before-context ring
+                        IfCondition GreaterThan(CCGrepCtx.ring_count, 0) ThenBlock: {
+                            CCGrep_EmitRing(label)
+                        }
+                        // Emit match line
+                        CCGrep_EmitLine(line_buf, line_len, line_no, label, 58)  // ':'
+                        CCGrepCtx.after_rem = GrepConfig.after_ctx
+                        match_count = Add(match_count, 1)
+                        CCGrepState.match_count = Add(CCGrepState.match_count, 1)
+                        // max_results=0 → unlimited. Otherwise per-file, like grep -m.
+                        IfCondition And(GreaterThan(CCGrepState.max_results, 0), GreaterEqual(match_count, CCGrepState.max_results)) ThenBlock: {
+                            stop_early = 1
+                        }
+                        IfCondition GreaterThan(CCGrepState.truncated, 0) ThenBlock: {
+                            stop_early = 1
+                        }
+                    }
+                } ElseBlock: {
+                    IfCondition GreaterThan(CCGrepCtx.after_rem, 0) ThenBlock: {
+                        CCGrep_EmitLine(line_buf, line_len, line_no, label, 45)  // '-'
+                        CCGrepCtx.after_rem = Subtract(CCGrepCtx.after_rem, 1)
+                        IfCondition GreaterThan(CCGrepState.truncated, 0) ThenBlock: {
+                            stop_early = 1
+                        }
+                    } ElseBlock: {
+                        IfCondition GreaterThan(GrepConfig.before_ctx, 0) ThenBlock: {
+                            CCGrep_PushRing(line_buf, line_len, line_no)
+                        }
+                    }
+                }
+
+                line_len = 0
+                i = Add(i, Add(nl_offset, 1))
+            }
+        }
+
+        // Trailing no-newline line
+        IfCondition And(GreaterThan(line_len, 0), EqualTo(stop_early, 0)) ThenBlock: {
+            line_no = Add(line_no, 1)
+            raw_match = LineMatches(line_buf, line_len)
+            effective = raw_match
+            IfCondition EqualTo(GrepConfig.invert, 1) ThenBlock: {
+                IfCondition EqualTo(raw_match, 1) ThenBlock: { effective = 0 } ElseBlock: { effective = 1 }
+            }
+            IfCondition EqualTo(effective, 1) ThenBlock: {
+                IfCondition GreaterThan(CCGrepCtx.ring_count, 0) ThenBlock: { CCGrep_EmitRing(label) }
+                CCGrep_EmitLine(line_buf, line_len, line_no, label, 58)
+                match_count = Add(match_count, 1)
+                CCGrepState.match_count = Add(CCGrepState.match_count, 1)
+            }
+        }
+
+        Deallocate(line_buf, CCGrepConst.LINE_MAX)
+        Deallocate(read_buf, CCGrepConst.BUF_SIZE)
+        ReturnValue(match_count)
+    }
+}
+
+// =============================================================================
+// RECURSIVE DIRECTORY SEARCH
+// =============================================================================
+
+Function.CCGrep_GlobMatch {
+    Input: name: Address
+    Input: pat: Address
+    Output: Integer
+    Body: {
+        plen = StringLength(pat)
+        nlen = StringLength(name)
+        // *suffix (most common: *.ailang)
+        IfCondition EqualTo(GetByte(pat, 0), 42) ThenBlock: {
+            suf_len = Subtract(plen, 1)
+            IfCondition EqualTo(suf_len, 0) ThenBlock: { ReturnValue(1) }  // bare * = match all
+            IfCondition LessThan(nlen, suf_len) ThenBlock: { ReturnValue(0) }
+            base = Add(name, Subtract(nlen, suf_len))
+            ReturnValue(EqualTo(MemCompare(base, Add(pat, 1), suf_len), 0))
+        }
+        // exact
+        IfCondition NotEqual(nlen, plen) ThenBlock: { ReturnValue(0) }
+        ReturnValue(EqualTo(MemCompare(name, pat, nlen), 0))
+    }
+}
+
+Function.CCGrep_ProcessDir {
+    Input: path: Address
+    Input: depth: Integer
+    Body: {
+        IfCondition GreaterThan(depth, CCGrepConst.MAX_DEPTH) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(CCGrepState.truncated, 0) ThenBlock: { ReturnValue(0) }
+
+        oflags = BitwiseOr(CCGrepSys.O_RDONLY, CCGrepSys.O_DIRECTORY)
+        dir_fd = SystemCall(CCGrepSys.SYS_OPENAT, CCGrepSys.AT_FDCWD, path, oflags, 0, 0)
+        IfCondition LessThan(dir_fd, 0) ThenBlock: { ReturnValue(0) }
+
+        dirbuf  = Allocate(CCGrepConst.DIRBUF_SIZE)
+        path_len = StringLength(path)
+        child_buf = Allocate(4096)
+
+        WhileLoop 1 {
+            IfCondition GreaterThan(CCGrepState.truncated, 0) ThenBlock: { BreakLoop }
+            n = SystemCall(CCGrepSys.SYS_GETDENTS64, dir_fd, dirbuf, CCGrepConst.DIRBUF_SIZE)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            pos = 0
+            WhileLoop LessThan(pos, n) {
+                IfCondition GreaterThan(CCGrepState.truncated, 0) ThenBlock: { BreakLoop }
+                entry  = Add(dirbuf, pos)
+                reclen = Add(GetByte(entry, 16), Multiply(GetByte(entry, 17), 256))
+                IfCondition EqualTo(reclen, 0) ThenBlock: { BreakLoop }
+                dtype  = GetByte(entry, 18)
+                dname  = Add(entry, 19)
+                d0 = GetByte(dname, 0)
+                d1 = GetByte(dname, 1)
+                skip = 0
+                IfCondition EqualTo(d0, 46) ThenBlock: { skip = 1 }
+                IfCondition EqualTo(StringCompare(dname, "__pycache__"), 0) ThenBlock: { skip = 1 }
+                IfCondition EqualTo(skip, 0) ThenBlock: {
+                    dname_len = StringLength(dname)
+                    MemoryCopy(child_buf, path, path_len)
+                    SetByte(child_buf, path_len, 47)
+                    MemoryCopy(Add(child_buf, Add(path_len, 1)), dname, dname_len)
+                    SetByte(child_buf, Add(Add(path_len, 1), dname_len), 0)
+
+                    IfCondition EqualTo(dtype, CCGrepSys.DT_DIR) ThenBlock: {
+                        CCGrep_ProcessDir(child_buf, Add(depth, 1))
+                    } ElseBlock: {
+                        // DT_REG (8) or DT_UNKNOWN (0) — for filesystems without d_type support
+                        IfCondition Or(EqualTo(dtype, CCGrepSys.DT_REG), EqualTo(dtype, 0)) ThenBlock: {
+                            include_ok = 1
+                            IfCondition NotEqual(GrepConfig.include_pat, 0) ThenBlock: {
+                                include_ok = CCGrep_GlobMatch(dname, GrepConfig.include_pat)
+                            }
+                            IfCondition EqualTo(include_ok, 1) ThenBlock: {
+                                cfd = SystemCall(CCGrepSys.SYS_OPENAT, CCGrepSys.AT_FDCWD, child_buf, 0)
+                                IfCondition GreaterEqual(cfd, 0) ThenBlock: {
+                                    CCGrep_ProcessStream(cfd, child_buf)
+                                    SystemCall(CCGrepSys.SYS_CLOSE, cfd, 0, 0, 0, 0)
+                                }
+                            }
+                        }
+                    }
+                }
+                pos = Add(pos, reclen)
+            }
+        }
+
+        Deallocate(child_buf, 4096)
+        Deallocate(dirbuf, CCGrepConst.DIRBUF_SIZE)
+        SystemCall(CCGrepSys.SYS_CLOSE, dir_fd, 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// SCHEMA + IPC DISPATCH
+// =============================================================================
+
+Function.CCGrep_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Grep", "Search for a pattern in files using BM/NFA/DFA engine. Returns matching lines with optional context.")
+        UtilArgs_AddField(s, "pattern",     "string", 1, "Pattern to search (regex by default; set fixed=1 for literal)", "pattern")
+        UtilArgs_AddField(s, "path",        "path",   1, "File or directory path to search", "path")
+        UtilArgs_AddField(s, "context",     "int",    0, "Lines of context around each match (default 0)", "context")
+        UtilArgs_AddField(s, "recursive",   "int",    0, "1 = recurse into subdirectories", "recursive")
+        UtilArgs_AddField(s, "fixed",       "int",    0, "1 = treat pattern as literal string (no regex)", "fixed")
+        UtilArgs_AddField(s, "ignore_case", "int",    0, "1 = case-insensitive match", "ignore_case")
+        UtilArgs_AddField(s, "include",     "string", 0, "Filename glob filter e.g. *.ailang (only with recursive=1)", "include")
+        UtilArgs_AddField(s, "max_results", "int",    0, "Max matching lines per file (0 = unlimited, like grep -m)", "max_results")
+        UtilArgs_AddField(s, "invert",      "int",    0, "1 = return non-matching lines (-v)", "invert")
+        UtilArgs_AddField(s, "word_match",  "int",    0, "1 = match whole words only (-w)", "word_match")
+        UtilArgs_AddField(s, "whole_line",  "int",    0, "1 = match whole line only (-x)", "whole_line")
+        UtilArgs_SetDefault(s, "context",     "0")
+        UtilArgs_SetDefault(s, "recursive",   "0")
+        UtilArgs_SetDefault(s, "fixed",       "0")
+        UtilArgs_SetDefault(s, "ignore_case", "0")
+        UtilArgs_SetDefault(s, "max_results", "0")
+        UtilArgs_SetDefault(s, "invert",      "0")
+        UtilArgs_SetDefault(s, "word_match",  "0")
+        UtilArgs_SetDefault(s, "whole_line",  "0")
+        ReturnValue(s)
+    }
+}
+
+Function.CCGrep_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCGrep_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Input: truncated: Integer
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        IfCondition EqualTo(truncated, 1) ThenBlock: { JSON.SetBool(resp, "truncated", 1) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCGrep_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCGrepState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+// Int fields are JSON numbers after ParseIPC. GetString is a no-op on them
+// (returns 0), which is why every flag except recursive was ignored.
+Function.CCGrep_ArgInt {
+    Input: args: Address
+    Input: name: Address
+    Output: Integer
+    Body: {
+        v = UtilArgs_GetInt(args, name)
+        IfCondition NotEqual(v, 0) ThenBlock: { ReturnValue(v) }
+        s = UtilArgs_GetString(args, name)
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(StringToInt(s))
+    }
+}
+
+Function.CCGrep_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCGrep_SendError(client_fd, 0, "invalid JSON")  ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCGrep_SendError(client_fd, 0, "request must be JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCGrep_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCGrep_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id        = JSON.GetString(obj, "id")
+            args      = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCGrepState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCGrep_SendError(client_fd, id, "missing required args: pattern, path")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            pattern = UtilArgs_GetString(validated, "pattern")
+            path    = UtilArgs_GetString(validated, "path")
+            IfCondition Or(EqualTo(pattern, 0), EqualTo(path, 0)) ThenBlock: {
+                CCGrep_SendError(client_fd, id, "pattern and path are required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            // Reset per-request state
+            GrepConfig.case_insensitive = 0
+            GrepConfig.invert           = 0
+            GrepConfig.line_numbers     = 1
+            GrepConfig.fixed            = 0
+            GrepConfig.whole_line       = 0
+            GrepConfig.word_match       = 0
+            GrepConfig.before_ctx       = 0
+            GrepConfig.after_ctx        = 0
+            GrepConfig.recursive        = 0
+            GrepConfig.include_pat      = 0
+            GrepConfig.show_prefix      = 1
+            CCGrepState.result_pos      = 0
+            CCGrepState.match_count     = 0
+            CCGrepState.truncated       = 0
+            CCGrepState.max_results     = 0
+            CCGrep_FreePatterns()
+            Patterns.longest            = 0
+            Patterns.dfa_ok             = 0
+            Patterns.fast_literal_ok    = 0
+            CCGrepCtx.ring_head         = 0
+            CCGrepCtx.ring_count        = 0
+            CCGrepCtx.after_rem         = 0
+            CCGrepCtx.prev_end          = 0
+
+            // Apply options — int fields via GetInt (GetString is a no-op on them).
+            cv = CCGrep_ArgInt(validated, "context")
+            IfCondition GreaterThan(cv, 0) ThenBlock: {
+                IfCondition GreaterThan(cv, CCGrepConst.MAX_CTX) ThenBlock: { cv = CCGrepConst.MAX_CTX }
+                GrepConfig.before_ctx = cv
+                GrepConfig.after_ctx  = cv
+            }
+            IfCondition GreaterThan(CCGrep_ArgInt(validated, "fixed"), 0) ThenBlock: { GrepConfig.fixed = 1 }
+            IfCondition GreaterThan(CCGrep_ArgInt(validated, "ignore_case"), 0) ThenBlock: { GrepConfig.case_insensitive = 1 }
+            IfCondition GreaterThan(CCGrep_ArgInt(validated, "invert"), 0) ThenBlock: { GrepConfig.invert = 1 }
+            IfCondition GreaterThan(CCGrep_ArgInt(validated, "word_match"), 0) ThenBlock: { GrepConfig.word_match = 1 }
+            IfCondition GreaterThan(CCGrep_ArgInt(validated, "whole_line"), 0) ThenBlock: { GrepConfig.whole_line = 1 }
+            IfCondition GreaterThan(CCGrep_ArgInt(validated, "recursive"), 0) ThenBlock: { GrepConfig.recursive = 1 }
+            inc_str = UtilArgs_GetString(validated, "include")
+            IfCondition NotEqual(inc_str, 0) ThenBlock: { GrepConfig.include_pat = inc_str }
+            mr = CCGrep_ArgInt(validated, "max_results")
+            IfCondition GreaterThan(mr, 0) ThenBlock: { CCGrepState.max_results = mr }
+
+            // Add pattern and compile
+            CCGrep_AddPattern(pattern)
+            CCGrep_CompilePatterns()
+
+            // Run search — detect path type first (BUG-1 fix)
+            dir_fd = SystemCall(CCGrepSys.SYS_OPENAT, CCGrepSys.AT_FDCWD, path, BitwiseOr(CCGrepSys.O_RDONLY, CCGrepSys.O_DIRECTORY))
+            IfCondition GreaterEqual(dir_fd, 0) ThenBlock: {
+                // path is a directory
+                IfCondition EqualTo(GrepConfig.recursive, 1) ThenBlock: {
+                    SystemCall(CCGrepSys.SYS_CLOSE, dir_fd, 0, 0, 0, 0)
+                    CCGrep_ProcessDir(path, 0)
+                } ElseBlock: {
+                    SystemCall(CCGrepSys.SYS_CLOSE, dir_fd, 0, 0, 0, 0)
+                    CCGrep_SendError(client_fd, id, StringConcat("is a directory; use recursive=1: ", path))
+                    JSON.Free(parsed)  ReturnValue(0)
+                }
+            } ElseBlock: {
+                // not a directory — treat as single file
+                // If include filter is set, check basename against glob
+                IfCondition NotEqual(GrepConfig.include_pat, 0) ThenBlock: {
+                    // Extract basename from path (scan for last '/')
+                    path_len = StringLength(path)
+                    bname = path
+                    si = Subtract(path_len, 1)
+                    WhileLoop GreaterEqual(si, 0) {
+                        IfCondition EqualTo(GetByte(path, si), 47) ThenBlock: {
+                            bname = Add(path, Add(si, 1))
+                            BreakLoop
+                        }
+                        si = Subtract(si, 1)
+                    }
+                    IfCondition EqualTo(CCGrep_GlobMatch(bname, GrepConfig.include_pat), 0) ThenBlock: {
+                        // File does not match include filter — skip
+                        content = "(no matches — excluded by include filter)"
+                        CCGrep_SendResult(client_fd, id, content, 0)
+                        JSON.Free(parsed)  ReturnValue(0)
+                    }
+                }
+                fd = SystemCall(CCGrepSys.SYS_OPENAT, CCGrepSys.AT_FDCWD, path, 0)
+                IfCondition LessThan(fd, 0) ThenBlock: {
+                    CCGrep_SendError(client_fd, id, StringConcat("cannot open: ", path))
+                    JSON.Free(parsed)  ReturnValue(0)
+                }
+                GrepConfig.show_prefix = 0
+                CCGrep_ProcessStream(fd, path)
+                SystemCall(CCGrepSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            }
+
+            // NUL-terminate result — always safe: allocated RESULT_CAP+1 bytes
+            SetByte(CCGrepState.result_buf, CCGrepState.result_pos, 0)
+
+            content = CCGrepState.result_buf
+            IfCondition EqualTo(CCGrepState.match_count, 0) ThenBlock: { content = "(no matches)" }
+
+            CCGrep_SendResult(client_fd, id, content, CCGrepState.truncated)
+            CCGrep_FreePatterns()
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCGrep_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+SubRoutine.Main {
+    CCGrepConst.SOCK_PATH = "@halcode/Grep"
+    CCGrepState.schema    = CCGrep_BuildSchema()
+
+    // Pre-allocate long-lived buffers
+    CCGrepState.result_buf = Allocate(Add(CCGrepConst.RESULT_CAP, 1))
+    CCGrepCtx.ring_slots   = Allocate(Multiply(CCGrepConst.MAX_CTX, CCGrepConst.LINE_SLOT))
+    CCGrepCtx.ring_lens    = Allocate(Multiply(CCGrepConst.MAX_CTX, 8))
+    CCGrepCtx.ring_nos     = Allocate(Multiply(CCGrepConst.MAX_CTX, 8))
+
+    // Pre-allocate pattern arrays (reused, count reset per request)
+    CCGrep_InitPatterns()
+
+    // Pre-allocate scratch buffers (reused across requests)
+    Scratch.rx    = Allocate(Add(CCGrepConst.LINE_MAX, 1))
+    Scratch.rx_lc = Allocate(Add(CCGrepConst.LINE_MAX, 1))
+    Scratch.digits = Allocate(24)
+    Scratch.ready = 1
+
+    SystemCall(CCGrepSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCGrepSys.SYS_UNLINK, CCGrepConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_grep_ipc] socket create failed\n")
+        Exit(1)
+    }
+    br = Socket.BindUnix(fd, CCGrepConst.SOCK_PATH)
+    IfCondition LessThan(br, 0) ThenBlock: {
+        PrintMessage("[cc_grep_ipc] bind failed\n")
+        Socket.Close(fd)  Exit(1)
+    }
+    Socket.Listen(fd, CCGrepConst.BACKLOG)
+    CCGrepState.listen_fd = fd
+    PrintMessage("[cc_grep_ipc] listening on @halcode/Grep\n")
+
+    WhileLoop EqualTo(CCGrepState.running, 1) {
+        client_fd = Socket.Accept(CCGrepState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCGrep_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCGrepState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

@@ -1,0 +1,442 @@
+// cc_ailang_ipc.ailang — AILang compiler/analyzer IPC tool for HalCode9000.
+//
+// Socket: @halcode/Ailang
+// Schema:
+//   op     (required): "compile" | "analyze"
+//   source (required): absolute path to .ailang source file
+//   output (required for compile): absolute path for output binary
+//
+// Response JSON:
+//   { "ok": bool,
+//     "output": "<path>",   // compile only, on success
+//     "content": "<full compiler/analyzer stdout+stderr>",
+//     "error": "<content, or an exit status>" }  // only when ok is false
+//
+// Binaries resolved via /usr/local/bin symlinks — rebuilds are live immediately.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCAilangSys {
+    "SYS_READ":      Initialize=0
+    "SYS_CLOSE":     Initialize=3
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_MKDIR":     Initialize=83
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_KILL":      Initialize=62
+    "WNOHANG":       Initialize=1
+}
+
+FixedPool.CCAilangConst {
+    "SOCK_PATH":  Initialize="@halcode/Ailang", CanChange=True
+    "BACKLOG":    Initialize=8
+    "OUT_MAX":    Initialize=262144
+    "READ_CHUNK": Initialize=4096
+    "COMPILER":   Initialize="/usr/local/bin/ailang.x"
+    "ANALYZER":   Initialize="/usr/local/bin/analyzer.x"
+}
+
+FixedPool.CCAilangState {
+    "schema":     Initialize=0,  CanChange=True
+    "listen_fd":  Initialize=-1, CanChange=True
+    "running":    Initialize=1,  CanChange=True
+    "out_buf":    Initialize=0,  CanChange=True
+    "last_exit":  Initialize=0,  CanChange=True
+}
+
+// =============================================================================
+// OUTPUT PARSING
+// =============================================================================
+
+// Scan buf[0..len) for needle, return the integer that immediately follows it.
+// Returns -1 if needle not found or no digit follows.
+Function.CCAlg_ScanIntAfter {
+    Input: buf: Address
+    Input: len: Integer
+    Input: needle: Address
+    Output: Integer
+    Body: {
+        nlen = StringLength(needle)
+        limit = Subtract(len, nlen)
+        IfCondition LessThan(limit, 0) ThenBlock: { ReturnValue(-1) }
+        i = 0
+        WhileLoop LessEqual(i, limit) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, nlen) {
+                bc = GetByte(buf, Add(i, j))
+                nc = GetByte(needle, j)
+                IfCondition NotEqual(bc, nc) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                pos = Add(i, nlen)
+                WhileLoop LessThan(pos, len) {
+                    IfCondition NotEqual(GetByte(buf, pos), 32) ThenBlock: { BreakLoop }
+                    pos = Add(pos, 1)
+                }
+                num = 0
+                has_digit = 0
+                WhileLoop LessThan(pos, len) {
+                    c = GetByte(buf, pos)
+                    IfCondition LessThan(c, 48) ThenBlock: { BreakLoop }
+                    IfCondition GreaterThan(c, 57) ThenBlock: { BreakLoop }
+                    num = Add(Multiply(num, 10), Subtract(c, 48))
+                    has_digit = 1
+                    pos = Add(pos, 1)
+                }
+                IfCondition EqualTo(has_digit, 1) ThenBlock: { ReturnValue(num) }
+                ReturnValue(-1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// FORK + EXEC
+// =============================================================================
+
+// Fork+exec `binary` with null-terminated char** `argv`.
+// Captures combined stdout+stderr into CCAilangState.out_buf (null-terminated).
+// Sets CCAilangState.last_exit to child exit code.
+// Returns bytes captured, or -1 on fork/pipe failure.
+Function.CCAlg_Run {
+    Input: binary: Address
+    Input: argv: Address
+    Output: Integer
+    Body: {
+        pf = Allocate(8)
+        pr = SystemCall(CCAilangSys.SYS_PIPE, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)
+            ReturnValue(-1)
+        }
+        pipe_r = Dereference(pf, "dword")
+        pipe_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+
+        pid = SystemCall(CCAilangSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(CCAilangSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCAilangSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child: redirect stdout+stderr to pipe, exec compiler/analyzer.
+            // Null envp is fine — binary-relative Librarys lookup uses /proc/self/exe.
+            SystemCall(CCAilangSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCAilangSys.SYS_DUP2, pipe_w, 1, 0, 0, 0)
+            SystemCall(CCAilangSys.SYS_DUP2, pipe_w, 2, 0, 0, 0)
+            SystemCall(CCAilangSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            SystemCall(CCAilangSys.SYS_EXECVE, binary, argv, 0)
+            SystemCall(CCAilangSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        // Parent: drain output until EOF.
+        SystemCall(CCAilangSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+        buf  = CCAilangState.out_buf
+        used = 0
+        WhileLoop 1 {
+            free_room = Subtract(CCAilangConst.OUT_MAX, used)
+            IfCondition LessEqual(free_room, 0) ThenBlock: { BreakLoop }
+            want = CCAilangConst.READ_CHUNK
+            IfCondition GreaterThan(want, free_room) ThenBlock: { want = free_room }
+            n = SystemCall(CCAilangSys.SYS_READ, pipe_r, Add(buf, used), want)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SetByte(buf, used, 0)
+        SystemCall(CCAilangSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+
+        // Reap child. 600 x 100ms = 60s, then SIGKILL so a stuck
+        // analyzer cannot be reported as exit 0 and leaked.
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        raw_status = 0
+        reaped = 0
+        wi = 0
+        WhileLoop LessThan(wi, 600) {
+            wr = SystemCall(CCAilangSys.SYS_WAIT4, pid, status_buf, CCAilangSys.WNOHANG, 0, 0)
+            IfCondition GreaterThan(wr, 0) ThenBlock: {
+                raw_status = Dereference(status_buf, "dword")
+                reaped = 1
+                BreakLoop
+            }
+            IfCondition LessThan(wr, 0) ThenBlock: { BreakLoop }
+            ts = Allocate(16)
+            StoreValue(ts, 0)
+            StoreValue(Add(ts, 8), 100000000)
+            SystemCall(CCAilangSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+            Deallocate(ts, 16)
+            wi = Add(wi, 1)
+        }
+        IfCondition EqualTo(reaped, 0) ThenBlock: {
+            SystemCall(CCAilangSys.SYS_KILL, pid, 9, 0, 0, 0)
+            SystemCall(CCAilangSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+            raw_status = Dereference(status_buf, "dword")
+        }
+        Deallocate(status_buf, 8)
+        CCAilangState.last_exit = BitwiseAnd(RightShift(raw_status, 8), 255)
+        ReturnValue(used)
+    }
+}
+
+// =============================================================================
+// IPC LAYER
+// =============================================================================
+
+Function.CCAlg_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Ailang", "Compile or analyze AILang source files using the installed toolchain")
+        UtilArgs_AddField(s, "op",     "string", 1, "Operation: 'compile' (build binary) or 'analyze' (type/arity check only)", "op")
+        UtilArgs_AddField(s, "source", "string", 1, "Absolute path to the .ailang source file", "source")
+        UtilArgs_AddField(s, "output", "string", 0, "Absolute path for output binary (required for op=compile)", "output")
+        ReturnValue(s)
+    }
+}
+
+// SerializeObject returns a fresh string. The response object aliases
+// literals and caller buffers, so it must not be JSON.Free'd.
+Function.CCAlg_FreeStr {
+    Input: str: Address
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(str)
+        Deallocate(str, Add(n, 1))
+    }
+}
+
+Function.CCAlg_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        CCAlg_FreeStr(wire)
+    }
+}
+
+Function.CCAlg_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: ok: Integer
+    Input: output_path: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", ok)
+        IfCondition NotEqual(output_path, 0) ThenBlock: {
+            JSON.SetString(resp, "output", output_path)
+        }
+        JSON.SetString(resp, "content", content)
+        // The host reads "error" for the failure text. A non-zero compiler
+        // exit used to leave that field out, so the chat showed "no detail".
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            detail = content
+            use_fallback = 0
+            IfCondition EqualTo(detail, 0) ThenBlock: { use_fallback = 1 }
+            IfCondition EqualTo(use_fallback, 0) ThenBlock: {
+                dlen = StringLength(detail)
+                IfCondition EqualTo(dlen, 0) ThenBlock: { use_fallback = 1 }
+            }
+            IfCondition EqualTo(use_fallback, 1) ThenBlock: {
+                detail = StringConcat("compiler or analyzer exited ", NumberToString(CCAilangState.last_exit))
+            }
+            JSON.SetString(resp, "error", detail)
+        }
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        CCAlg_FreeStr(wire)
+    }
+}
+
+Function.CCAlg_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCAilangState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        CCAlg_FreeStr(wire)
+    }
+}
+
+Function.CCAlg_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCAlg_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCAlg_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCAlg_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCAlg_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id        = JSON.GetString(obj, "id")
+            args      = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCAilangState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCAlg_SendError(client_fd, id, "missing required argument (op, source)")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            op     = UtilArgs_GetString(validated, "op")
+            source = UtilArgs_GetString(validated, "source")
+            IfCondition EqualTo(op, 0) ThenBlock: {
+                CCAlg_SendError(client_fd, id, "op is required: 'compile' or 'analyze'")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(source, 0) ThenBlock: {
+                CCAlg_SendError(client_fd, id, "source is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            // --- op=compile ---
+            IfCondition EqualTo(StringCompare(op, "compile"), 0) ThenBlock: {
+                output = UtilArgs_GetString(validated, "output")
+                IfCondition EqualTo(output, 0) ThenBlock: {
+                    CCAlg_SendError(client_fd, id, "output is required for op=compile")
+                    JSON.Free(parsed)  ReturnValue(0)
+                }
+                argv = Allocate(32)
+                StoreValue(argv,         CCAilangConst.COMPILER)
+                StoreValue(Add(argv, 8), source)
+                StoreValue(Add(argv, 16), output)
+                StoreValue(Add(argv, 24), 0)
+                used = CCAlg_Run(CCAilangConst.COMPILER, argv)
+                Deallocate(argv, 32)
+                IfCondition LessThan(used, 0) ThenBlock: {
+                    CCAlg_SendError(client_fd, id, "failed to fork compiler process")
+                    JSON.Free(parsed)  ReturnValue(0)
+                }
+                ok = 0
+                IfCondition EqualTo(CCAilangState.last_exit, 0) ThenBlock: { ok = 1 }
+                out_path = 0
+                IfCondition EqualTo(ok, 1) ThenBlock: { out_path = output }
+                CCAlg_SendResult(client_fd, id, ok, out_path, CCAilangState.out_buf)
+                JSON.Free(parsed)
+                ReturnValue(0)
+            }
+
+            // --- op=analyze ---
+            IfCondition EqualTo(StringCompare(op, "analyze"), 0) ThenBlock: {
+                argv = Allocate(24)
+                StoreValue(argv,         CCAilangConst.ANALYZER)
+                StoreValue(Add(argv, 8), source)
+                StoreValue(Add(argv, 16), 0)
+                used = CCAlg_Run(CCAilangConst.ANALYZER, argv)
+                Deallocate(argv, 24)
+                IfCondition LessThan(used, 0) ThenBlock: {
+                    CCAlg_SendError(client_fd, id, "failed to fork analyzer process")
+                    JSON.Free(parsed)  ReturnValue(0)
+                }
+                // analyzer.x exits 1 for warnings with zero errors
+                // ("Summary: 0 errors, N warnings") and 2 for real errors.
+                // Parse failures also exit 1, but they never print that summary.
+                ok = 0
+                IfCondition EqualTo(CCAilangState.last_exit, 0) ThenBlock: { ok = 1 }
+                IfCondition EqualTo(CCAilangState.last_exit, 1) ThenBlock: {
+                    IfCondition EqualTo(StringContains(CCAilangState.out_buf, "Summary: 0 errors"), 1) ThenBlock: {
+                        ok = 1
+                    }
+                }
+                CCAlg_SendResult(client_fd, id, ok, 0, CCAilangState.out_buf)
+                JSON.Free(parsed)
+                ReturnValue(0)
+            }
+
+            CCAlg_SendError(client_fd, id, "unknown op: use 'compile' or 'analyze'")
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+
+        CCAlg_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+
+SubRoutine.Main {
+    CCAilangState.schema  = CCAlg_BuildSchema()
+    CCAilangState.out_buf = Allocate(Add(CCAilangConst.OUT_MAX, 1))
+
+    SystemCall(CCAilangSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_ailang_ipc] socket create failed\n")
+        Exit(1)
+    }
+    Socket.BindUnix(fd, CCAilangConst.SOCK_PATH)
+    Socket.Listen(fd, CCAilangConst.BACKLOG)
+    CCAilangState.listen_fd = fd
+    PrintMessage("[cc_ailang_ipc] listening on @halcode/Ailang\n")
+
+    WhileLoop EqualTo(CCAilangState.running, 1) {
+        client_fd = Socket.Accept(CCAilangState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCAlg_HandleRequest(client_fd, req)
+                        CCAlg_FreeStr(req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCAilangState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

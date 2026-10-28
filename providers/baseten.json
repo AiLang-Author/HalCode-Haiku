@@ -1,0 +1,101 @@
+{
+  "name": "Baseten",
+  "backend": "openai",
+  "base_url": "https://inference.baseten.co/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "BASETEN_API_KEY",
+  "key_hint": "baseten",
+  "tier": 2,
+  "models": [
+    {
+      "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "display": "DeepSeek V4.1 Flash"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4.1-Flash-Fast",
+      "display": "DeepSeek V4.1 Flash Fast"
+    },
+    {
+      "id": "zai-org/GLM-5.3-Flash",
+      "display": "GLM 5.3 Flash"
+    },
+    {
+      "id": "zai-org/GLM-5.3-Fast",
+      "display": "GLM 5.3 Fast"
+    },
+    {
+      "id": "zai-org/GLM-5.3",
+      "display": "GLM 5.3"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "display": "DeepSeek V4 Flash 0731"
+    },
+    {
+      "id": "thinkingmachines/inkling-small",
+      "display": "Inkling Small"
+    },
+    {
+      "id": "moonshotai/Kimi-K3",
+      "display": "Kimi K3"
+    },
+    {
+      "id": "thinkingmachines/inkling",
+      "display": "Inkling"
+    },
+    {
+      "id": "zai-org/GLM-5.2",
+      "display": "GLM 5.2"
+    },
+    {
+      "id": "zai-org/GLM-5.2-Fast",
+      "display": "GLM 5.2 Fast"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.7-Code",
+      "display": "Kimi K2.7 Code"
+    },
+    {
+      "id": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
+      "display": "Nemotron Ultra"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Pro",
+      "display": "DeepSeek V4 Pro"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.6",
+      "display": "Kimi K2.6"
+    },
+    {
+      "id": "zai-org/GLM-5.1",
+      "display": "GLM 5.1"
+    },
+    {
+      "id": "nvidia/Nemotron-120B-A12B",
+      "display": "Nemotron Super"
+    },
+    {
+      "id": "zai-org/GLM-5",
+      "display": "GLM 5"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.5",
+      "display": "Kimi K2.5"
+    },
+    {
+      "id": "zai-org/GLM-4.7",
+      "display": "GLM 4.7"
+    },
+    {
+      "id": "openai/gpt-oss-120b",
+      "display": "OpenAI GPT 120B"
+    }
+  ],
+  "default_model": "zai-org/GLM-5.3-Fast",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no BASETEN_API_KEY set \u2014 models.dev catalog"
+}

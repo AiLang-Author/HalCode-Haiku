@@ -1,0 +1,403 @@
+// cc_ls_ipc.ailang — HalCode9000 LS tool, IPC service.
+//
+// Lists directory contents. For Phase 1 we shell out to /bin/ls and
+// capture its output — same pattern as Bash but with a fixed argv.
+// Phase 2 can swap to native getdents64 if we want to drop the shell-out.
+//
+// Schema: path (required string), all (bool, show hidden, default false).
+// Output: "exit=<N>\n<ls_output>"  — exit code followed by ls output.
+//
+// Path safety: blocks "/", "/mnt", "/mnt/c/...", "/home", "/home/..."
+// to prevent unbounded WSL2 filesystem walks that hang the agent.
+//
+// Mailbox pattern: pre-allocates a static output buffer at boot to
+// avoid arena fragmentation across repeated LS calls.
+//
+// Build: ./ailang.x Applications/HalCode9000/cc_tools/cc_ls_ipc.ailang cc_ls_ipc.x
+// Run:   ./cc_ls_ipc.x   (binds /tmp/ailang_cctools/LS.sock)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCLsSys {
+    "SYS_READ":      Initialize=0
+    "SYS_CLOSE":     Initialize=3
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+}
+
+FixedPool.CCLsConst {
+    "SOCK_PATH":     Initialize=0, CanChange=True
+    "SOCK_DIR":      Initialize=0, CanChange=True
+    "MAX_OUTPUT":    Initialize=16384    // 16KB — protects arena; 50KB was overkill for ls output
+    "READ_CHUNK":    Initialize=4096
+    "BACKLOG":       Initialize=8
+}
+
+FixedPool.CCLsState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+}
+
+// Static mailbox — pre-allocated once at boot to avoid arena churn
+FixedPool.CCLsMailbox {
+    "buf":           Initialize=0, CanChange=True
+}
+
+Function.CCLs_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("LS", "List the contents of a directory")
+        UtilArgs_AddField(s, "path", "path", 1, "Absolute path to the directory to list", "path")
+        UtilArgs_AddField(s, "all", "bool", 0, "Show hidden entries (dotfiles)", "all")
+        ReturnValue(s)
+    }
+}
+
+Function.CCLs_Run {
+    Input: path: Address
+    Input: all_flag: Integer
+    Input: out_truncated_ptr: Address
+    Input: out_exitcode_ptr: Address
+    Output: Address
+    Body: {
+        StoreValue(out_truncated_ptr, 0, "dword")
+        StoreValue(out_exitcode_ptr, 0, "dword")
+
+        // ----- PATH SAFETY GUARD -----
+        // Reject paths that would cause an unbounded filesystem walk (WSL2 /mnt/c hang).
+        // Block: exact "/" root, "/mnt", "/mnt/c", "/mnt/c/", any "/mnt/c/..." prefix.
+        // Also block "/home" and "/home/<user>" to prevent whole-home walks.
+        blocked = 0
+        IfCondition EqualTo(StringCompare(path, "/"), 0)         ThenBlock: { blocked = 1 }
+        IfCondition EqualTo(StringCompare(path, "/mnt"), 0)      ThenBlock: { blocked = 1 }
+        IfCondition EqualTo(StringCompare(path, "/home"), 0)     ThenBlock: { blocked = 1 }
+        
+        IfCondition GreaterEqual(StringLength(path), 6) ThenBlock: {
+            match = 1
+            IfCondition NotEqual(GetByte(path, 0), 47) ThenBlock: { match = 0 } // /
+            IfCondition NotEqual(GetByte(path, 1), 109) ThenBlock: { match = 0 } // m
+            IfCondition NotEqual(GetByte(path, 2), 110) ThenBlock: { match = 0 } // n
+            IfCondition NotEqual(GetByte(path, 3), 116) ThenBlock: { match = 0 } // t
+            IfCondition NotEqual(GetByte(path, 4), 47) ThenBlock: { match = 0 } // /
+            IfCondition NotEqual(GetByte(path, 5), 99) ThenBlock: { match = 0 } // c
+            IfCondition EqualTo(match, 1) ThenBlock: { blocked = 1 }
+        }
+        
+        IfCondition EqualTo(blocked, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        pf = Allocate(8)
+        pr = SystemCall(CCLsSys.SYS_PIPE, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: { Deallocate(pf, 8)  ReturnValue(0) }
+        pipe_r = Dereference(pf, "dword")
+        pipe_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+
+        // argv: ["/bin/ls", "-la"|"-l", path, NULL]   (4 entries)
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0), "/bin/ls")
+        IfCondition EqualTo(all_flag, 1) ThenBlock: {
+            StoreValue(Add(argv, 8), "-la")
+        } ElseBlock: {
+            StoreValue(Add(argv, 8), "-l")
+        }
+        StoreValue(Add(argv, 16), path)
+        StoreValue(Add(argv, 24), 0)
+
+        pid = SystemCall(CCLsSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(CCLsSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCLsSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            Deallocate(argv, 32)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(CCLsSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCLsSys.SYS_DUP2, pipe_w, 1, 0, 0, 0)
+            SystemCall(CCLsSys.SYS_DUP2, pipe_w, 2, 0, 0, 0)
+            SystemCall(CCLsSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            SystemCall(CCLsSys.SYS_EXECVE, "/bin/ls", argv, 0)
+            SystemCall(CCLsSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+        SystemCall(CCLsSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+
+        // Write into the static mailbox buffer
+        used = 0
+        chunk = Allocate(CCLsConst.READ_CHUNK)
+        WhileLoop 1 {
+            free_room = Subtract(CCLsConst.MAX_OUTPUT, used)
+            IfCondition LessEqual(free_room, 0) ThenBlock: {
+                StoreValue(out_truncated_ptr, 1, "dword")
+                WhileLoop 1 {
+                    dn = SystemCall(CCLsSys.SYS_READ, pipe_r, chunk, CCLsConst.READ_CHUNK, 0, 0)
+                    IfCondition LessEqual(dn, 0) ThenBlock: { BreakLoop }
+                }
+                BreakLoop
+            }
+            want = CCLsConst.READ_CHUNK
+            IfCondition GreaterThan(want, free_room) ThenBlock: { want = free_room }
+            n = SystemCall(CCLsSys.SYS_READ, pipe_r, chunk, want, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            i = 0
+            WhileLoop LessThan(i, n) {
+                SetByte(CCLsMailbox.buf, Add(used, i), GetByte(chunk, i))
+                i = Add(i, 1)
+            }
+            used = Add(used, n)
+        }
+        SetByte(CCLsMailbox.buf, used, 0)
+        Deallocate(chunk, CCLsConst.READ_CHUNK)
+        SystemCall(CCLsSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+
+        // Capture exit status
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        SystemCall(CCLsSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+        exit_code = Dereference(status_buf, "dword")
+        Deallocate(status_buf, 8)
+        Deallocate(argv, 32)
+
+        // Prepend exit code line to output
+        // Format: "exit=<N>\n<output>"
+        // Build the result in the mailbox buffer by shifting content right.
+        ec_str = Allocate(16)
+        // Build "exit=" prefix
+        SetByte(ec_str, 0, 101)  // 'e'
+        SetByte(ec_str, 1, 120)  // 'x'
+        SetByte(ec_str, 2, 105)  // 'i'
+        SetByte(ec_str, 3, 116)  // 't'
+        SetByte(ec_str, 4, 61)   // '='
+        ec_pos = 5
+        ec_val = exit_code
+        // Convert exit code to decimal digits (max 255 = 3 digits)
+        digits = Allocate(4)
+        dcount = 0
+        IfCondition EqualTo(ec_val, 0) ThenBlock: {
+            SetByte(digits, 0, 48) // '0'
+            dcount = 1
+        } ElseBlock: {
+            WhileLoop GreaterThan(ec_val, 0) {
+                SetByte(digits, dcount, Add(Modulo(ec_val, 10), 48))
+                dcount = Add(dcount, 1)
+                ec_val = Divide(ec_val, 10)
+            }
+        }
+        // Reverse digits
+        di = 0
+        WhileLoop LessThan(di, dcount) {
+            SetByte(ec_str, Add(ec_pos, di), GetByte(digits, Subtract(Subtract(dcount, 1), di)))
+            di = Add(di, 1)
+        }
+        Deallocate(digits, 4)
+        ec_pos = Add(ec_pos, dcount)
+        SetByte(ec_str, ec_pos, 10) // '\n'
+        ec_pos = Add(ec_pos, 1)
+        SetByte(ec_str, ec_pos, 0)
+        ec_len = ec_pos
+
+        // If mailbox has content, we need to shift it right to make room for exit code line
+        // But simpler: just concatenate — write exit code prefix into mailbox start, then
+        // append the original ls output after it.
+        // Since we already wrote ls output starting at offset 0 in mailbox.buf, 
+        // we need to shift it right by ec_len bytes.
+        IfCondition GreaterThan(used, 0) ThenBlock: {
+            shift_i = used
+            WhileLoop GreaterThan(shift_i, 0) {
+                shifted = Add(shift_i, ec_len)
+                IfCondition LessThan(shifted, CCLsConst.MAX_OUTPUT) ThenBlock: {
+                    SetByte(CCLsMailbox.buf, shifted, GetByte(CCLsMailbox.buf, Subtract(shift_i, 1)))
+                }
+                shift_i = Subtract(shift_i, 1)
+            }
+            // Copy exit code prefix into the now-free space at offset 0
+            copy_i = 0
+            WhileLoop LessThan(copy_i, ec_len) {
+                SetByte(CCLsMailbox.buf, copy_i, GetByte(ec_str, copy_i))
+                copy_i = Add(copy_i, 1)
+            }
+            total_used = Add(used, ec_len)
+            IfCondition GreaterEqual(total_used, CCLsConst.MAX_OUTPUT) ThenBlock: {
+                total_used = Subtract(CCLsConst.MAX_OUTPUT, 1)
+                StoreValue(out_truncated_ptr, 1, "dword")
+            }
+            SetByte(CCLsMailbox.buf, total_used, 0)
+        } ElseBlock: {
+            // No ls output — just store the exit code line
+            copy_i = 0
+            WhileLoop LessThan(copy_i, ec_len) {
+                SetByte(CCLsMailbox.buf, copy_i, GetByte(ec_str, copy_i))
+                copy_i = Add(copy_i, 1)
+            }
+            SetByte(CCLsMailbox.buf, ec_len, 0)
+        }
+
+        StoreValue(out_exitcode_ptr, exit_code, "dword")
+        Deallocate(ec_str, 16)
+        ReturnValue(CCLsMailbox.buf)
+    }
+}
+
+Function.CCLs_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCLs_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Input: truncated: Integer
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        IfCondition EqualTo(truncated, 1) ThenBlock: { JSON.SetBool(resp, "truncated", 1) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCLs_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCLsState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCLs_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Output: Integer
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCLs_SendError(client_fd, 0, "invalid JSON")  ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCLs_SendError(client_fd, 0, "request must be a JSON object")  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCLs_SendError(client_fd, 0, "missing method")  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCLs_SendSchema(client_fd)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCLsState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCLs_SendError(client_fd, id, "missing required argument 'path'")  ReturnValue(0)
+            }
+            path = UtilArgs_GetString(validated, "path")
+            all_flag = UtilArgs_GetBool(validated, "all")
+            trunc_holder = Allocate(8)
+            StoreValue(trunc_holder, 0, "dword")
+            ec_holder = Allocate(8)
+            StoreValue(ec_holder, 0, "dword")
+            content = CCLs_Run(path, all_flag, trunc_holder, ec_holder)
+            truncated = Dereference(trunc_holder, "dword")
+            exit_code = Dereference(ec_holder, "dword")
+            Deallocate(trunc_holder, 8)
+            Deallocate(ec_holder, 8)
+            IfCondition EqualTo(content, 0) ThenBlock: {
+                CCLs_SendError(client_fd, id, "fork/exec ls failed (or path blocked)")
+            } ElseBlock: {
+                lines = 0
+                seen_nl = 0
+                li = 0
+                llen = StringLength(content)
+                WhileLoop LessThan(li, llen) {
+                    IfCondition EqualTo(GetByte(content, li), 10) ThenBlock: {
+                        IfCondition EqualTo(seen_nl, 1) ThenBlock: { lines = Add(lines, 1) }
+                        seen_nl = 1
+                    }
+                    li = Add(li, 1)
+                }
+                IfCondition EqualTo(truncated, 1) ThenBlock: {
+                    marker = StringConcat("\n[truncated after ", NumberToString(lines))
+                    marker = StringConcat(marker, " lines]")
+                    final = StringConcat(content, marker)
+                    CCLs_SendResult(client_fd, id, final, 1)
+                } ElseBlock: {
+                    marker = StringConcat("\n[", NumberToString(lines))
+                    marker = StringConcat(marker, " lines]")
+                    final = StringConcat(content, marker)
+                    CCLs_SendResult(client_fd, id, final, 0)
+                }
+            }
+            ReturnValue(1)
+        }
+        CCLs_SendError(client_fd, 0, "unknown method")
+        ReturnValue(0)
+    }
+}
+
+SubRoutine.Main {
+    CCLsConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    CCLsConst.SOCK_PATH = "@halcode/LS"
+
+    // Allocate the static mailbox buffer once at boot
+    CCLsMailbox.buf = Allocate(Add(CCLsConst.MAX_OUTPUT, 2))
+
+    CCLsState.schema = CCLs_BuildSchema()
+    SystemCall(CCLsSys.SYS_MKDIR, CCLsConst.SOCK_DIR, 493, 0, 0, 0)
+    SystemCall(CCLsSys.SYS_UNLINK, CCLsConst.SOCK_PATH, 0, 0, 0, 0)
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
+    Socket.BindUnix(fd, CCLsConst.SOCK_PATH)
+    Socket.Listen(fd, CCLsConst.BACKLOG)
+    CCLsState.listen_fd = fd
+    PrintMessage("[cc_ls_ipc] listening on ")  PrintMessage(CCLsConst.SOCK_PATH)  PrintMessage("\n")
+    WhileLoop EqualTo(CCLsState.running, 1) {
+        client_fd = Socket.Accept(CCLsState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCLs_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Exit(0)
+}
+
+RunTask(Main)

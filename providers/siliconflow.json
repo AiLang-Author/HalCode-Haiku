@@ -1,0 +1,177 @@
+{
+  "name": "SiliconFlow",
+  "backend": "openai",
+  "base_url": "https://api.siliconflow.com/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "SILICONFLOW_API_KEY",
+  "key_hint": "siliconflow",
+  "tier": 2,
+  "models": [
+    {
+      "id": "zai-org/GLM-5.3-Flash",
+      "display": "GLM-5.3-Flash"
+    },
+    {
+      "id": "zai-org/GLM-5.3",
+      "display": "GLM-5.3"
+    },
+    {
+      "id": "Qwen/Qwen3.8-2.4T-A95B",
+      "display": "Qwen3.8 2.4T A95B"
+    },
+    {
+      "id": "moonshotai/Kimi-K3",
+      "display": "Kimi K3"
+    },
+    {
+      "id": "tencent/Hy3",
+      "display": "Hy3"
+    },
+    {
+      "id": "meituan-longcat/LongCat-2.0",
+      "display": "LongCat-2.0"
+    },
+    {
+      "id": "zai-org/GLM-5.2",
+      "display": "GLM-5.2"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.7-Code",
+      "display": "Kimi K2.7 Code"
+    },
+    {
+      "id": "google/gemma-4-12B-it",
+      "display": "Gemma 4 12B IT"
+    },
+    {
+      "id": "nex-agi/Nex-N2-Pro",
+      "display": "Nex-N2-Pro"
+    },
+    {
+      "id": "MiniMaxAI/MiniMax-M3",
+      "display": "MiniMax-M3"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Flash",
+      "display": "DeepSeek V4 Flash"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Pro",
+      "display": "DeepSeek V4 Pro"
+    },
+    {
+      "id": "Qwen/Qwen3.6-27B",
+      "display": "Qwen3.6 27B"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.6",
+      "display": "moonshotai/Kimi-K2.6"
+    },
+    {
+      "id": "Qwen/Qwen3.6-35B-A3B",
+      "display": "Qwen3.6 35B-A3B"
+    },
+    {
+      "id": "zai-org/GLM-5.1",
+      "display": "zai-org/GLM-5.1"
+    },
+    {
+      "id": "google/gemma-4-31B-it",
+      "display": "Gemma 4 31B IT"
+    },
+    {
+      "id": "google/gemma-4-26B-A4B-it",
+      "display": "Gemma 4 26B A4B IT"
+    },
+    {
+      "id": "zai-org/GLM-5V-Turbo",
+      "display": "zai-org/GLM-5V-Turbo"
+    },
+    {
+      "id": "Qwen/Qwen3.5-9B",
+      "display": "Qwen/Qwen3.5-9B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-27B",
+      "display": "Qwen3.5 27B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-35B-A3B",
+      "display": "Qwen3.5 35B-A3B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-122B-A10B",
+      "display": "Qwen3.5 122B-A10B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-397B-A17B",
+      "display": "Qwen3.5 397B-A17B"
+    },
+    {
+      "id": "MiniMaxAI/MiniMax-M2.5",
+      "display": "MiniMaxAI/MiniMax-M2.5"
+    },
+    {
+      "id": "zai-org/GLM-5",
+      "display": "zai-org/GLM-5"
+    },
+    {
+      "id": "stepfun-ai/Step-3.5-Flash",
+      "display": "stepfun-ai/Step-3.5-Flash"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.5",
+      "display": "moonshotai/Kimi-K2.5"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3.2",
+      "display": "deepseek-ai/DeepSeek-V3.2"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-32B-Thinking",
+      "display": "Qwen/Qwen3-VL-32B-Thinking"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-32B-Instruct",
+      "display": "Qwen/Qwen3-VL-32B-Instruct"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-8B-Instruct",
+      "display": "Qwen/Qwen3-VL-8B-Instruct"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-30B-A3B-Thinking",
+      "display": "Qwen/Qwen3-VL-30B-A3B-Thinking"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3.2-Exp",
+      "display": "deepseek-ai/DeepSeek-V3.2-Exp"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+      "display": "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3.1-Terminus",
+      "display": "deepseek-ai/DeepSeek-V3.1-Terminus"
+    },
+    {
+      "id": "inclusionAI/Ling-flash-2.0",
+      "display": "inclusionAI/Ling-flash-2.0"
+    },
+    {
+      "id": "ByteDance-Seed/Seed-OSS-36B-Instruct",
+      "display": "ByteDance-Seed/Seed-OSS-36B-Instruct"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3.1",
+      "display": "deepseek-ai/DeepSeek-V3.1"
+    }
+  ],
+  "default_model": "zai-org/GLM-5.3",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no SILICONFLOW_API_KEY set \u2014 models.dev catalog"
+}

@@ -1,0 +1,53 @@
+{
+  "name": "Groq",
+  "backend": "openai",
+  "base_url": "https://api.groq.com",
+  "api_path": "/openai/v1/chat/completions",
+  "models_endpoint": "/openai/v1/models",
+  "auth": "bearer",
+  "key_env": "GROQ_API_KEY",
+  "key_hint": "groq",
+  "tier": 3,
+  "models": [
+    {
+      "id": "qwen/qwen3.8-27b",
+      "display": "Qwen3.8 27B"
+    },
+    {
+      "id": "qwen/qwen3.6-27b",
+      "display": "Qwen3.6 27B"
+    },
+    {
+      "id": "groq/compound-mini",
+      "display": "Compound Mini"
+    },
+    {
+      "id": "groq/compound",
+      "display": "Compound"
+    },
+    {
+      "id": "openai/gpt-oss-20b",
+      "display": "GPT OSS 20B"
+    },
+    {
+      "id": "openai/gpt-oss-120b",
+      "display": "GPT OSS 120B"
+    },
+    {
+      "id": "allam-2-7b",
+      "display": "ALLaM-2-7b"
+    },
+    {
+      "id": "llama-3.3-70b-versatile",
+      "display": "Llama 3.3 70B"
+    },
+    {
+      "id": "llama-3.1-8b-instant",
+      "display": "Llama 3.1 8B"
+    }
+  ],
+  "default_model": "qwen/qwen3.8-27b",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no GROQ_API_KEY set \u2014 models.dev catalog"
+}

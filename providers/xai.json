@@ -1,0 +1,49 @@
+{
+  "name": "xAI",
+  "backend": "openai",
+  "base_url": "https://api.x.ai",
+  "api_path": "/v1/chat/completions",
+  "models_endpoint": "/v1/models",
+  "auth": "bearer",
+  "key_env": "XAI_API_KEY",
+  "key_hint": "xai",
+  "tier": 1,
+  "models": [
+    {
+      "id": "grok-4.7",
+      "display": "Grok 4.7"
+    },
+    {
+      "id": "grok-4.6",
+      "display": "Grok 4.6"
+    },
+    {
+      "id": "grok-4.5",
+      "display": "Grok 4.5"
+    },
+    {
+      "id": "grok-4.3",
+      "display": "Grok 4.3"
+    },
+    {
+      "id": "grok-build-0.1",
+      "display": "Grok Build 0.1"
+    },
+    {
+      "id": "grok-4.20-0309-reasoning",
+      "display": "Grok 4.20 (Reasoning)"
+    },
+    {
+      "id": "grok-4.20-0309-non-reasoning",
+      "display": "Grok 4.20 (Non-Reasoning)"
+    },
+    {
+      "id": "grok-4.20-multi-agent-0309",
+      "display": "Grok 4.20 Multi-Agent"
+    }
+  ],
+  "default_model": "grok-4.7",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "HTTP Error 403: Forbidden"
+}

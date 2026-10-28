@@ -1,0 +1,512 @@
+// cc_agent_ipc.ailang — HalCode9000 Sub-Agent Orchestrator
+//
+// Spawns a headless worker via ./HalCode9000.x --agent <provider[:model]>.
+// Worker spec precedence: per-call "model" arg > HALCODE_WORKER env > "deepseek".
+// Handles writing the context to a temp file, executing the worker, and
+// reading the result back to the orchestrator.
+//
+// Socket: @halcode/Agent
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.AgentSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_POLL":      Initialize=7
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+    "SYS_SETPGID":   Initialize=109
+}
+
+FixedPool.AgentConst {
+    "SOCK_PATH":     Initialize="@halcode/Agent", CanChange=True
+    "BACKLOG":       Initialize=8
+}
+
+FixedPool.AgentState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+}
+
+// Leave the tool's process group and drop every inherited socket.
+// The daemon is forked from cc_agent_ipc, so without this it keeps the
+// @halcode/Agent listen fd and the host's client fd. A read on that dup
+// steals bytes from the host, and the host then treats the agent as gone.
+Function.Agent_Detach {
+    Body: {
+        SystemCall(AgentSys.SYS_SETPGID, 0, 0, 0, 0, 0)
+        afd = 3
+        WhileLoop LessThan(afd, 128) {
+            SystemCall(AgentSys.SYS_CLOSE, afd, 0, 0, 0, 0)
+            afd = Add(afd, 1)
+        }
+    }
+}
+
+// Inherit environment variables (API keys, HALCODE_WORKER) for the worker.
+Function.Agent_BuildInheritedEnvp {
+    Output: Address
+    Body: {
+        fd = SystemCall(AgentSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(65536)
+        n = SystemCall(0, fd, buf, 65536, 0, 0)
+        SystemCall(AgentSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+
+        envp = Allocate(4096)
+        idx = 0
+        StoreValue(Add(envp, 0), buf)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: {
+                next_pos = Add(i, 1)
+                IfCondition LessThan(next_pos, n) ThenBlock: {
+                    idx = Add(idx, 1)
+                    StoreValue(Add(envp, Multiply(idx, 8)), Add(buf, next_pos))
+                }
+            }
+            i = Add(i, 1)
+        }
+        StoreValue(Add(envp, Multiply(Add(idx, 1), 8)), 0)
+        ReturnValue(envp)
+    }
+}
+
+// Read $VAR from /proc/self/environ. Returns 0 if not set.
+Function.Agent_GetEnv {
+    Input: var_name: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(AgentSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(65536)
+        n = SystemCall(AgentSys.SYS_READ, fd, buf, 65536, 0, 0)
+        SystemCall(AgentSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 65536)
+            ReturnValue(0)
+        }
+        var_len = StringLength(var_name)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, var_len) {
+                IfCondition NotEqual(GetByte(buf, Add(i, j)), GetByte(var_name, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, var_len)), 61) ThenBlock: {
+                    val_start = Add(i, Add(var_len, 1))
+                    val_end = val_start
+                    WhileLoop LessThan(val_end, n) {
+                        IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                        val_end = Add(val_end, 1)
+                    }
+                    val_len = Subtract(val_end, val_start)
+                    out = Allocate(Add(val_len, 1))
+                    k = 0
+                    WhileLoop LessThan(k, val_len) {
+                        SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                        k = Add(k, 1)
+                    }
+                    SetByte(out, val_len, 0)
+                    Deallocate(buf, 65536)
+                    ReturnValue(out)
+                }
+            }
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 65536)
+        ReturnValue(0)
+    }
+}
+
+Function.Agent_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Agent", "Spawns a background sub-agent worker to process a task asynchronously. Pulls input from Pgmem and parks output in Pgmem. Worker provider/model is configurable via the optional 'model' field (provider[:model]), else the HALCODE_WORKER env var, else the built-in default.")
+        UtilArgs_AddField(s, "task_id", "string", 0, "The Task ID in pgmem (optional).", "task_id")
+        UtilArgs_AddField(s, "task_prompt", "string", 1, "The instructions or goal for the sub-agent.", "task_prompt")
+        UtilArgs_AddField(s, "context_key", "string", 1, "The Pgmem key to pickup context data from.", "context_key")
+        UtilArgs_AddField(s, "result_key", "string", 1, "The Pgmem key to park the result to.", "result_key")
+        UtilArgs_AddField(s, "model", "string", 0, "Optional worker provider[:model] spec (e.g. 'deepseek', 'openai:gpt-4o'). Defaults to HALCODE_WORKER env var, then 'deepseek'.", "model")
+        ReturnValue(s)
+    }
+}
+
+Function.Agent_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.Agent_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.Agent_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = "{\"name\":\"Agent\",\"description\":\"Spawns a background sub-agent worker to process a task asynchronously. Pulls input from Pgmem and parks output in Pgmem. Worker provider/model is configurable via the optional 'model' field (provider[:model]), else the HALCODE_WORKER env var, else the built-in default.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"task_id\":{\"type\":\"string\",\"description\":\"The Task ID in pgmem (optional).\"},\"task_prompt\":{\"type\":\"string\",\"description\":\"The instructions or goal for the sub-agent.\"},\"context_key\":{\"type\":\"string\",\"description\":\"The Pgmem key to pickup context data from.\"},\"result_key\":{\"type\":\"string\",\"description\":\"The Pgmem key to park the result to.\"},\"model\":{\"type\":\"string\",\"description\":\"Optional worker provider[:model] spec (e.g. 'deepseek', 'openai:gpt-4o'). Defaults to HALCODE_WORKER env var, then 'deepseek'.\"}},\"required\":[\"task_prompt\",\"context_key\",\"result_key\"]}}"
+        resp_str = StringConcat("{\"method\":\"schema_response\",\"schema\":", schema_str)
+        resp_str = StringConcat(resp_str, "}")
+        Socket.SendMsg(client_fd, resp_str)
+    }
+}
+
+Function.Agent_CallPgmem {
+    Input: args_obj: Address
+    Output: Address
+    Body: {
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        rc = Socket.ConnectUnix(fd, "@halcode/Pgmem")
+        IfCondition LessThan(rc, 0) ThenBlock: { Socket.Close(fd) ReturnValue(0) }
+        Socket.SetRecvTimeout(fd, 30000)
+
+        wrap = JSON.NewObject()
+        JSON.SetString(wrap, "method", "call")
+        JSON.SetString(wrap, "id", "agent_internal")
+        JSON.SetObject(wrap, "args", args_obj)
+        
+        Socket.SendMsg(fd, JSON.SerializeObject(wrap))
+        resp_str = Socket.RecvMsg(fd)
+        Socket.Close(fd)
+        ReturnValue(resp_str)
+    }
+}
+
+// Append a timestamped line to /tmp/hal_agent_<task_id>.log.
+// O_WRONLY|O_CREAT|O_APPEND = 1|64|1024 = 1089, mode 0644 = 420
+Function.Agent_LogMsg {
+    Input: log_path: Address
+    Input: msg: Address
+    Body: {
+        IfCondition EqualTo(log_path, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(msg, 0) ThenBlock: { ReturnValue(0) }
+        lfd = SystemCall(AgentSys.SYS_OPEN, log_path, 1089, 420, 0, 0)
+        IfCondition LessThan(lfd, 0) ThenBlock: { ReturnValue(0) }
+        llen = StringLength(msg)
+        SystemCall(AgentSys.SYS_WRITE, lfd, msg, llen, 0, 0)
+        nl = Allocate(4)
+        SetByte(nl, 0, 10) SetByte(nl, 1, 0)
+        SystemCall(AgentSys.SYS_WRITE, lfd, nl, 1, 0, 0)
+        Deallocate(nl, 4)
+        SystemCall(AgentSys.SYS_CLOSE, lfd, 0, 0, 0, 0)
+    }
+}
+
+Function.Agent_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Output: Integer
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { Agent_SendError(client_fd, 0, "invalid JSON") ReturnValue(0) }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: { Agent_SendError(client_fd, 0, "request must be a JSON object") ReturnValue(0) }
+
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: { Agent_SendError(client_fd, 0, "missing method") ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: { Agent_SendSchema(client_fd) ReturnValue(0) }
+
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(AgentState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                Agent_SendError(client_fd, id, "missing required arguments") ReturnValue(0)
+            }
+
+            t_id = UtilArgs_GetString(validated, "task_id")
+            t_prompt = UtilArgs_GetString(validated, "task_prompt")
+            c_key = UtilArgs_GetString(validated, "context_key")
+            r_key = UtilArgs_GetString(validated, "result_key")
+            m_arg = UtilArgs_GetString(validated, "model")
+            
+            IfCondition EqualTo(t_id, 0) ThenBlock: { t_id = "unknown" }
+
+            pid = SystemCall(AgentSys.SYS_FORK, 0, 0, 0, 0, 0)
+            IfCondition EqualTo(pid, 0) ThenBlock: {
+                pid2 = SystemCall(AgentSys.SYS_FORK, 0, 0, 0, 0, 0)
+                IfCondition GreaterThan(pid2, 0) ThenBlock: {
+                    SystemCall(AgentSys.SYS_EXIT, 0, 0, 0, 0, 0)
+                }
+
+                // Background Worker (Daemon). Detach before any other call
+                // so this process cannot read the parent's client socket.
+                Agent_Detach()
+                Arena_Init()
+                log_path = StringConcat("/tmp/hal_agent_", t_id)
+                log_path = StringConcat(log_path, ".log")
+                Agent_LogMsg(log_path, "[daemon] started")
+                Agent_LogMsg(log_path, StringConcat("[daemon] task_id=", t_id))
+                Agent_LogMsg(log_path, StringConcat("[daemon] context_key=", c_key))
+                Agent_LogMsg(log_path, StringConcat("[daemon] result_key=", r_key))
+
+                worker_spec = m_arg
+                IfCondition EqualTo(worker_spec, 0) ThenBlock: {
+                    worker_spec = Agent_GetEnv("HALCODE_WORKER")
+                }
+                IfCondition EqualTo(worker_spec, 0) ThenBlock: {
+                    worker_spec = "deepseek"
+                }
+                Agent_LogMsg(log_path, StringConcat("[daemon] worker_spec=", worker_spec))
+                cmd_prefix = StringConcat("timeout 300 ./HalCode9000.x --agent ", worker_spec)
+                cmd_prefix = StringConcat(cmd_prefix, " < ")
+
+                c_data = ""
+                IfCondition NotEqual(c_key, 0) ThenBlock: {
+                    pg_req = JSON.NewObject()
+                    JSON.SetString(pg_req, "op", "pickup")
+                    JSON.SetString(pg_req, "key", c_key)
+                    pg_resp_str = Agent_CallPgmem(pg_req)
+                    IfCondition NotEqual(pg_resp_str, 0) ThenBlock: {
+                        pg_resp = JSON.AsObject(ParseJSON(pg_resp_str))
+                        IfCondition NotEqual(pg_resp, 0) ThenBlock: {
+                            IfCondition EqualTo(JSON.GetBool(pg_resp, "ok"), 1) ThenBlock: {
+                                c_data = JSON.GetString(pg_resp, "content")
+                            }
+                        }
+                    }
+                }
+                
+                in_content = StringConcat("TASK INSTRUCTIONS:\n", t_prompt)
+                in_content = StringConcat(in_content, "\n\nCONTEXT DATA:\n")
+                IfCondition NotEqual(c_data, 0) ThenBlock: {
+                    in_content = StringConcat(in_content, c_data)
+                }
+                
+                in_path = StringConcat("/tmp/agent_in_", t_id)
+                in_path = StringConcat(in_path, ".txt")
+                out_path = StringConcat("/tmp/agent_out_", t_id)
+                out_path = StringConcat(out_path, ".txt")
+
+                Agent_LogMsg(log_path, StringConcat("[daemon] writing input to ", in_path))
+                fd = SystemCall(AgentSys.SYS_OPEN, in_path, 577, 384, 0, 0) // O_WRONLY|O_CREAT|O_TRUNC, 0600
+                IfCondition GreaterEqual(fd, 0) ThenBlock: {
+                    SystemCall(AgentSys.SYS_WRITE, fd, in_content, StringLength(in_content), 0, 0)
+                    SystemCall(AgentSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+                }
+
+                SystemCall(AgentSys.SYS_UNLINK, out_path, 0, 0, 0, 0)
+                envp = Agent_BuildInheritedEnvp()
+
+                Agent_LogMsg(log_path, "[daemon] spawning HalCode9000.x worker")
+                cpid = SystemCall(AgentSys.SYS_FORK, 0, 0, 0, 0, 0)
+                IfCondition EqualTo(cpid, 0) ThenBlock: {
+                    Agent_Detach()
+                    argv = Allocate(32)
+                    StoreValue(Add(argv, 0), "/bin/sh")
+                    StoreValue(Add(argv, 8), "-c")
+                    cmd = cmd_prefix
+                    cmd = StringConcat(cmd, in_path)
+                    cmd = StringConcat(cmd, " > ")
+                    cmd = StringConcat(cmd, out_path)
+                    cmd = StringConcat(cmd, " 2>>")
+                    cmd = StringConcat(cmd, log_path)
+                    StoreValue(Add(argv, 16), cmd)
+                    StoreValue(Add(argv, 24), 0)
+                    SystemCall(AgentSys.SYS_EXECVE, "/bin/sh", argv, envp)
+                    SystemCall(AgentSys.SYS_EXIT, 1, 0, 0, 0, 0)
+                }
+
+                status_ptr2 = Allocate(8)
+                SystemCall(AgentSys.SYS_WAIT4, cpid, status_ptr2, 0, 0, 0)
+                raw_status2 = Dereference(status_ptr2, "dword")
+                exit_code2 = Modulo(Divide(raw_status2, 256), 256)
+                Deallocate(status_ptr2, 8)
+                Agent_LogMsg(log_path, StringConcat("[daemon] worker exited, code=", NumberToString(exit_code2)))
+
+                out_content = "[Error: Sub-agent execution failed]"
+                out_fd = SystemCall(AgentSys.SYS_OPEN, out_path, 0, 0, 0, 0)
+                IfCondition GreaterEqual(out_fd, 0) ThenBlock: {
+                    buf = Allocate(1048576)
+                    n = SystemCall(AgentSys.SYS_READ, out_fd, buf, 1048575, 0, 0)
+                    SystemCall(AgentSys.SYS_CLOSE, out_fd, 0, 0, 0, 0)
+                    Agent_LogMsg(log_path, StringConcat("[daemon] output bytes=", NumberToString(n)))
+                    IfCondition GreaterThan(n, 0) ThenBlock: {
+                        SetByte(buf, n, 0)
+                        out_content = buf
+                    }
+                } ElseBlock: {
+                    Agent_LogMsg(log_path, "[daemon] output file not found or empty")
+                }
+
+                Agent_LogMsg(log_path, StringConcat("[daemon] parking to pgmem key=", r_key))
+                park_req = JSON.NewObject()
+                JSON.SetString(park_req, "op", "park")
+                JSON.SetString(park_req, "key", r_key)
+                JSON.SetString(park_req, "kind", "tool_result")
+                JSON.SetString(park_req, "content", out_content)
+                JSON.SetString(park_req, "scope", "project")
+                park_resp = Agent_CallPgmem(park_req)
+                IfCondition EqualTo(park_resp, 0) ThenBlock: {
+                    Agent_LogMsg(log_path, "[daemon] WARNING: park call returned null (pgmem timeout or unavailable)")
+                } ElseBlock: {
+                    Agent_LogMsg(log_path, "[daemon] park ok")
+                }
+
+                // Write flag file so HalCode9000 main loop can show a notification.
+                notify_fd = SystemCall(AgentSys.SYS_OPEN, "/tmp/hal_agent_notify.txt", 577, 420, 0, 0)
+                IfCondition GreaterEqual(notify_fd, 0) ThenBlock: {
+                    notify_msg = StringConcat("Agent parked: ", r_key)
+                    notify_msg = StringConcat(notify_msg, "\n")
+                    SystemCall(AgentSys.SYS_WRITE, notify_fd, notify_msg, StringLength(notify_msg), 0, 0)
+                    SystemCall(AgentSys.SYS_CLOSE, notify_fd, 0, 0, 0, 0)
+                }
+
+                IfCondition GreaterEqual(out_fd, 0) ThenBlock: {
+                    Deallocate(buf, 1048576)
+                }
+                
+                IfCondition NotEqual(StringCompare(t_id, "unknown"), 0) ThenBlock: {
+                    Agent_LogMsg(log_path, "[daemon] calling task_end")
+                    end_req = JSON.NewObject()
+                    JSON.SetString(end_req, "op", "task_end")
+                    JSON.SetString(end_req, "task_id", t_id)
+                    JSON.SetString(end_req, "status", "complete")
+                    JSON.SetString(end_req, "result_key", r_key)
+                    end_resp = Agent_CallPgmem(end_req)
+                    IfCondition EqualTo(end_resp, 0) ThenBlock: {
+                        Agent_LogMsg(log_path, "[daemon] WARNING: task_end call returned null (pgmem timeout or unavailable)")
+                    } ElseBlock: {
+                        Agent_LogMsg(log_path, "[daemon] task_end ok")
+                    }
+                }
+
+                Agent_LogMsg(log_path, "[daemon] done, cleaning up")
+                SystemCall(AgentSys.SYS_UNLINK, in_path, 0, 0, 0, 0)
+                SystemCall(AgentSys.SYS_UNLINK, out_path, 0, 0, 0, 0)
+                SystemCall(AgentSys.SYS_EXIT, 0, 0, 0, 0, 0)
+            }
+            
+            status_ptr = Allocate(8)
+            SystemCall(AgentSys.SYS_WAIT4, pid, status_ptr, 0, 0, 0)
+            Deallocate(status_ptr, 8)
+            
+            log_reply = StringConcat("/tmp/hal_agent_", t_id)
+            log_reply = StringConcat(log_reply, ".log")
+            reply = StringConcat("Worker spawned asynchronously. Result will be parked in Pgmem under key: ", r_key)
+            reply = StringConcat(reply, " | Log: ")
+            reply = StringConcat(reply, log_reply)
+            Agent_SendResult(client_fd, id, reply)
+            ReturnValue(1)
+        }
+        Agent_SendError(client_fd, 0, "unknown method")
+        ReturnValue(0)
+    }
+}
+
+SubRoutine.Main {
+    Arena_Init()
+    AgentState.schema = Agent_BuildSchema()
+
+    SystemCall(AgentSys.SYS_UNLINK, AgentConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
+    bind_rc = Socket.BindUnix(fd, AgentConst.SOCK_PATH)
+    IfCondition LessThan(bind_rc, 0) ThenBlock: { Exit(1) }
+    Socket.Listen(fd, AgentConst.BACKLOG)
+    AgentState.listen_fd = fd
+
+    WhileLoop EqualTo(AgentState.running, 1) {
+        client_fd = Socket.Accept(AgentState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            // 2-entry pollfd array: [client_fd, listen_fd]
+            // struct pollfd { int fd; short events; short revents; } = 8 bytes each
+            pfd = Allocate(16)
+            WhileLoop EqualTo(done, 0) {
+                // Fill pollfd[0] for persistent client (HC or first connector)
+                StoreValue(pfd, client_fd, "dword")
+                SetByte(pfd, 4, 1)   // events = POLLIN
+                SetByte(pfd, 5, 0)
+                SetByte(pfd, 6, 0)   // revents cleared
+                SetByte(pfd, 7, 0)
+                // Fill pollfd[1] for listen socket (new MCP connections)
+                StoreValue(Add(pfd, 8), AgentState.listen_fd, "dword")
+                SetByte(pfd, 12, 1)  // events = POLLIN
+                SetByte(pfd, 13, 0)
+                SetByte(pfd, 14, 0)  // revents cleared
+                SetByte(pfd, 15, 0)
+
+                SystemCall(AgentSys.SYS_POLL, pfd, 2, -1, 0, 0)
+
+                rev_client = GetByte(pfd, 6)
+                rev_listen = GetByte(pfd, 14)
+
+                // New connection from MCP client: accept, serve once, close
+                IfCondition NotEqual(rev_listen, 0) ThenBlock: {
+                    new_fd = Socket.Accept(AgentState.listen_fd)
+                    IfCondition GreaterEqual(new_fd, 0) ThenBlock: {
+                        Socket.SetRecvTimeout(new_fd, 10000)
+                        mcp_req = Socket.RecvMsg(new_fd)
+                        IfCondition NotEqual(mcp_req, 0) ThenBlock: {
+                            IfCondition NotEqual(mcp_req, -1) ThenBlock: {
+                                Agent_HandleRequest(new_fd, mcp_req)
+                            }
+                        }
+                        Socket.Close(new_fd)
+                    }
+                }
+
+                // Persistent client (HC) has data
+                IfCondition NotEqual(rev_client, 0) ThenBlock: {
+                    req = Socket.RecvMsg(client_fd)
+                    IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                    IfCondition NotEqual(req, 0) ThenBlock: {
+                        IfCondition NotEqual(req, -1) ThenBlock: {
+                            Agent_HandleRequest(client_fd, req)
+                        }
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Exit(0)
+}
+
+RunTask(Main)

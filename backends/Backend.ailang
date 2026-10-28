@@ -1,0 +1,446 @@
+// backends/Backend.ailang — provider-agnostic dispatch wrapper.
+//
+// HalCode9000.ailang calls Backend.* everywhere. This file routes each call
+// to the active backend (Anthropic or OpenAI) based on BackendState.kind.
+//
+// Public API (mirrors both backend modules exactly):
+//   Backend.Init(auth_mode, credential, system_prompt)
+//        provider_json: parsed provider config object (from providers/*.json)
+//        Sets model, URLs, and backend kind. Calls the right backend Init.
+//
+//   Backend.BuildHeaders()                  -> headers_str
+//   Backend.BuildRequest(messages, tools)   -> body_str
+//   Backend.OnEvent(evt_type, evt_data)     -> signal (0=continue,1=done,2=tools)
+//   Backend.GetPendingTools()               -> JSON array
+//   Backend.GetToolName(i)                  -> string
+//   Backend.GetToolId(i)                    -> string
+//   Backend.CommitAssistantToHistory()
+//   Backend.AppendToolResultsToHistory(arr)
+//   Backend.IsCleanStop()                   -> Integer
+//   Backend.Reset()
+//   Backend.GetURL()                        -> full URL string (host+path)
+//
+// Backend kinds:
+//   0 = unset
+//   1 = Anthropic
+//   2 = OpenAI-compatible (OpenAI, Groq, xAI, Google, Ollama, ...)
+//   3 = Gemini (Google API - distinct to handle specific endpoint quirks)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+Import.Applications.HalCode9000.backends.Anthropic
+Import.Applications.HalCode9000.backends.OpenAI
+Import.Applications.HalCode9000.backends.Gemini
+
+FixedPool.BackendKind {
+    "UNSET":     Initialize=0
+    "ANTHROPIC": Initialize=1
+    "OPENAI":    Initialize=2
+    "GEMINI":    Initialize=3
+}
+
+FixedPool.BackendState {
+    "kind":      Initialize=0, CanChange=True   // BackendKind
+    "url":       Initialize=0, CanChange=True   // full URL (allocated string)
+    "model":     Initialize=0, CanChange=True
+    "sys_prompt": Initialize=0, CanChange=True
+}
+
+// Provider fields stored directly — avoids Library.JSON hash collisions
+// (task #28) that cause GetString to return wrong values for keys like
+// "key_hint" and "default_model".
+//
+// "kind" is an INTEGER (BackendKind.ANTHROPIC=1 or BackendKind.OPENAI=2).
+// CC_MakeProvider sets it directly. Backend.Init reads it WITHOUT doing a
+// StringCompare on "backend" — StringCompare was the source of the bug where
+// DeepSeek (and all OpenAI-compat providers) silently fell through to Anthropic
+// because the "backend" string pointer got clobbered by arena allocations in
+// the Auth flow that runs between CC_MakeProvider() and Backend.Init().
+FixedPool.SelectedProvider {
+    "name":             Initialize=0, CanChange=True
+    "backend":          Initialize=0, CanChange=True
+    "base_url":         Initialize=0, CanChange=True
+    "api_path":         Initialize=0, CanChange=True
+    "default_model":    Initialize=0, CanChange=True
+    "key_hint":         Initialize=0, CanChange=True
+    "reasoning_effort": Initialize=0, CanChange=True
+    "kind":             Initialize=0, CanChange=True   // BackendKind integer — NOT a string pointer
+}
+
+// =============================================================================
+// INIT
+// =============================================================================
+// auth_mode:     "apikey" or "oauth"
+// credential:    API key or Bearer token
+// system_prompt: the agent's system prompt string
+//
+// Reads SelectedProvider.* fields (set by CC_MakeProvider in HalCode9000.ailang).
+// Routes to Anthropic or OpenAI backend based on SelectedProvider.kind integer —
+// avoids StringCompare on "backend" string which was unreliable after arena churn.
+Function.Backend.Init {
+    Input: auth_mode: Address
+    Input: credential: Address
+    Input: system_prompt: Address
+    Body: {
+        prov_kind   = SelectedProvider.kind
+        base_url    = SelectedProvider.base_url
+        api_path    = SelectedProvider.api_path
+        model       = SelectedProvider.default_model
+
+        url = StringConcat(base_url, api_path)
+        BackendState.url = url
+        BackendState.model = model
+        BackendState.sys_prompt = system_prompt
+
+        IfCondition EqualTo(prov_kind, BackendKind.ANTHROPIC) ThenBlock: {
+            BackendState.kind = BackendKind.ANTHROPIC
+            Anthropic.Init(auth_mode, credential, model, system_prompt)
+        } ElseBlock: {
+            IfCondition EqualTo(prov_kind, BackendKind.GEMINI) ThenBlock: {
+                BackendState.kind = BackendKind.GEMINI
+                Gemini.Init(auth_mode, credential, model, system_prompt)
+                Gemini.SetURL(base_url, api_path)
+            } ElseBlock: {
+                BackendState.kind = BackendKind.OPENAI
+                OpenAI.Init(auth_mode, credential, model, system_prompt)
+                OpenAI.SetURL(base_url, api_path)
+                OpenAI.SetReasoningEffort(SelectedProvider.reasoning_effort)
+            }
+        }
+    }
+}
+
+Function.Backend.SetMaxTokens {
+    Input: n: Integer
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            Anthropic.SetMaxTokens(n)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            Gemini.SetMaxTokens(n)
+            ReturnValue(0)
+        }
+        OpenAI.SetMaxTokens(n)
+    }
+}
+
+Function.Backend.HitLength {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.OPENAI) ThenBlock: {
+            ReturnValue(OpenAI.HitLength())
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// HEADERS
+// =============================================================================
+Function.Backend.BuildHeaders {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            ReturnValue(Anthropic.BuildHeaders())
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            ReturnValue(Gemini.BuildHeaders())
+        }
+        ReturnValue(OpenAI.BuildHeaders())
+    }
+}
+
+// =============================================================================
+// REQUEST
+// =============================================================================
+Function.Backend.BuildRequest {
+    Input: messages: Address
+    Input: tools: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            ReturnValue(Anthropic.BuildRequest(messages, tools))
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            ReturnValue(Gemini.BuildRequest(messages, tools))
+        }
+        ReturnValue(OpenAI.BuildRequest(messages, tools))
+    }
+}
+
+// =============================================================================
+// URL
+// =============================================================================
+Function.Backend.GetURL {
+    Output: Address
+    Body: {
+        ReturnValue(BackendState.url)
+    }
+}
+
+// =============================================================================
+// SSE EVENT
+// =============================================================================
+Function.Backend.OnEvent {
+    Input: evt_type: Address
+    Input: evt_data: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            ReturnValue(Anthropic.OnEvent(evt_type, evt_data))
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            ReturnValue(Gemini.OnEvent(evt_type, evt_data))
+        }
+        ReturnValue(OpenAI.OnEvent(evt_type, evt_data))
+    }
+}
+
+// =============================================================================
+// PENDING TOOLS
+// =============================================================================
+Function.Backend.GetPendingTools {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            ReturnValue(Anthropic.GetPendingTools())
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            ReturnValue(Gemini.GetPendingTools())
+        }
+        ReturnValue(OpenAI.GetPendingTools())
+    }
+}
+
+Function.Backend.GetToolName {
+    Input: i: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            ReturnValue(Anthropic.GetToolName(i))
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            ReturnValue(Gemini.GetToolName(i))
+        }
+        ReturnValue(OpenAI.GetToolName(i))
+    }
+}
+
+Function.Backend.GetToolId {
+    Input: i: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            ReturnValue(Anthropic.GetToolId(i))
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            ReturnValue(Gemini.GetToolId(i))
+        }
+        ReturnValue(OpenAI.GetToolId(i))
+    }
+}
+
+// =============================================================================
+// USAGE DISPLAY
+// =============================================================================
+Function.Backend.PrintUsage {
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            Anthropic.PrintUsage()
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.OPENAI) ThenBlock: {
+            OpenAI.PrintUsage()
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            Gemini.PrintUsage()
+        }
+    }
+}
+
+// =============================================================================
+// HISTORY COMMIT
+// =============================================================================
+Function.Backend.CommitAssistantToHistory {
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            Anthropic.CommitAssistantToHistory()
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            Gemini.CommitAssistantToHistory()
+        } ElseBlock: {
+            OpenAI.CommitAssistantToHistory()
+        }
+    }
+}
+
+Function.Backend.AppendToolResultsToHistory {
+    Input: arr: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            Anthropic.AppendToolResultsToHistory(arr)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            Gemini.AppendToolResultsToHistory(arr)
+        } ElseBlock: {
+            OpenAI.AppendToolResultsToHistory(arr)
+        }
+    }
+}
+
+// =============================================================================
+// CLEAN STOP CHECK
+// =============================================================================
+Function.Backend.IsCleanStop {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            ReturnValue(Anthropic.IsCleanStop())
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            ReturnValue(Gemini.IsCleanStop())
+        }
+        ReturnValue(OpenAI.IsCleanStop())
+    }
+}
+
+// =============================================================================
+// BUFFER ACCESSORS — valid between CommitAssistantToHistory and Reset
+// =============================================================================
+Function.Backend.GetReasoning {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.OPENAI) ThenBlock: {
+            ReturnValue(OpenAI.GetReasoning())
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Backend.GetResponseText {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.OPENAI) ThenBlock: {
+            ReturnValue(OpenAI.GetResponseText())
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// RESET
+// =============================================================================
+Function.Backend.Reset {
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            Anthropic.Reset()
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            Gemini.Reset()
+        } ElseBlock: {
+            OpenAI.Reset()
+        }
+    }
+}
+
+// =============================================================================
+// PROVIDER LOADER — reads providers/*.json, returns array of parsed objects
+// =============================================================================
+// Called from startup. Returns an XArray of provider JSON objects.
+// Caller iterates, shows menu, populates SelectedProvider.*, calls Backend.Init.
+//
+// Uses SYS_GETDENTS to list the directory, reads each *.json file.
+// Returns 0 on failure, XArray on success.
+
+FixedPool.BELoaderSys {
+    "SYS_OPEN":    Initialize=2
+    "SYS_READ":    Initialize=0
+    "SYS_CLOSE":   Initialize=3
+    "SYS_GETDENTS":Initialize=78
+    "O_RDONLY":    Initialize=0
+    "O_DIRECTORY": Initialize=65536
+    "DT_REG":      Initialize=8
+}
+
+FixedPool.BELoaderConst {
+    "DENTS_BUF":   Initialize=4096
+    "FILE_BUF":    Initialize=8192
+    "DIR_PATH":    Initialize=0, CanChange=True
+}
+
+Function.Backend.LoadProviders {
+    Input: providers_dir: Address
+    Output: Address
+    Body: {
+        BELoaderConst.DIR_PATH = providers_dir
+        dfd = SystemCall(BELoaderSys.SYS_OPEN, providers_dir,
+                         BitwiseOr(BELoaderSys.O_RDONLY, BELoaderSys.O_DIRECTORY),
+                         0, 0, 0)
+        IfCondition LessThan(dfd, 0) ThenBlock: { ReturnValue(0) }
+
+        dents    = Allocate(BELoaderConst.DENTS_BUF)
+        arr      = Array.Create(16)
+        scanning = 1
+
+        WhileLoop EqualTo(scanning, 1) {
+            nb = SystemCall(BELoaderSys.SYS_GETDENTS, dfd, dents,
+                            BELoaderConst.DENTS_BUF, 0, 0)
+            IfCondition LessEqual(nb, 0) ThenBlock: {
+                scanning = 0
+            } ElseBlock: {
+                off = 0
+                WhileLoop LessThan(off, nb) {
+                    reclen = GetByte(dents, Add(off, 16))
+                    reclen = BitwiseOr(reclen, LeftShift(GetByte(dents, Add(off, 17)), 8))
+                    dtype  = GetByte(dents, Subtract(Add(off, reclen), 1))
+                    name   = Add(dents, Add(off, 18))
+
+                    // DT_REG=8 on ext4; WSL2 NTFS may return DT_UNKNOWN=0 — accept both
+                    is_file = 0
+                    IfCondition EqualTo(dtype, 8) ThenBlock: { is_file = 1 }
+                    IfCondition EqualTo(dtype, 0) ThenBlock: { is_file = 1 }
+                    IfCondition EqualTo(is_file, 1) ThenBlock: {
+                        nlen = StringLength(name)
+                        IfCondition GreaterThan(nlen, 5) ThenBlock: {
+                            sfx = Add(name, Subtract(nlen, 5))
+                            IfCondition EqualTo(StringCompare(sfx, ".json"), 0) ThenBlock: {
+                                fpath = StringConcat(providers_dir, "/")
+                                fpath = StringConcat(fpath, name)
+                                ffd = SystemCall(BELoaderSys.SYS_OPEN, fpath,
+                                                 BELoaderSys.O_RDONLY, 0, 0, 0)
+                                IfCondition GreaterEqual(ffd, 0) ThenBlock: {
+                                    // Fresh buffer per file — JSON stores string ptrs into it
+                                    fbuf = Allocate(BELoaderConst.FILE_BUF)
+                                    nr = SystemCall(BELoaderSys.SYS_READ, ffd, fbuf,
+                                                    Subtract(BELoaderConst.FILE_BUF, 1), 0, 0)
+                                    SystemCall(BELoaderSys.SYS_CLOSE, ffd, 0, 0, 0, 0)
+                                    IfCondition GreaterThan(nr, 0) ThenBlock: {
+                                        SetByte(fbuf, nr, 0)
+                                        obj = JSON.AsObject(ParseJSON(fbuf))
+                                        IfCondition NotEqual(obj, 0) ThenBlock: {
+                                            Array.Push(arr, obj)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    IfCondition LessEqual(reclen, 0) ThenBlock: { off = nb }
+                    IfCondition GreaterThan(reclen, 0) ThenBlock: {
+                        off = Add(off, reclen)
+                    }
+                }
+            }
+        }
+
+        SystemCall(BELoaderSys.SYS_CLOSE, dfd, 0, 0, 0, 0)
+        Deallocate(dents, BELoaderConst.DENTS_BUF)
+        ReturnValue(arr)
+    }
+}

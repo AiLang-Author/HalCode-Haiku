@@ -1,0 +1,722 @@
+// Auth.ailang — ClaudeCode auth dispatcher.
+//
+// Decides between subscription OAuth (claude.ai manual-paste flow) and
+// console API key. Designed so the caller (ClaudeCode.ailang) can detect
+// "needs setup" and run a bootstrap flow rather than just erroring out.
+//
+// Return shape from Auth.RunOAuthFlow / Auth.RunAPIKeyFlow:
+//   {
+//     "status":     "ok" | "needs_setup_oauth" | "needs_setup_apikey" | "error",
+//     "mode":       "oauth" | "apikey"           (only when status=="ok")
+//     "credential": "<bearer-or-key>"            (only when status=="ok")
+//     "message":    "<human-readable detail>"    (always present)
+//   }
+//
+// OAuth flow (manual paste, matches official `claude` CLI behavior):
+//   1. Open browser to claude.ai/oauth/authorize?... with code=true and a
+//      redirect_uri pointing to a server-rendered "copy this code" page.
+//   2. User authorizes, browser shows a one-time code.
+//   3. User pastes the code back into the terminal.
+//   4. Exchange code (with PKCE verifier) for access+refresh tokens.
+//   5. Cache tokens at ~/.halcode/oauth_tokens.json (mode 0600).
+//
+// Why not localhost callback: Anthropic's subscription OAuth (claude.ai) is
+// configured for a fixed remote redirect_uri. They do strict redirect_uri
+// matching, and the registered URI is hosted on platform.claude.com — not
+// localhost. The manual-paste pattern is the only one that works with their
+// current OAuth config.
+//
+// PR note: this client uses the same client_id as the official Claude Code
+// CLI because Anthropic doesn't expose a third-party-registration path for
+// subscription scopes. The PR proposes adding such a path. See
+// ClaudeCode.md "OAuth & client_id reuse" for the full transparency note.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.HTTP
+LibraryImport.OAuth
+
+FixedPool.AuthSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_MKDIR":     Initialize=83
+}
+
+FixedPool.AuthConst {
+    "TOKEN_LEEWAY":  Initialize=60      // refresh if within 60s of expiry
+    "PASTE_BUF":     Initialize=4096    // max length for pasted code
+}
+
+FixedPool.AuthHttpState {
+    "resp_buf":  Initialize=0, CanChange=True
+    "chunk_buf": Initialize=0, CanChange=True
+    "paste_buf": Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// RESULT HELPER
+// =============================================================================
+Function.Auth_Result {
+    Input: status: Address
+    Input: mode: Address
+    Input: credential: Address
+    Input: message: Address
+    Output: Address
+    Body: {
+        out = JSON.NewObject()
+        JSON.SetString(out, "status", status)
+        IfCondition NotEqual(mode, 0) ThenBlock: { JSON.SetString(out, "mode", mode) }
+        IfCondition NotEqual(credential, 0) ThenBlock: { JSON.SetString(out, "credential", credential) }
+        IfCondition NotEqual(message, 0) ThenBlock: { JSON.SetString(out, "message", message) }
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// NATIVE FILE WRITER (Safe Serialization + Syscalls)
+// =============================================================================
+Function.Auth_WriteJsonFile {
+    Input: path: Address
+    Input: obj: Address
+    Output: Integer
+    Body: {
+        IfCondition Or(EqualTo(path, 0), EqualTo(obj, 0)) ThenBlock: { ReturnValue(0) }
+        json_str = JSON.SerializeObject(obj)
+        IfCondition EqualTo(json_str, 0) ThenBlock: { ReturnValue(0) }
+        fd = SystemCall(AuthSys.SYS_OPEN, path, 577, 384, 0, 0) // O_WRONLY|O_CREAT|O_TRUNC (577), 0600 (384)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(AuthSys.SYS_WRITE, fd, json_str, StringLength(json_str), 0, 0)
+        SystemCall(AuthSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        ReturnValue(1)
+    }
+}
+
+Function.Auth_SaveTokensNative {
+    Input: path: Address
+    Input: tokens_obj: Address
+    Output: Integer
+    Body: {
+        IfCondition Or(EqualTo(path, 0), EqualTo(tokens_obj, 0)) ThenBlock: { ReturnValue(0) }
+        safe_tokens = JSON.NewObject()
+        acc = JSON.GetString(tokens_obj, "access_token")
+        IfCondition NotEqual(acc, 0) ThenBlock: { JSON.SetString(safe_tokens, "access_token", acc) }
+        ref = JSON.GetString(tokens_obj, "refresh_token")
+        IfCondition NotEqual(ref, 0) ThenBlock: { JSON.SetString(safe_tokens, "refresh_token", ref) }
+        typ = JSON.GetString(tokens_obj, "token_type")
+        IfCondition NotEqual(typ, 0) ThenBlock: { JSON.SetString(safe_tokens, "token_type", typ) }
+        scp = JSON.GetString(tokens_obj, "scope")
+        IfCondition NotEqual(scp, 0) ThenBlock: { JSON.SetString(safe_tokens, "scope", scp) }
+        exp_in = JSON.GetNumber(tokens_obj, "expires_in")
+        IfCondition GreaterThan(exp_in, 0) ThenBlock: {
+            JSON.SetNumber(safe_tokens, "expires_in", exp_in)
+            now = SystemCall(201, 0, 0, 0, 0, 0)
+            exp_at = Add(now, exp_in)
+            JSON.SetNumber(safe_tokens, "expires_at", exp_at)
+        } ElseBlock: {
+            ea = JSON.GetNumber(tokens_obj, "expires_at")
+            IfCondition GreaterThan(ea, 0) ThenBlock: { JSON.SetNumber(safe_tokens, "expires_at", ea) }
+        }
+        ReturnValue(Auth_WriteJsonFile(path, safe_tokens))
+    }
+}
+
+// =============================================================================
+// CONFIG LOAD/WRITE
+// =============================================================================
+Function.Auth.LoadConfig {
+    Input: path: Address
+    Output: Address
+    Body: { ReturnValue(OAuth.LoadTokens(path)) }
+}
+
+// Write the default OAuth config. All values here come from observation of
+// the official `claude` CLI's OAuth handshake. They are checked into the
+// default config (NOT hardcoded into source) so users can edit them without
+// recompiling — and so the same binary can be retargeted at a different
+// OAuth provider by editing one file.
+Function.Auth.WriteDefaultOAuthConfig {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        cfg = JSON.NewObject()
+        // Endpoints — discovered from the official Claude CLI binary
+        // (strings extraction + observation of /login flow). Sourced from
+        // /tmp/oauth_urls.txt, captured 2026-04-28.
+        JSON.SetString(cfg, "authorize_endpoint", "https://claude.ai/oauth/authorize")
+        JSON.SetString(cfg, "token_endpoint",     "https://platform.claude.com/v1/oauth/token")
+        // The static client_id used by the official Claude Code CLI for
+        // subscription auth. See ClaudeCode.md OAuth section for the
+        // attribution + transparency note.
+        JSON.SetString(cfg, "client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+        // Server-hosted manual-paste redirect.
+        JSON.SetString(cfg, "redirect_uri", "https://platform.claude.com/oauth/code/callback")
+        // Scopes — full set the official CLI requests (subscription billing requires user:inference)
+        scopes = JSON.NewArray()
+        JSON.PushString(scopes, "org:create_api_key")
+        JSON.PushString(scopes, "user:profile")
+        JSON.PushString(scopes, "user:inference")
+        JSON.PushString(scopes, "user:sessions:claude_code")
+        JSON.PushString(scopes, "user:mcp_servers")
+        JSON.PushString(scopes, "user:file_upload")
+        JSON.SetArray(cfg, "scopes", scopes)
+        // Browser launcher
+        JSON.SetString(cfg, "browser_command", "wslview")
+        // Manual paste flow — append "code=true" to the authorize URL so
+        // claude.ai renders the "copy code" page rather than auto-redirecting.
+        JSON.SetBool(cfg, "manual_paste_flow", 1)
+        ReturnValue(Auth_WriteJsonFile(path, cfg))
+    }
+}
+
+// =============================================================================
+// CONFIG LOAD/WRITE FOR GOOGLE GEMINI
+// =============================================================================
+Function.Auth.WriteGoogleOAuthConfig {
+    Input: path: Address
+    Input: client_id: Address
+    Input: client_secret: Address
+    Output: Integer
+    Body: {
+        cfg = JSON.NewObject()
+        JSON.SetString(cfg, "authorize_endpoint", "https://accounts.google.com/o/oauth2/v2/auth")
+        JSON.SetString(cfg, "token_endpoint",     "https://oauth2.googleapis.com/token")
+        JSON.SetString(cfg, "client_id", client_id)
+        IfCondition NotEqual(client_secret, 0) ThenBlock: { JSON.SetString(cfg, "client_secret", client_secret) }
+        JSON.SetString(cfg, "redirect_uri", "http://127.0.0.1")
+        scopes = JSON.NewArray()
+        JSON.PushString(scopes, "https://www.googleapis.com/auth/generative-language")
+        JSON.PushString(scopes, "https://www.googleapis.com/auth/cloud-platform")
+        JSON.SetArray(cfg, "scopes", scopes)
+        JSON.SetString(cfg, "browser_command", "wslview")
+        JSON.SetBool(cfg, "manual_paste_flow", 0)
+        ReturnValue(Auth_WriteJsonFile(path, cfg))
+    }
+}
+
+// =============================================================================
+// READ ONE LINE FROM STDIN — for the user's pasted code
+// =============================================================================
+Function.Auth_ReadLine {
+    Input: buf: Address
+    Input: maxlen: Integer
+    Output: Integer
+    Body: {
+        used = 0
+        WhileLoop LessThan(used, Subtract(maxlen, 1)) {
+            n = SystemCall(AuthSys.SYS_READ, 0, Add(buf, used), 1, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            ch = GetByte(buf, used)
+            IfCondition EqualTo(ch, 10) ThenBlock: { BreakLoop }
+            used = Add(used, 1)
+        }
+        // Strip trailing CR if present
+        IfCondition GreaterThan(used, 0) ThenBlock: {
+            last = GetByte(buf, Subtract(used, 1))
+            IfCondition EqualTo(last, 13) ThenBlock: { used = Subtract(used, 1) }
+        }
+        SetByte(buf, used, 0)
+        ReturnValue(used)
+    }
+}
+
+// Extracts "code=..." from a pasted localhost URL, or returns original string
+Function.Auth_ExtractCodeFromUrl {
+    Input: url: Address
+    Output: Address
+    Body: {
+        len = StringLength(url)
+        i = 0
+        WhileLoop LessThan(i, Subtract(len, 4)) {
+            IfCondition EqualTo(GetByte(url, i), 99) ThenBlock: {       // c
+                IfCondition EqualTo(GetByte(url, Add(i, 1)), 111) ThenBlock: { // o
+                    IfCondition EqualTo(GetByte(url, Add(i, 2)), 100) ThenBlock: { // d
+                        IfCondition EqualTo(GetByte(url, Add(i, 3)), 101) ThenBlock: { // e
+                            IfCondition EqualTo(GetByte(url, Add(i, 4)), 61) ThenBlock: { // =
+                                start = Add(i, 5)
+                                end = start
+                                WhileLoop LessThan(end, len) {
+                                    ch = GetByte(url, end)
+                                    IfCondition Or(EqualTo(ch, 38), EqualTo(ch, 35)) ThenBlock: { BreakLoop } // & or #
+                                    end = Add(end, 1)
+                                }
+                                code_len = Subtract(end, start)
+                                code_str = Allocate(Add(code_len, 1))
+                                IfCondition EqualTo(code_str, 0) ThenBlock: { ReturnValue(url) }
+                                k = 0
+                                WhileLoop LessThan(k, code_len) {
+                                    SetByte(code_str, k, GetByte(url, Add(start, k)))
+                                    k = Add(k, 1)
+                                }
+                                SetByte(code_str, code_len, 0)
+                                ReturnValue(code_str)
+                            }
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(url)
+    }
+}
+
+// =============================================================================
+// CUSTOM GOOGLE TOKEN EXCHANGE (Bypasses Library.OAuth missing secret support)
+// =============================================================================
+Function.Auth_URLEncode {
+    Input: str: Address
+    Output: Address
+    Body: {
+        len = StringLength(str)
+        out = Allocate(Add(Multiply(len, 3), 1))
+        i = 0
+        j = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(str, i)
+            is_safe = 0
+            IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: { is_safe = 1 }
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { is_safe = 1 }
+            IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: { is_safe = 1 }
+            IfCondition EqualTo(ch, 45) ThenBlock: { is_safe = 1 }
+            IfCondition EqualTo(ch, 95) ThenBlock: { is_safe = 1 }
+            IfCondition EqualTo(ch, 46) ThenBlock: { is_safe = 1 }
+            IfCondition EqualTo(ch, 126) ThenBlock: { is_safe = 1 }
+
+            IfCondition EqualTo(is_safe, 1) ThenBlock: {
+                SetByte(out, j, ch)
+                j = Add(j, 1)
+            } ElseBlock: {
+                SetByte(out, j, 37)
+                j = Add(j, 1)
+                high = Divide(ch, 16)
+                low = Modulo(ch, 16)
+                IfCondition LessThan(high, 10) ThenBlock: { SetByte(out, j, Add(high, 48)) } ElseBlock: { SetByte(out, j, Add(high, 55)) }
+                j = Add(j, 1)
+                IfCondition LessThan(low, 10) ThenBlock: { SetByte(out, j, Add(low, 48)) } ElseBlock: { SetByte(out, j, Add(low, 55)) }
+                j = Add(j, 1)
+            }
+            i = Add(i, 1)
+        }
+        SetByte(out, j, 0)
+        ReturnValue(out)
+    }
+}
+
+Function.Auth_PostTokenWithSecret {
+    Input: token_endpoint: Address
+    Input: client_id: Address
+    Input: client_secret: Address
+    Input: extra_body: Address
+    Output: Address
+    Body: {
+        body = "client_id="
+        body = StringConcat(body, Auth_URLEncode(client_id))
+        body = StringConcat(body, "&client_secret=")
+        body = StringConcat(body, Auth_URLEncode(client_secret))
+        body = StringConcat(body, "&")
+        body = StringConcat(body, extra_body)
+
+        headers = "Content-Type: application/x-www-form-urlencoded\nAccept: application/json\n"
+        handle = HTTP.PostStream(token_endpoint, headers, body, 10000, 10000)
+        IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(0) }
+
+        IfCondition EqualTo(AuthHttpState.resp_buf, 0) ThenBlock: {
+            AuthHttpState.resp_buf = Allocate(65536)
+            AuthHttpState.chunk_buf = Allocate(4096)
+        }
+        resp = AuthHttpState.resp_buf
+        chunk = AuthHttpState.chunk_buf
+        MemorySet(resp, 0, 65536)
+        MemorySet(chunk, 0, 4096)
+
+        used = 0
+        WhileLoop LessThan(used, 65535) {
+            n = HTTP.ReadLineTimeout(handle, chunk, 4095, 50)
+            IfCondition EqualTo(n, -2) ThenBlock: {
+                ContinueLoop
+            }
+            IfCondition LessThan(n, 0) ThenBlock: { BreakLoop }
+            IfCondition GreaterThan(n, 0) ThenBlock: {
+                i = 0
+                WhileLoop LessThan(i, n) { 
+                    IfCondition LessThan(used, 65530) ThenBlock: {
+                        SetByte(resp, used, GetByte(chunk, i))
+                        used = Add(used, 1)
+                    }
+                    i = Add(i, 1) 
+                }
+            }
+            IfCondition LessThan(used, 65530) ThenBlock: {
+                SetByte(resp, used, 10)
+                used = Add(used, 1)
+            }
+        }
+        SetByte(resp, used, 0)
+        HTTP.CloseStream(handle)
+
+        parsed = ParseJSON(resp)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        obj = JSON.AsObject(parsed)
+        err = JSON.GetString(obj, "error")
+        IfCondition NotEqual(err, 0) ThenBlock: {
+            PrintMessage("[Auth] Token error: ")
+            PrintMessage(err)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+        ReturnValue(obj)
+    }
+}
+
+// =============================================================================
+// MANUAL-PASTE BROWSER FLOW
+// Match the official Claude CLI's UX:
+//   1. Print "opening browser..." with the URL fallback
+//   2. User approves at claude.ai, copies the displayed code
+//   3. Terminal prompts "paste code: ", reads pasted line
+//   4. Exchange code+verifier+redirect_uri for tokens
+// =============================================================================
+Function.Auth_RunPasteFlow {
+    Input: config: Address
+    Output: Address
+    Body: {
+        authorize_endpoint = JSON.GetString(config, "authorize_endpoint")
+        token_endpoint     = JSON.GetString(config, "token_endpoint")
+        client_id          = JSON.GetString(config, "client_id")
+        redirect_uri       = JSON.GetString(config, "redirect_uri")
+        scopes             = JSON.GetArray(config, "scopes")
+
+        IfCondition Or(EqualTo(authorize_endpoint, 0), EqualTo(token_endpoint, 0)) ThenBlock: {
+            PrintMessage("[auth] config missing authorize_endpoint or token_endpoint\n")
+            ReturnValue(0)
+        }
+        IfCondition Or(EqualTo(client_id, 0), EqualTo(redirect_uri, 0)) ThenBlock: {
+            PrintMessage("[auth] config missing client_id or redirect_uri\n")
+            ReturnValue(0)
+        }
+
+        // PKCE
+        pkce = OAuth.GeneratePKCE()
+        IfCondition EqualTo(pkce, 0) ThenBlock: {
+            PrintMessage("[auth] PKCE generation failed (sha256sum/xxd missing?)\n")
+            ReturnValue(0)
+        }
+        verifier = JSON.GetString(pkce, "verifier")
+        challenge = JSON.GetString(pkce, "challenge")
+
+        // State (random, anti-CSRF)
+        state_pkce = OAuth.GeneratePKCE()
+        state = "x"
+        IfCondition NotEqual(state_pkce, 0) ThenBlock: {
+            sv = JSON.GetString(state_pkce, "verifier")
+            IfCondition NotEqual(sv, 0) ThenBlock: { state = sv }
+        }
+
+        // Build authorize URL with the trailing &code=true if requested
+        url = OAuth.BuildAuthorizeURL(authorize_endpoint, client_id, redirect_uri, scopes, state, challenge)
+        IfCondition EqualTo(JSON.GetBool(config, "manual_paste_flow"), 1) ThenBlock: {
+            url = StringConcat(url, "&code=true")
+        }
+
+        PrintMessage("\n[auth] Opening browser to:\n  ")
+        PrintMessage(url)
+        PrintMessage("\n[auth] If the browser doesn't open, paste that URL into one manually.\n")
+        PrintMessage("[auth] For Google/Loopback flows, your browser will redirect to a broken localhost page.\n")
+        PrintMessage("[auth] Simply copy the full localhost URL from your address bar and paste it below.\n\n")
+
+        browser_cmd = JSON.GetString(config, "browser_command")
+        OAuth.LaunchBrowser(url, browser_cmd)
+
+        PrintMessage("After authorizing, paste the code (or the full redirected localhost URL) here and press Enter.\n")
+        PrintMessage("> ")
+
+        IfCondition EqualTo(AuthHttpState.paste_buf, 0) ThenBlock: {
+            AuthHttpState.paste_buf = Allocate(AuthConst.PASTE_BUF)
+        }
+        buf = AuthHttpState.paste_buf
+        MemorySet(buf, 0, AuthConst.PASTE_BUF)
+
+        n = Auth_ReadLine(buf, AuthConst.PASTE_BUF)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            PrintMessage("[auth] no code entered\n")
+            ReturnValue(0)
+        }
+
+        // The displayed code may be a localhost URL or of the form "<code>#<state>".
+        code_only = Auth_ExtractCodeFromUrl(buf)
+        i = 0
+        WhileLoop LessThan(i, StringLength(code_only)) {
+            IfCondition EqualTo(GetByte(code_only, i), 35) ThenBlock: {   // '#' = 35
+                SetByte(code_only, i, 0)
+                BreakLoop
+            }
+            i = Add(i, 1)
+        }
+
+        // Exchange
+        client_secret = JSON.GetString(config, "client_secret")
+        IfCondition NotEqual(client_secret, 0) ThenBlock: {
+            extra = "grant_type=authorization_code&code="
+            extra = StringConcat(extra, Auth_URLEncode(code_only))
+            extra = StringConcat(extra, "&redirect_uri=")
+            extra = StringConcat(extra, Auth_URLEncode(redirect_uri))
+            extra = StringConcat(extra, "&code_verifier=")
+            extra = StringConcat(extra, Auth_URLEncode(verifier))
+            tokens = Auth_PostTokenWithSecret(token_endpoint, client_id, client_secret, extra)
+        } ElseBlock: {
+            tokens = OAuth.ExchangeCode(token_endpoint, client_id, code_only, redirect_uri, verifier)
+        }
+        IfCondition EqualTo(tokens, 0) ThenBlock: {
+            PrintMessage("[auth] token exchange failed (invalid or expired code?)\n")
+            ReturnValue(0)
+        }
+        PrintMessage("[auth] authenticated successfully\n")
+        ReturnValue(tokens)
+    }
+}
+
+// =============================================================================
+// PUBLIC: RUN FLOW for option 1 (OAuth subscription)
+// Order:
+//   1. Load config — if missing, return needs_setup_oauth
+//   2. Try cached tokens (fresh) — return ok if valid
+//   3. Try refresh — return ok if refresh worked
+//   4. Run interactive paste flow
+// =============================================================================
+Function.Auth.RunOAuthFlow {
+    Input: config_path: Address
+    Input: tokens_path: Address
+    Output: Address
+    Body: {
+        config = Auth.LoadConfig(config_path)
+        IfCondition EqualTo(config, 0) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_oauth", 0, 0, "no config file at the given path"))
+        }
+        client_id = JSON.GetString(config, "client_id")
+        token_endpoint = JSON.GetString(config, "token_endpoint")
+        authorize_endpoint = JSON.GetString(config, "authorize_endpoint")
+        IfCondition Or(EqualTo(client_id, 0), EqualTo(token_endpoint, 0)) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_oauth", 0, 0, "config missing required fields (client_id, token_endpoint)"))
+        }
+        IfCondition EqualTo(StringCompare(client_id, "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com"), 0) ThenBlock: {
+            ReturnValue(Auth_Result("needs_client_id", 0, 0, "Placeholder client ID detected"))
+        }
+
+        IfCondition NotEqual(authorize_endpoint, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(authorize_endpoint, "https://accounts.google.com/o/oauth2/v2/auth"), 0) ThenBlock: {
+                client_secret = JSON.GetString(config, "client_secret")
+                IfCondition EqualTo(client_secret, 0) ThenBlock: {
+                    ReturnValue(Auth_Result("needs_client_id", 0, 0, "Google config missing client_secret (old config detected)"))
+                }
+                IfCondition LessEqual(StringLength(client_secret), 0) ThenBlock: {
+                    ReturnValue(Auth_Result("needs_client_id", 0, 0, "Google config has empty client_secret"))
+                }
+            }
+        }
+
+        // Try existing tokens
+        tokens = OAuth.LoadTokens(tokens_path)
+        IfCondition NotEqual(tokens, 0) ThenBlock: {
+            IfCondition EqualTo(OAuth.IsExpired(tokens, AuthConst.TOKEN_LEEWAY), 0) ThenBlock: {
+                access = OAuth.GetAccessToken(tokens)
+                IfCondition NotEqual(access, 0) ThenBlock: {
+                    ReturnValue(Auth_Result("ok", "oauth", access, "using cached subscription token"))
+                }
+            }
+            // Expired — refresh
+            refresh_tok = OAuth.GetRefreshToken(tokens)
+            IfCondition NotEqual(refresh_tok, 0) ThenBlock: {
+                client_sec = JSON.GetString(config, "client_secret")
+                IfCondition NotEqual(client_sec, 0) ThenBlock: {
+                    extra = "grant_type=refresh_token&refresh_token="
+                    extra = StringConcat(extra, Auth_URLEncode(refresh_tok))
+                    new_tokens = Auth_PostTokenWithSecret(token_endpoint, client_id, client_sec, extra)
+                } ElseBlock: {
+                    new_tokens = OAuth.RefreshTokens(token_endpoint, client_id, refresh_tok)
+                }
+                IfCondition NotEqual(new_tokens, 0) ThenBlock: {
+                    Auth_SaveTokensNative(tokens_path, new_tokens)
+                    access = OAuth.GetAccessToken(new_tokens)
+                    ReturnValue(Auth_Result("ok", "oauth", access, "refreshed subscription token"))
+                }
+            }
+            // Refresh failed; fall through to interactive
+        }
+
+        // Interactive paste flow
+        new_tokens = Auth_RunPasteFlow(config)
+        IfCondition EqualTo(new_tokens, 0) ThenBlock: {
+            ReturnValue(Auth_Result("error", 0, 0, "OAuth paste flow failed; see messages above"))
+        }
+        Auth_SaveTokensNative(tokens_path, new_tokens)
+        access = OAuth.GetAccessToken(new_tokens)
+        ReturnValue(Auth_Result("ok", "oauth", access, "authenticated via browser + paste"))
+    }
+}
+
+// =============================================================================
+// PUBLIC: RUN FLOW for option 2 (API key from env)
+// =============================================================================
+
+// Read $HOME from /proc/self/environ. Returns 0 if HOME is not set.
+Function.Auth_GetHome {
+    Output: Address
+    Body: {
+        fd = SystemCall(AuthSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(8192)
+        n = SystemCall(AuthSys.SYS_READ, fd, buf, 8192, 0, 0)
+        SystemCall(3, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 8192)
+            ReturnValue(0)
+        }
+        // Scan for HOME=
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 72) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, 1)), 79) ThenBlock: {
+                    IfCondition EqualTo(GetByte(buf, Add(i, 2)), 77) ThenBlock: {
+                        IfCondition EqualTo(GetByte(buf, Add(i, 3)), 69) ThenBlock: {
+                            IfCondition EqualTo(GetByte(buf, Add(i, 4)), 61) ThenBlock: {
+                                val_start = Add(i, 5)
+                                val_end = val_start
+                                WhileLoop LessThan(val_end, n) {
+                                    IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                                    val_end = Add(val_end, 1)
+                                }
+                                val_len = Subtract(val_end, val_start)
+                                out = Allocate(Add(val_len, 1))
+                                k = 0
+                                WhileLoop LessThan(k, val_len) {
+                                    SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                                    k = Add(k, 1)
+                                }
+                                SetByte(out, val_len, 0)
+                                Deallocate(buf, 8192)
+                                ReturnValue(out)
+                            }
+                        }
+                    }
+                }
+            }
+            // Skip to next env entry (past null terminator)
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 8192)
+        ReturnValue(0)
+    }
+}
+
+// Read ~/.halcode/<hint>_key (e.g. "deepseek" -> "deepseek_key").
+// Falls back to ~/.halcode/api_key for backward compat when hint is "anthropic".
+// Returns 0 if not found, otherwise heap-allocated null-terminated key string.
+Function.Auth_ReadKeyFile {
+    Input: hint: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(hint, 0) ThenBlock: { ReturnValue(0) }
+        // Build path: $HOME/.halcode/<hint>_key
+        home = Auth_GetHome()
+        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
+        haldir = StringConcat(home, "/.halcode/")
+        stem   = StringConcat(haldir, hint)
+        path   = StringConcat(stem, "_key")
+        fd = SystemCall(AuthSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            // Try /root/.halcode/<hint>_key
+            stem2  = StringConcat("/root/.halcode/", hint)
+            path2  = StringConcat(stem2, "_key")
+            fd = SystemCall(AuthSys.SYS_OPEN, path2, 0, 0, 0, 0)
+            IfCondition LessThan(fd, 0) ThenBlock: {
+                // Legacy fallback to api_key only for the anthropic hint —
+                // other providers must NOT pick up the Anthropic key by mistake.
+                IfCondition EqualTo(StringCompare(hint, "anthropic"), 0) ThenBlock: {
+                    legacy = StringConcat(haldir, "api_key")
+                    fd = SystemCall(AuthSys.SYS_OPEN, legacy, 0, 0, 0, 0)
+                    IfCondition LessThan(fd, 0) ThenBlock: {
+                        fd = SystemCall(AuthSys.SYS_OPEN, "/root/.halcode/api_key", 0, 0, 0, 0)
+                        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+                    }
+                } ElseBlock: {
+                    ReturnValue(0)
+                }
+            }
+        }
+        buf = Allocate(256)
+        nr  = SystemCall(AuthSys.SYS_READ, fd, buf, 255, 0, 0)
+        SystemCall(3, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(nr, 0) ThenBlock: {
+            Deallocate(buf, 256)
+            ReturnValue(0)
+        } ElseBlock: {
+            SetByte(buf, nr, 0)
+            // Strip trailing whitespace / newlines
+            i = Subtract(nr, 1)
+            WhileLoop GreaterEqual(i, 0) {
+                ch = GetByte(buf, i)
+                is_ws = 0
+                IfCondition EqualTo(ch, 10) ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(ch, 13) ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(ch, 32) ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(ch,  9) ThenBlock: { is_ws = 1 }
+                IfCondition EqualTo(is_ws, 1) ThenBlock: {
+                    SetByte(buf, i, 0)
+                    i = Subtract(i, 1)
+                } ElseBlock: {
+                    i = -1
+                }
+            }
+            IfCondition EqualTo(StringLength(buf), 0) ThenBlock: {
+                Deallocate(buf, 256)
+                ReturnValue(0)
+            } ElseBlock: {
+                ReturnValue(buf)
+            }
+        }
+    }
+}
+
+// key_hint: stem for ~/.halcode/<hint>_key  (from provider's "key_hint" field)
+// Key file ALWAYS wins over the env var — the env var is last-resort fallback.
+// This prevents ANTHROPIC_API_KEY leaking into non-Anthropic providers.
+Function.Auth.RunAPIKeyFlow {
+    Input: api_key: Address
+    Input: key_hint: Address
+    Output: Address
+    Body: {
+        key = 0
+        src = 0
+
+        // 1. Try provider-specific key file first
+        hint = key_hint
+        IfCondition EqualTo(hint, 0) ThenBlock: { hint = "anthropic" }
+        key = Auth_ReadKeyFile(hint)
+        IfCondition NotEqual(key, 0) ThenBlock: {
+            src = StringConcat("~/.halcode/", StringConcat(hint, "_key"))
+        }
+
+        // 2. Fall back to env var only if no key file found
+        IfCondition EqualTo(key, 0) ThenBlock: {
+            key = api_key
+            src = "env var"
+        }
+
+        IfCondition EqualTo(key, 0) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_apikey", 0, 0, "no API key found"))
+        }
+        IfCondition LessEqual(StringLength(key), 0) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_apikey", 0, 0, "API key is empty"))
+        }
+        ReturnValue(Auth_Result("ok", "apikey", key, src))
+    }
+}

@@ -1,0 +1,652 @@
+// cc_edit_ipc.ailang — targeted in-place file edit (old_string -> new_string).
+//
+// Mirrors the Claude Code Edit tool exactly:
+//   replace_all=0 (default): old_string must appear exactly once, else error.
+//   replace_all=1:           replace every occurrence.
+//
+// Schema: path (required), old_string (required), new_string (required),
+//         replace_all (optional int, default 0)
+//
+// Build:
+//   ./ailang.x Applications/HalCode9000/cc_tools/cc_edit_ipc.ailang \
+//              Applications/HalCode9000/cc_edit_ipc.x
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCEditSys {
+    "SYS_READ":   Initialize=0
+    "SYS_WRITE":  Initialize=1
+    "SYS_OPEN":   Initialize=2
+    "SYS_CLOSE":  Initialize=3
+    "SYS_FSTAT":  Initialize=5
+    "SYS_MKDIR":  Initialize=83
+    "SYS_UNLINK": Initialize=87
+}
+
+FixedPool.CCEditConst {
+    "SOCK_PATH":  Initialize=0, CanChange=True
+    "MAX_FILE":   Initialize=4194304
+    "BACKLOG":    Initialize=8
+}
+
+FixedPool.CCEditState {
+    "schema":     Initialize=0,  CanChange=True
+    "listen_fd":  Initialize=-1, CanChange=True
+    "running":    Initialize=1,  CanChange=True
+    "replace_len": Initialize=0, CanChange=True
+}
+
+FixedPool.CCEditUndo {
+    "JOURNAL_DIR": Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// UNDO JOURNAL (record before-image before modifying a file)
+// =============================================================================
+
+// Read $HOME from /proc/self/environ. Returns 0 if not set.
+Function.CCEdit_UndoGetHome {
+    Output: Address
+    Body: {
+        fd = SystemCall(CCEditSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(8192)
+        n = SystemCall(CCEditSys.SYS_READ, fd, buf, 8192, 0, 0)
+        SystemCall(CCEditSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 8192)
+            ReturnValue(0)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 72) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, 1)), 79) ThenBlock: {
+                    IfCondition EqualTo(GetByte(buf, Add(i, 2)), 77) ThenBlock: {
+                        IfCondition EqualTo(GetByte(buf, Add(i, 3)), 69) ThenBlock: {
+                            IfCondition EqualTo(GetByte(buf, Add(i, 4)), 61) ThenBlock: {
+                                val_start = Add(i, 5)
+                                val_end = val_start
+                                WhileLoop LessThan(val_end, n) {
+                                    IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                                    val_end = Add(val_end, 1)
+                                }
+                                val_len = Subtract(val_end, val_start)
+                                out = Allocate(Add(val_len, 1))
+                                k = 0
+                                WhileLoop LessThan(k, val_len) {
+                                    SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                                    k = Add(k, 1)
+                                }
+                                SetByte(out, val_len, 0)
+                                Deallocate(buf, 8192)
+                                ReturnValue(out)
+                            }
+                        }
+                    }
+                }
+            }
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 8192)
+        ReturnValue(0)
+    }
+}
+
+Function.CCEdit_UndoEnsureDir {
+    Body: {
+        IfCondition NotEqual(CCEditUndo.JOURNAL_DIR, 0) ThenBlock: { ReturnValue(0) }
+        home = CCEdit_UndoGetHome()
+        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
+        CCEditUndo.JOURNAL_DIR = StringConcat(home, "/.halcode/undo")
+        SystemCall(CCEditSys.SYS_MKDIR, CCEditUndo.JOURNAL_DIR, 493, 0, 0, 0)
+    }
+}
+
+Function.CCEdit_UndoHeadPath {
+    Output: Address
+    Body: {
+        CCEdit_UndoEnsureDir()
+        ReturnValue(StringConcat(CCEditUndo.JOURNAL_DIR, "/HEAD"))
+    }
+}
+
+Function.CCEdit_UndoEntryPath {
+    Input: seq: Integer
+    Input: suffix: Address
+    Output: Address
+    Body: {
+        CCEdit_UndoEnsureDir()
+        num = NumberToString(seq)
+        p = StringConcat(CCEditUndo.JOURNAL_DIR, "/")
+        p = StringConcat(p, num)
+        p = StringConcat(p, suffix)
+        ReturnValue(p)
+    }
+}
+
+Function.CCEdit_UndoReadHead {
+    Output: Integer
+    Body: {
+        path = CCEdit_UndoHeadPath()
+        fd = SystemCall(CCEditSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(32)
+        n = SystemCall(CCEditSys.SYS_READ, fd, buf, 31, 0, 0)
+        SystemCall(CCEditSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 32)
+            ReturnValue(0)
+        }
+        SetByte(buf, n, 0)
+        val = StringToInt(buf)
+        Deallocate(buf, 32)
+        ReturnValue(val)
+    }
+}
+
+Function.CCEdit_UndoWriteHead {
+    Input: val: Integer
+    Body: {
+        path = CCEdit_UndoHeadPath()
+        str = NumberToString(val)
+        fd = SystemCall(CCEditSys.SYS_OPEN, path, 577, 420, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        written = 0
+        slen = StringLength(str)
+        WhileLoop LessThan(written, slen) {
+            n = SystemCall(CCEditSys.SYS_WRITE, fd, Add(str, written), Subtract(slen, written), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            written = Add(written, n)
+        }
+        SystemCall(CCEditSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+    }
+}
+
+Function.CCEdit_UndoWriteFile {
+    Input: path: Address
+    Input: data: Address
+    Input: len: Integer
+    Body: {
+        fd = SystemCall(CCEditSys.SYS_OPEN, path, 577, 420, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        written = 0
+        WhileLoop LessThan(written, len) {
+            n = SystemCall(CCEditSys.SYS_WRITE, fd, Add(data, written), Subtract(len, written), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            written = Add(written, n)
+        }
+        SystemCall(CCEditSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+    }
+}
+
+Function.CCEdit_UnlinkPath {
+    Input: path: Address
+    Body: {
+        SystemCall(CCEditSys.SYS_UNLINK, path, 0, 0, 0, 0)
+    }
+}
+
+// Drop the redo journal. Any new edit invalidates pending redo entries.
+Function.CCEdit_ClearRedo {
+    Body: {
+        CCEdit_UndoEnsureDir()
+        redodir = StringConcat(CCEditUndo.JOURNAL_DIR, "/redo")
+        SystemCall(CCEditSys.SYS_MKDIR, redodir, 493, 0, 0, 0)
+
+        hpath = StringConcat(redodir, "/HEAD")
+        rhead = 0
+        fd = SystemCall(CCEditSys.SYS_OPEN, hpath, 0, 0, 0, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            buf = Allocate(32)
+            n = SystemCall(CCEditSys.SYS_READ, fd, buf, 31, 0, 0)
+            SystemCall(CCEditSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            IfCondition GreaterThan(n, 0) ThenBlock: {
+                SetByte(buf, n, 0)
+                rhead = StringToInt(buf)
+            }
+            Deallocate(buf, 32)
+        }
+
+        i = 1
+        WhileLoop LessEqual(i, rhead) {
+            num = NumberToString(i)
+            base = StringConcat(redodir, "/")
+            base = StringConcat(base, num)
+            CCEdit_UnlinkPath(StringConcat(base, ".path"))
+            CCEdit_UnlinkPath(StringConcat(base, ".bak"))
+            CCEdit_UnlinkPath(StringConcat(base, ".new"))
+            i = Add(i, 1)
+        }
+
+        fd2 = SystemCall(CCEditSys.SYS_OPEN, hpath, 577, 420, 0, 0)
+        IfCondition GreaterEqual(fd2, 0) ThenBlock: {
+            SystemCall(CCEditSys.SYS_WRITE, fd2, "0", 1, 0, 0)
+            SystemCall(CCEditSys.SYS_CLOSE, fd2, 0, 0, 0, 0)
+        }
+    }
+}
+
+Function.CCEdit_RecordUndo {
+    Input: path: Address
+    Input: before_buf: Address
+    Input: before_len: Integer
+    Body: {
+        CCEdit_UndoEnsureDir()
+        head = CCEdit_UndoReadHead()
+        seq = Add(head, 1)
+        ppath = CCEdit_UndoEntryPath(seq, ".path")
+        CCEdit_UndoWriteFile(ppath, path, StringLength(path))
+        bpath = CCEdit_UndoEntryPath(seq, ".bak")
+        CCEdit_UndoWriteFile(bpath, before_buf, before_len)
+        CCEdit_UndoWriteHead(seq)
+        CCEdit_ClearRedo()
+    }
+}
+
+// =============================================================================
+// SCHEMA
+// =============================================================================
+Function.CCEdit_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Edit", "Perform exact string replacement in a file")
+        UtilArgs_AddField(s, "path",        "path",   1, "Absolute path to the file to edit", "path")
+        UtilArgs_AddField(s, "old_string",  "string", 1, "Exact string to find and replace", "old_string")
+        UtilArgs_AddField(s, "new_string",  "string", 1, "Replacement string (empty string to delete)", "new_string")
+        UtilArgs_AddField(s, "replace_all", "int",    0, "0=must be unique occurrence, 1=replace all", "replace_all")
+        UtilArgs_SetDefault(s, "replace_all", "0")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// STRING SEARCH / REPLACE HELPERS
+// =============================================================================
+
+// Find first occurrence of needle in hay[start..hay_len). Returns offset or -1.
+Function.CCEdit_Find {
+    Input: hay:        Address
+    Input: hay_len:    Integer
+    Input: needle:     Address
+    Input: needle_len: Integer
+    Input: start:      Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(needle_len, 0) ThenBlock: { ReturnValue(-1) }
+        limit = Subtract(hay_len, needle_len)
+        i = start
+        WhileLoop LessEqual(i, limit) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, needle_len) {
+                IfCondition NotEqual(GetByte(hay, Add(i, j)), GetByte(needle, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: { ReturnValue(i) }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// Count all occurrences of needle in hay.
+Function.CCEdit_Count {
+    Input: hay:        Address
+    Input: hay_len:    Integer
+    Input: needle:     Address
+    Input: needle_len: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(needle_len, 0) ThenBlock: { ReturnValue(0) }
+        count = 0
+        pos = 0
+        WhileLoop LessThan(pos, hay_len) {
+            found = CCEdit_Find(hay, hay_len, needle, needle_len, pos)
+            IfCondition LessThan(found, 0) ThenBlock: { BreakLoop }
+            count = Add(count, 1)
+            pos = Add(found, needle_len)
+        }
+        ReturnValue(count)
+    }
+}
+
+// Replace all occurrences of needle with repl. Returns a new heap buffer
+// (NUL-terminated). Stores output byte count in CCEditState.replace_len.
+// Returns hay unchanged (not a copy) when count=0 — caller must check.
+Function.CCEdit_Replace {
+    Input: hay:        Address
+    Input: hay_len:    Integer
+    Input: needle:     Address
+    Input: needle_len: Integer
+    Input: repl:       Address
+    Input: repl_len:   Integer
+    Output: Address
+    Body: {
+        count = CCEdit_Count(hay, hay_len, needle, needle_len)
+        IfCondition EqualTo(count, 0) ThenBlock: {
+            CCEditState.replace_len = hay_len
+            ReturnValue(hay)
+        }
+
+        new_len = Add(Subtract(hay_len, Multiply(count, needle_len)), Multiply(count, repl_len))
+        CCEditState.replace_len = new_len
+        out = Allocate(Add(new_len, 1))
+
+        src_pos = 0
+        dst_pos = 0
+        WhileLoop LessThan(src_pos, hay_len) {
+            found = CCEdit_Find(hay, hay_len, needle, needle_len, src_pos)
+            IfCondition LessThan(found, 0) ThenBlock: {
+                remaining = Subtract(hay_len, src_pos)
+                IfCondition GreaterThan(remaining, 0) ThenBlock: {
+                    MemoryCopy(Add(out, dst_pos), Add(hay, src_pos), remaining)
+                    dst_pos = Add(dst_pos, remaining)
+                }
+                src_pos = hay_len
+            } ElseBlock: {
+                before = Subtract(found, src_pos)
+                IfCondition GreaterThan(before, 0) ThenBlock: {
+                    MemoryCopy(Add(out, dst_pos), Add(hay, src_pos), before)
+                    dst_pos = Add(dst_pos, before)
+                }
+                IfCondition GreaterThan(repl_len, 0) ThenBlock: {
+                    MemoryCopy(Add(out, dst_pos), repl, repl_len)
+                    dst_pos = Add(dst_pos, repl_len)
+                }
+                src_pos = Add(found, needle_len)
+            }
+        }
+        SetByte(out, dst_pos, 0)
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// CORE EDIT OPERATION
+// =============================================================================
+Function.CCEdit_DoEdit {
+    Input: args:    Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        path        = UtilArgs_GetString(args, "path")
+        old_str     = UtilArgs_GetString(args, "old_string")
+        new_str     = UtilArgs_GetString(args, "new_string")
+        replace_all = UtilArgs_GetInt(args,    "replace_all")
+
+        IfCondition EqualTo(path, 0) ThenBlock: {
+            msg = "missing path"
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(old_str, 0) ThenBlock: {
+            msg = "missing old_string"
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+        old_len = StringLength(old_str)
+        IfCondition EqualTo(old_len, 0) ThenBlock: {
+            msg = "old_string must not be empty"
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+        new_len = 0
+        IfCondition NotEqual(new_str, 0) ThenBlock: { new_len = StringLength(new_str) }
+        IfCondition EqualTo(new_str, 0) ThenBlock: { new_str = "" }
+
+        // --- Read file ---
+        fd = SystemCall(CCEditSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            msg = StringConcat("cannot open: ", path)
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+
+        stat_buf = Allocate(144)
+        SystemCall(CCEditSys.SYS_FSTAT, fd, stat_buf, 0, 0, 0)
+        file_size = Dereference(Add(stat_buf, 48))
+        Deallocate(stat_buf, 144)
+
+        IfCondition LessEqual(file_size, 0) ThenBlock: { file_size = 0 }
+        IfCondition GreaterThan(file_size, CCEditConst.MAX_FILE) ThenBlock: {
+            SystemCall(CCEditSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            msg = "file too large for Edit (max 4MB)"
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+
+        alloc_sz = Add(file_size, 2)
+        file_buf = Allocate(alloc_sz)
+        total = 0
+        IfCondition GreaterThan(file_size, 0) ThenBlock: {
+            WhileLoop LessThan(total, file_size) {
+                n = SystemCall(CCEditSys.SYS_READ, fd, Add(file_buf, total), Subtract(file_size, total), 0, 0)
+                IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+                total = Add(total, n)
+            }
+        }
+        SetByte(file_buf, total, 0)
+        SystemCall(CCEditSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        // --- Count and validate ---
+        count = CCEdit_Count(file_buf, total, old_str, old_len)
+
+        IfCondition EqualTo(count, 0) ThenBlock: {
+            Deallocate(file_buf, alloc_sz)
+            msg = "old_string not found in file"
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+        IfCondition And(EqualTo(replace_all, 0), NotEqual(count, 1)) ThenBlock: {
+            Deallocate(file_buf, alloc_sz)
+            cstr = NumberToString(count)
+            msg = StringConcat(cstr, " occurrences found; set replace_all=1 to replace all, or make old_string more specific")
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+
+        // --- Replace ---
+        new_buf = CCEdit_Replace(file_buf, total, old_str, old_len, new_str, new_len)
+        new_file_len = CCEditState.replace_len
+
+        IfCondition EqualTo(new_buf, file_buf) ThenBlock: {
+            Deallocate(file_buf, alloc_sz)
+            msg = "replace produced no change (internal error)"
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+
+        // Record before-image so /undo can restore the original content.
+        CCEdit_RecordUndo(path, file_buf, total)
+
+        // --- Write back: O_WRONLY|O_CREAT|O_TRUNC=577, 0644=420 ---
+        wfd = SystemCall(CCEditSys.SYS_OPEN, path, 577, 420, 0, 0)
+        IfCondition LessThan(wfd, 0) ThenBlock: {
+            Deallocate(file_buf, alloc_sz)
+            Deallocate(new_buf, Add(new_file_len, 1))
+            msg = StringConcat("cannot write: ", path)
+            MemoryCopy(err_buf, msg, Add(StringLength(msg), 1))
+            ReturnValue(0)
+        }
+        written = 0
+        WhileLoop LessThan(written, new_file_len) {
+            n = SystemCall(CCEditSys.SYS_WRITE, wfd, Add(new_buf, written), Subtract(new_file_len, written), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            written = Add(written, n)
+        }
+        SystemCall(CCEditSys.SYS_CLOSE, wfd, 0, 0, 0, 0)
+        Deallocate(file_buf, alloc_sz)
+        Deallocate(new_buf, Add(new_file_len, 1))
+
+        // --- Build success message ---
+        cstr = NumberToString(count)
+        result = StringConcat("Edited ", path)
+        result = StringConcat(result, " (replaced ")
+        result = StringConcat(result, cstr)
+        result = StringConcat(result, " occurrence")
+        IfCondition GreaterThan(count, 1) ThenBlock: {
+            result = StringConcat(result, "s")
+        }
+        result = StringConcat(result, ", ")
+        result = StringConcat(result, NumberToString(new_file_len))
+        result = StringConcat(result, " bytes written)")
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// IPC DISPATCH
+// =============================================================================
+Function.CCEdit_SendError {
+    Input: client_fd: Integer
+    Input: id:        Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        out = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, out)
+    }
+}
+
+Function.CCEdit_SendResult {
+    Input: client_fd: Integer
+    Input: id:        Address
+    Input: content:   Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        out = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, out)
+    }
+}
+
+Function.CCEdit_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCEditState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: {
+            JSON.SetObject(resp, "schema", schema_obj)
+        }
+        out = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, out)
+    }
+}
+
+Function.CCEdit_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str:   Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCEdit_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCEdit_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCEdit_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCEdit_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id        = JSON.GetString(obj, "id")
+            args      = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCEditState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCEdit_SendError(client_fd, id, "missing required arguments (path, old_string, new_string)")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            err_buf = Allocate(512)
+            SetByte(err_buf, 0, 0)
+            result = CCEdit_DoEdit(validated, err_buf)
+            IfCondition EqualTo(result, 0) ThenBlock: {
+                CCEdit_SendError(client_fd, id, err_buf)
+            } ElseBlock: {
+                CCEdit_SendResult(client_fd, id, result)
+            }
+            Deallocate(err_buf, 512)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCEdit_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    CCEditConst.SOCK_PATH = "@halcode/Edit"
+    CCEditState.schema = CCEdit_BuildSchema()
+
+    SystemCall(CCEditSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCEditSys.SYS_UNLINK, CCEditConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_edit_ipc] socket create failed\n")
+        Exit(1)
+    }
+    br = Socket.BindUnix(fd, CCEditConst.SOCK_PATH)
+    IfCondition LessThan(br, 0) ThenBlock: {
+        PrintMessage("[cc_edit_ipc] bind failed\n")
+        Socket.Close(fd)  Exit(1)
+    }
+    Socket.Listen(fd, CCEditConst.BACKLOG)
+    CCEditState.listen_fd = fd
+    PrintMessage("[cc_edit_ipc] listening on @halcode/Edit\n")
+
+    WhileLoop EqualTo(CCEditState.running, 1) {
+        client_fd = Socket.Accept(CCEditState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCEdit_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+
+    Socket.Close(CCEditState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

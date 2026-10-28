@@ -1,0 +1,611 @@
+// cc_packager_ipc.ailang — AILang Packager IPC tool for HalCode9000.
+//
+// Socket: @halcode/Packager
+// Schema: op (required), dir (required), output (optional)
+// Ops: scan, graph, init, info, build, pack
+//
+// Wraps the standalone Packager modules (Scan, Parse, Graph, Manifest,
+// Install, Build, Pack) in the cc_tools IPC envelope so HalCode9000
+// can call them directly.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.Hash
+LibraryImport.Array
+LibraryImport.UtilArgs
+
+// Packager modules
+Import.Packager.Packager.IO
+Import.Packager.Packager.Scan
+Import.Packager.Packager.Parse
+Import.Packager.Packager.Graph
+Import.Packager.Packager.Manifest
+Import.Packager.Packager.Install
+Import.Packager.Packager.Build
+Import.Packager.Packager.Pack
+
+// Compatibility pools required by Packager modules
+FixedPool.PkgState {
+    "mode":            Initialize=0, CanChange=True
+    "project_dir":     Initialize=0, CanChange=True
+    "verbose":         Initialize=0, CanChange=True
+}
+
+FixedPool.PkgVersion {
+    "MAJOR":   Initialize=0
+    "MINOR":   Initialize=1
+    "PATCH":   Initialize=0
+}
+
+// IPC constants
+FixedPool.CCPkgConst {
+    "SOCK_PATH":   Initialize="@halcode/Packager", CanChange=True
+    "BACKLOG":     Initialize=8
+    "OUT_CAP":     Initialize=32768
+}
+
+FixedPool.CCPkgState {
+    "schema":    Initialize=0,  CanChange=True
+    "listen_fd": Initialize=-1, CanChange=True
+    "running":   Initialize=1,  CanChange=True
+    "out_buf":   Initialize=0,  CanChange=True
+    "out_pos":   Initialize=0,  CanChange=True
+}
+
+// =============================================================================
+// OUTPUT HELPERS — write to CCPkgState.out_buf at out_pos
+// =============================================================================
+
+Function.CCPkg_AppendStr {
+    Input: s: Address
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        len = StringLength(s)
+        avail = Subtract(CCPkgConst.OUT_CAP, CCPkgState.out_pos)
+        copy = len
+        IfCondition GreaterThan(copy, avail) ThenBlock: { copy = avail }
+        IfCondition GreaterThan(copy, 0) ThenBlock: {
+            MemoryCopy(Add(CCPkgState.out_buf, CCPkgState.out_pos), s, copy)
+            CCPkgState.out_pos = Add(CCPkgState.out_pos, copy)
+        }
+    }
+}
+
+Function.CCPkg_AppendInt {
+    Input: num: Integer
+    Body: {
+        IfCondition EqualTo(num, 0) ThenBlock: { CCPkg_AppendStr("0")  ReturnValue(0) }
+        tmp = Allocate(24)
+        ndig = 0
+        n = num
+        WhileLoop GreaterThan(n, 0) {
+            SetByte(tmp, ndig, Add(48, Modulo(n, 10)))
+            ndig = Add(ndig, 1)
+            n = Divide(n, 10)
+        }
+        i = Subtract(ndig, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            avail = Subtract(CCPkgConst.OUT_CAP, CCPkgState.out_pos)
+            IfCondition GreaterThan(avail, 0) ThenBlock: {
+                SetByte(CCPkgState.out_buf, CCPkgState.out_pos, GetByte(tmp, i))
+                CCPkgState.out_pos = Add(CCPkgState.out_pos, 1)
+            }
+            i = Subtract(i, 1)
+        }
+        Deallocate(tmp, 24)
+    }
+}
+
+Function.CCPkg_AppendNL {
+    Body: {
+        avail = Subtract(CCPkgConst.OUT_CAP, CCPkgState.out_pos)
+        IfCondition GreaterThan(avail, 0) ThenBlock: {
+            SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 10)
+            CCPkgState.out_pos = Add(CCPkgState.out_pos, 1)
+        }
+    }
+}
+
+// =============================================================================
+// OP HANDLERS — each resets out_buf and fills it with result text
+// =============================================================================
+
+// Scan a project directory. Returns file listing.
+Function.CCPkg_OpScan {
+    Input: dir: Address
+    Body: {
+        CCPkgState.out_pos = 0
+
+        Scan_Init()
+        ScanState.base_dir = dir
+        Scan_Directory(dir, 0)
+
+        count = Scan_GetCount()
+        i = 0
+        WhileLoop LessThan(i, count) {
+            entry = Scan_GetEntry(i)
+            name = Hash.Get(entry, "name")
+            ftype = Hash.Get(entry, "type")
+            fsize = Hash.Get(entry, "size")
+            is_entry = Hash.Get(entry, "is_entry")
+
+            // Type label
+            IfCondition EqualTo(ftype, FileType.SOURCE) ThenBlock: { CCPkg_AppendStr("  SOURCE  ") }
+            IfCondition EqualTo(ftype, FileType.BINARY) ThenBlock: { CCPkg_AppendStr("  BINARY  ") }
+            IfCondition EqualTo(ftype, FileType.SCRIPT) ThenBlock: { CCPkg_AppendStr("  SCRIPT  ") }
+            IfCondition EqualTo(ftype, FileType.CONFIG) ThenBlock: { CCPkg_AppendStr("  CONFIG  ") }
+            IfCondition EqualTo(ftype, FileType.DOCS) ThenBlock:   { CCPkg_AppendStr("  DOCS    ") }
+            IfCondition EqualTo(ftype, FileType.UNKNOWN) ThenBlock: { CCPkg_AppendStr("  OTHER   ") }
+
+            CCPkg_AppendStr(name)
+            IfCondition EqualTo(is_entry, 1) ThenBlock: {
+                CCPkg_AppendStr(" [entry]")
+            }
+            CCPkg_AppendStr(" (")
+            CCPkg_AppendInt(fsize)
+            CCPkg_AppendStr(" bytes)")
+            CCPkg_AppendNL()
+
+            i = Add(i, 1)
+        }
+
+        CCPkg_AppendNL()
+        CCPkg_AppendStr("Found: ")
+        CCPkg_AppendInt(ScanState.file_count)
+        CCPkg_AppendStr(" files (")
+        CCPkg_AppendInt(ScanState.src_count)
+        CCPkg_AppendStr(" source, ")
+        CCPkg_AppendInt(ScanState.bin_count)
+        CCPkg_AppendStr(" binary, ")
+        CCPkg_AppendInt(ScanState.script_count)
+        CCPkg_AppendStr(" script, ")
+        CCPkg_AppendInt(ScanState.config_count)
+        CCPkg_AppendStr(" config, ")
+        CCPkg_AppendInt(ScanState.docs_count)
+        CCPkg_AppendStr(" docs)")
+        CCPkg_AppendNL()
+        CCPkg_AppendInt(ScanState.entry_count)
+        CCPkg_AppendStr(" entry points, ")
+        CCPkg_AppendInt(ScanState.dir_count)
+        CCPkg_AppendStr(" directories scanned")
+        CCPkg_AppendNL()
+        CCPkg_AppendStr("Total size: ")
+        CCPkg_AppendInt(ScanState.total_size)
+        CCPkg_AppendStr(" bytes")
+        CCPkg_AppendNL()
+
+        SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+    }
+}
+
+// Build dependency graph. Returns deps + topo order + cycle status.
+Function.CCPkg_OpGraph {
+    Input: dir: Address
+    Body: {
+        CCPkgState.out_pos = 0
+
+        Scan_Init()
+        ScanState.base_dir = dir
+        Scan_Directory(dir, 0)
+        Parse_AllFiles()
+        Graph_Build()
+
+        has_cycle = Graph_DetectCycles()
+        Graph_TopoSort()
+
+        // Print dependency tree
+        CCPkg_AppendStr("Dependency Graph:")
+        CCPkg_AppendNL()
+        CCPkg_AppendNL()
+
+        count = Scan_GetCount()
+        i = 0
+        WhileLoop LessThan(i, count) {
+            entry = Scan_GetEntry(i)
+            ftype = Hash.Get(entry, "type")
+            IfCondition EqualTo(ftype, FileType.SOURCE) ThenBlock: {
+                path = Hash.Get(entry, "path")
+                imports = Hash.Get(entry, "imports")
+                CCPkg_AppendStr("  ")
+                CCPkg_AppendStr(path)
+                CCPkg_AppendNL()
+                IfCondition NotEqual(imports, 0) ThenBlock: {
+                    imp_count = Array.Size(imports)
+                    j = 0
+                    WhileLoop LessThan(j, imp_count) {
+                        dep = Array.Get(imports, j)
+                        CCPkg_AppendStr("    -> ")
+                        CCPkg_AppendStr(dep)
+                        CCPkg_AppendNL()
+                        j = Add(j, 1)
+                    }
+                }
+                CCPkg_AppendNL()
+            }
+            i = Add(i, 1)
+        }
+
+        // Topo order
+        CCPkg_AppendStr("Topological order (build sequence):")
+        CCPkg_AppendNL()
+        IfCondition GreaterThan(GraphState.topo_count, 0) ThenBlock: {
+            i = 0
+            WhileLoop LessThan(i, GraphState.topo_count) {
+                node = Array.Get(GraphState.topo_order, i)
+                CCPkg_AppendStr("  ")
+                CCPkg_AppendInt(Add(i, 1))
+                CCPkg_AppendStr(". ")
+                CCPkg_AppendStr(node)
+                CCPkg_AppendNL()
+                i = Add(i, 1)
+            }
+        }
+
+        CCPkg_AppendNL()
+        IfCondition EqualTo(has_cycle, 1) ThenBlock: {
+            CCPkg_AppendStr("WARNING: Dependency cycle detected!")
+            CCPkg_AppendNL()
+            IfCondition NotEqual(GraphState.cycle_path, 0) ThenBlock: {
+                CCPkg_AppendStr("  Cycle: ")
+                CCPkg_AppendStr(GraphState.cycle_path)
+                CCPkg_AppendNL()
+            }
+        } ElseBlock: {
+            CCPkg_AppendStr("Cycles: none")
+            CCPkg_AppendNL()
+        }
+
+        SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+    }
+}
+
+// Initialize package.json + install.sh in directory.
+Function.CCPkg_OpInit {
+    Input: dir: Address
+    Body: {
+        CCPkgState.out_pos = 0
+
+        Scan_Init()
+        ScanState.base_dir = dir
+        Scan_Directory(dir, 0)
+
+        Manifest_Create(dir)
+        Manifest_Save(dir)
+        CCPkg_AppendStr("Created package.json")
+        CCPkg_AppendNL()
+
+        Install_Generate()
+        Install_Write(dir)
+        CCPkg_AppendStr("Created install.sh")
+        CCPkg_AppendNL()
+
+        SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+    }
+}
+
+// Show project info: manifest + scan summary.
+Function.CCPkg_OpInfo {
+    Input: dir: Address
+    Body: {
+        CCPkgState.out_pos = 0
+
+        manifest_ok = Manifest_Load(dir)
+        IfCondition EqualTo(manifest_ok, 1) ThenBlock: {
+            obj = ManifestState.json
+            name = JSON.GetString(obj, "name")
+            ver = JSON.GetString(obj, "version")
+            desc = JSON.GetString(obj, "description")
+            lic = JSON.GetString(obj, "license")
+            entry_str = JSON.GetString(obj, "entry")
+
+            CCPkg_AppendStr("Package: ")
+            IfCondition NotEqual(name, 0) ThenBlock: { CCPkg_AppendStr(name) }
+            CCPkg_AppendStr(" v")
+            IfCondition NotEqual(ver, 0) ThenBlock: { CCPkg_AppendStr(ver) }
+            CCPkg_AppendNL()
+            IfCondition NotEqual(desc, 0) ThenBlock: {
+                CCPkg_AppendStr("  Description: ")
+                CCPkg_AppendStr(desc)
+                CCPkg_AppendNL()
+            }
+            IfCondition NotEqual(lic, 0) ThenBlock: {
+                CCPkg_AppendStr("  License: ")
+                CCPkg_AppendStr(lic)
+                CCPkg_AppendNL()
+            }
+            IfCondition NotEqual(entry_str, 0) ThenBlock: {
+                CCPkg_AppendStr("  Entry: ")
+                CCPkg_AppendStr(entry_str)
+                CCPkg_AppendNL()
+            }
+            CCPkg_AppendNL()
+        } ElseBlock: {
+            CCPkg_AppendStr("No package.json found. Use op=init to create one.")
+            CCPkg_AppendNL()
+            CCPkg_AppendNL()
+        }
+
+        // Scan summary
+        Scan_Init()
+        ScanState.base_dir = dir
+        Scan_Directory(dir, 0)
+
+        CCPkg_AppendStr("Found: ")
+        CCPkg_AppendInt(ScanState.file_count)
+        CCPkg_AppendStr(" files (")
+        CCPkg_AppendInt(ScanState.src_count)
+        CCPkg_AppendStr(" .ailang, ")
+        CCPkg_AppendInt(ScanState.bin_count)
+        CCPkg_AppendStr(" .x)")
+        CCPkg_AppendNL()
+        CCPkg_AppendInt(ScanState.entry_count)
+        CCPkg_AppendStr(" entry points")
+        CCPkg_AppendNL()
+        CCPkg_AppendStr("Total size: ")
+        CCPkg_AppendInt(ScanState.total_size)
+        CCPkg_AppendStr(" bytes")
+        CCPkg_AppendNL()
+
+        SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+    }
+}
+
+// Build all entry points.
+Function.CCPkg_OpBuild {
+    Input: dir: Address
+    Body: {
+        CCPkgState.out_pos = 0
+
+        Scan_Init()
+        ScanState.base_dir = dir
+        Scan_Directory(dir, 0)
+        Parse_AllFiles()
+        Graph_Build()
+        Graph_TopoSort()
+        Build_Run(dir)
+
+        CCPkg_AppendStr("Build complete: ")
+        CCPkg_AppendInt(BuildState.success_count)
+        CCPkg_AppendStr(" ok, ")
+        CCPkg_AppendInt(BuildState.fail_count)
+        CCPkg_AppendStr(" failed, ")
+        CCPkg_AppendInt(BuildState.total_targets)
+        CCPkg_AppendStr(" total")
+        CCPkg_AppendNL()
+
+        SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+    }
+}
+
+// Pack project into archive.
+Function.CCPkg_OpPack {
+    Input: dir: Address
+    Input: output: Address
+    Body: {
+        CCPkgState.out_pos = 0
+
+        IfCondition EqualTo(output, 0) ThenBlock: {
+            CCPkg_AppendStr("ERROR: output path required for pack")
+            CCPkg_AppendNL()
+            SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(StringLength(output), 0) ThenBlock: {
+            CCPkg_AppendStr("ERROR: output path required for pack")
+            CCPkg_AppendNL()
+            SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+            ReturnValue(0)
+        }
+
+        Scan_Init()
+        ScanState.base_dir = dir
+        Scan_Directory(dir, 0)
+
+        manifest_ok = Manifest_Load(dir)
+        IfCondition EqualTo(manifest_ok, 0) ThenBlock: {
+            CCPkg_AppendStr("No package.json found. Run op=init first.")
+            CCPkg_AppendNL()
+            SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+            ReturnValue(0)
+        }
+
+        Pack_Create(dir, output)
+        CCPkg_AppendStr("Archive created: ")
+        CCPkg_AppendStr(output)
+        CCPkg_AppendNL()
+
+        SetByte(CCPkgState.out_buf, CCPkgState.out_pos, 0)
+    }
+}
+
+// =============================================================================
+// IPC LAYER — standard cc_tools envelope
+// =============================================================================
+
+Function.CCPkg_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Packager", "Scan, analyze, build, and package AILang projects")
+        UtilArgs_AddField(s, "op", "string", 1, "Operation: scan|graph|init|info|build|pack", "op")
+        UtilArgs_AddField(s, "dir", "path", 1, "Project directory to operate on", "dir")
+        UtilArgs_AddField(s, "output", "path", 0, "Output path for pack command", "output")
+        ReturnValue(s)
+    }
+}
+
+Function.CCPkg_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCPkg_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCPkg_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCPkgState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCPkg_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCPkg_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCPkg_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCPkg_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+
+        // Schema request
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCPkg_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+
+        // Call request
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id   = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCPkgState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCPkg_SendError(client_fd, id, "missing required argument(s): op, dir")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            op  = UtilArgs_GetString(validated, "op")
+            dir = UtilArgs_GetString(validated, "dir")
+            output = UtilArgs_GetString(validated, "output")
+
+            IfCondition EqualTo(op, 0) ThenBlock: {
+                CCPkg_SendError(client_fd, id, "op is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(dir, 0) ThenBlock: {
+                CCPkg_SendError(client_fd, id, "dir is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            // Dispatch on op
+            IfCondition EqualTo(StringCompare(op, "scan"), 0) ThenBlock: {
+                CCPkg_OpScan(dir)
+                CCPkg_SendResult(client_fd, id, CCPkgState.out_buf)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(StringCompare(op, "graph"), 0) ThenBlock: {
+                CCPkg_OpGraph(dir)
+                CCPkg_SendResult(client_fd, id, CCPkgState.out_buf)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(StringCompare(op, "init"), 0) ThenBlock: {
+                CCPkg_OpInit(dir)
+                CCPkg_SendResult(client_fd, id, CCPkgState.out_buf)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(StringCompare(op, "info"), 0) ThenBlock: {
+                CCPkg_OpInfo(dir)
+                CCPkg_SendResult(client_fd, id, CCPkgState.out_buf)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(StringCompare(op, "build"), 0) ThenBlock: {
+                CCPkg_OpBuild(dir)
+                CCPkg_SendResult(client_fd, id, CCPkgState.out_buf)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(StringCompare(op, "pack"), 0) ThenBlock: {
+                CCPkg_OpPack(dir, output)
+                CCPkg_SendResult(client_fd, id, CCPkgState.out_buf)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            CCPkg_SendError(client_fd, id, "unknown op (use: scan, graph, init, info, build, pack)")
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+
+        CCPkg_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+// =============================================================================
+// ENTRY POINT
+// =============================================================================
+
+SubRoutine.Main {
+    CCPkgConst.SOCK_PATH = "@halcode/Packager"
+    CCPkgState.schema  = CCPkg_BuildSchema()
+    CCPkgState.out_buf = Allocate(Add(CCPkgConst.OUT_CAP, 1))
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_packager_ipc] socket create failed")
+        Exit(1)
+    }
+    Socket.BindUnix(fd, CCPkgConst.SOCK_PATH)
+    Socket.Listen(fd, CCPkgConst.BACKLOG)
+    CCPkgState.listen_fd = fd
+    PrintMessage("[cc_packager_ipc] listening on @halcode/Packager")
+
+    WhileLoop EqualTo(CCPkgState.running, 1) {
+        client_fd = Socket.Accept(CCPkgState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCPkg_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCPkgState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

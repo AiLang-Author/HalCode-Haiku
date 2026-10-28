@@ -1,0 +1,227 @@
+// cc_sleep_ipc.ailang — blocking sleep IPC tool for HalCode9000.
+//
+// Socket: @halcode/Sleep
+// Input:  seconds (integer, 1-300)
+// Action: nanosleep for the requested duration, then return.
+//         Does NOT touch Pgmem — safe to call while agent daemons are running.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCSleepSys {
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_POLL":      Initialize=7
+}
+
+FixedPool.CCSleepConst {
+    "SOCK_PATH": Initialize="@halcode/Sleep", CanChange=True
+    "BACKLOG":   Initialize=8
+    "MAX_SECS":  Initialize=300
+}
+
+FixedPool.CCSleepState {
+    "schema":    Initialize=0,  CanChange=True
+    "listen_fd": Initialize=-1, CanChange=True
+    "running":   Initialize=1,  CanChange=True
+}
+
+// =============================================================================
+// CORE
+// =============================================================================
+
+Function.CCSleep_Sleep {
+    Input: seconds: Integer
+    Body: {
+        ts = Allocate(16)
+        StoreValue(Add(ts, 0), seconds)
+        StoreValue(Add(ts, 8), 0)
+        SystemCall(CCSleepSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+    }
+}
+
+// =============================================================================
+// IPC LAYER
+// =============================================================================
+
+Function.CCSleep_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Sleep", "Block for N seconds without touching Pgmem. Use this after spawning Agent tasks instead of Bash sleep or polling Pgmem in a loop.")
+        UtilArgs_AddField(s, "seconds", "integer", 1, "How many seconds to sleep (1-300)", "90")
+        ReturnValue(s)
+    }
+}
+
+Function.CCSleep_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCSleep_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCSleep_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCSleepState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCSleep_HandleRequest {
+    Input: client_fd: Integer
+    Input: raw: Address
+    Body: {
+        parsed = ParseJSON(raw)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCSleep_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCSleep_SendError(client_fd, 0, "not an object")
+            ReturnValue(0)
+        }
+
+        method = JSON.GetString(obj, "method")
+        id     = JSON.GetString(obj, "id")
+
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCSleep_SendSchema(client_fd)
+            ReturnValue(0)
+        }
+
+        args = JSON.GetObject(obj, "args")
+        IfCondition EqualTo(args, 0) ThenBlock: {
+            CCSleep_SendError(client_fd, id, "missing params")
+            ReturnValue(0)
+        }
+
+        validated = UtilArgs_ParseIPC(CCSleepState.schema, args)
+        IfCondition EqualTo(validated, 0) ThenBlock: {
+            CCSleep_SendError(client_fd, id, "missing required param: seconds")
+            ReturnValue(0)
+        }
+
+        secs_str = UtilArgs_GetString(validated, "seconds", "90")
+        secs = StringToNumber(secs_str)
+
+        IfCondition LessThan(secs, 1)                         ThenBlock: { secs = 1 }
+        IfCondition GreaterThan(secs, CCSleepConst.MAX_SECS)  ThenBlock: { secs = CCSleepConst.MAX_SECS }
+
+        CCSleep_Sleep(secs)
+
+        result = StringConcat("Slept ", NumberToString(secs))
+        result = StringConcat(result, " seconds.")
+        CCSleep_SendResult(client_fd, id, result)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+
+SubRoutine.Main {
+    CCSleepState.schema = CCSleep_BuildSchema()
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_sleep_ipc] socket create failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    ok = Socket.BindUnix(fd, CCSleepConst.SOCK_PATH)
+    IfCondition LessThan(ok, 0) ThenBlock: {
+        PrintMessage("[cc_sleep_ipc] bind failed — another instance running?\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    Socket.Listen(fd, CCSleepConst.BACKLOG)
+    CCSleepState.listen_fd = fd
+    PrintMessage("[cc_sleep_ipc] listening on @halcode/Sleep\n")
+
+    // One persistent client (the host). Closing after the schema exchange
+    // left the host holding a dead fd, so the next Sleep call read EOF and
+    // reported "tool crashed or connection lost". Extra accepts are one-shot.
+    WhileLoop EqualTo(CCSleepState.running, 1) {
+        client_fd = Socket.Accept(CCSleepState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            pfd = Allocate(16)
+            WhileLoop EqualTo(done, 0) {
+                StoreValue(pfd, client_fd, "dword")
+                SetByte(pfd, 4, 1)
+                SetByte(pfd, 5, 0)
+                SetByte(pfd, 6, 0)
+                SetByte(pfd, 7, 0)
+                StoreValue(Add(pfd, 8), CCSleepState.listen_fd, "dword")
+                SetByte(pfd, 12, 1)
+                SetByte(pfd, 13, 0)
+                SetByte(pfd, 14, 0)
+                SetByte(pfd, 15, 0)
+                SystemCall(CCSleepSys.SYS_POLL, pfd, 2, -1, 0, 0)
+                rev_listen = GetByte(pfd, 14)
+                rev_client = GetByte(pfd, 6)
+                IfCondition NotEqual(rev_listen, 0) ThenBlock: {
+                    new_fd = Socket.Accept(CCSleepState.listen_fd)
+                    IfCondition GreaterEqual(new_fd, 0) ThenBlock: {
+                        Socket.SetRecvTimeout(new_fd, 10000)
+                        mcp_req = Socket.RecvMsg(new_fd)
+                        IfCondition NotEqual(mcp_req, 0) ThenBlock: {
+                            IfCondition NotEqual(mcp_req, -1) ThenBlock: {
+                                CCSleep_HandleRequest(new_fd, mcp_req)
+                            }
+                        }
+                        Socket.Close(new_fd)
+                    }
+                }
+                IfCondition NotEqual(rev_client, 0) ThenBlock: {
+                    req = Socket.RecvMsg(client_fd)
+                    IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                    IfCondition NotEqual(req, 0) ThenBlock: {
+                        IfCondition NotEqual(req, -1) ThenBlock: {
+                            CCSleep_HandleRequest(client_fd, req)
+                        }
+                    }
+                }
+            }
+            Deallocate(pfd, 16)
+            Socket.Close(client_fd)
+        }
+    }
+
+    Socket.Close(CCSleepState.listen_fd)
+}
+
+RunTask(Main)

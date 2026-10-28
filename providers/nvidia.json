@@ -1,0 +1,169 @@
+{
+  "name": "Nvidia",
+  "backend": "openai",
+  "base_url": "https://integrate.api.nvidia.com/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "NVIDIA_API_KEY",
+  "key_hint": "nvidia",
+  "tier": 2,
+  "models": [
+    {
+      "id": "deepseek-ai/deepseek-v4.1-flash",
+      "display": "DeepSeek V4.1 Flash"
+    },
+    {
+      "id": "z-ai/glm-5.3-flash",
+      "display": "GLM-5.3-Flash"
+    },
+    {
+      "id": "z-ai/glm-5.3",
+      "display": "GLM-5.3"
+    },
+    {
+      "id": "nvidia/nemotron-3.5-lightning-30b-a3b",
+      "display": "Nemotron 3.5 Lightning 30B A3B"
+    },
+    {
+      "id": "meta/muse-glimmer-30b",
+      "display": "Muse Glimmer 30B"
+    },
+    {
+      "id": "moonshotai/kimi-k3",
+      "display": "Kimi K3"
+    },
+    {
+      "id": "poolside/laguna-xs-2.1",
+      "display": "Laguna XS 2.1"
+    },
+    {
+      "id": "google/diffusiongemma-26b-a4b-it",
+      "display": "DiffusionGemma 26B A4B IT"
+    },
+    {
+      "id": "nvidia/nemotron-3-ultra-550b-a55b",
+      "display": "Nemotron 3 Ultra 550B A55B"
+    },
+    {
+      "id": "nvidia/nemotron-3.5-content-safety",
+      "display": "Nemotron 3.5 Content Safety"
+    },
+    {
+      "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+      "display": "Nemotron 3 Nano Omni"
+    },
+    {
+      "id": "nvidia/synthetic-video-detector",
+      "display": "synthetic-video-detector"
+    },
+    {
+      "id": "nvidia/active-speaker-detection",
+      "display": "Active Speaker Detection"
+    },
+    {
+      "id": "google/gemma-4-31b-it",
+      "display": "Gemma-4-31B-IT"
+    },
+    {
+      "id": "nvidia/llama-nemotron-rerank-vl-1b-v2",
+      "display": "llama-nemotron-rerank-vl-1b-v2"
+    },
+    {
+      "id": "nvidia/nemotron-voicechat",
+      "display": "nemotron-voicechat"
+    },
+    {
+      "id": "nvidia/nemotron-3-super-120b-a12b",
+      "display": "Nemotron 3 Super"
+    },
+    {
+      "id": "nvidia/usdcode",
+      "display": "usdcode"
+    },
+    {
+      "id": "nvidia/riva-translate-4b-instruct-v1.1",
+      "display": "riva-translate-4b-instruct-v1_1"
+    },
+    {
+      "id": "nvidia/cosmos-reason2-8b",
+      "display": "Cosmos Reason2 8B"
+    },
+    {
+      "id": "nvidia/streampetr",
+      "display": "streampetr"
+    },
+    {
+      "id": "mistralai/magistral-small-2506",
+      "display": "Magistral Small 2506"
+    },
+    {
+      "id": "mistralai/mistral-medium-3-instruct",
+      "display": "Mistral Medium 3"
+    },
+    {
+      "id": "openai/gpt-oss-20b",
+      "display": "GPT OSS 20B"
+    },
+    {
+      "id": "nvidia/llama-3.1-nemotron-70b-instruct",
+      "display": "Llama 3.1 Nemotron 70B Instruct"
+    },
+    {
+      "id": "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+      "display": "Llama 3.1 Nemotron Ultra 253B"
+    },
+    {
+      "id": "mistralai/mistral-7b-instruct-v0.3",
+      "display": "Mistral-7B-Instruct-v0.3"
+    },
+    {
+      "id": "nvidia/sparsedrive",
+      "display": "sparsedrive"
+    },
+    {
+      "id": "nvidia/bevformer",
+      "display": "bevformer"
+    },
+    {
+      "id": "google/gemma-3-12b-it",
+      "display": "Gemma 3 12B IT"
+    },
+    {
+      "id": "google/gemma-3-4b-it",
+      "display": "Gemma 3 4B IT"
+    },
+    {
+      "id": "nvidia/studiovoice",
+      "display": "studiovoice"
+    },
+    {
+      "id": "meta/esm2-650m",
+      "display": "esm2-650m"
+    },
+    {
+      "id": "nvidia/usdvalidate",
+      "display": "usdvalidate"
+    },
+    {
+      "id": "google/google-paligemma",
+      "display": "paligemma"
+    },
+    {
+      "id": "nvidia/rerank-qa-mistral-4b",
+      "display": "rerank-qa-mistral-4b"
+    },
+    {
+      "id": "meta/esmfold",
+      "display": "esmfold"
+    },
+    {
+      "id": "baai/bge-m3",
+      "display": "BGE M3"
+    }
+  ],
+  "default_model": "z-ai/glm-5.3",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no NVIDIA_API_KEY set \u2014 models.dev catalog"
+}

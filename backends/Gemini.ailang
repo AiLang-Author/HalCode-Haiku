@@ -1,0 +1,657 @@
+// backends/Gemini.ailang
+// Gemini-compatible backend for HalCode9000.
+// Specifically tuned for Google's /v1beta/openai/chat/completions endpoint
+// which has connection drop quirks and camelCase finishReason bugs.
+//
+// Public API:
+//   Gemini.Init
+//   Gemini.BuildHeaders
+//   Gemini.BuildRequest
+//   Gemini.OnEvent
+//   Gemini.GetPendingTools
+//   Gemini.CommitAssistantToHistory
+//   Gemini.AppendToolResultsToHistory
+//   Gemini.Reset
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+
+Import.Applications.HalCode9000.History
+Import.Applications.HalCode9000.UI
+
+FixedPool.GEMINISignal {
+    "CONTINUE":             Initialize=0
+    "TURN_DONE_NO_TOOLS":   Initialize=1
+    "TURN_DONE_WITH_TOOLS": Initialize=2
+}
+
+FixedPool.GEMINIConst {
+    "TEXT_BUF_SZ":          Initialize=262144
+    "ARGS_BUF_SZ":          Initialize=262144
+    "MAX_TOOLS":            Initialize=16
+    "API_HOST":             Initialize="generativelanguage.googleapis.com", CanChange=True
+    "API_PATH":             Initialize="/v1beta/openai/chat/completions", CanChange=True
+}
+
+FixedPool.GEMINICfg {
+    "api_key":              Initialize=0, CanChange=True
+    "auth_mode":            Initialize=0, CanChange=True
+    "model":                Initialize=0, CanChange=True
+    "system_prompt":        Initialize=0, CanChange=True
+    "max_tokens":           Initialize=8192, CanChange=True
+}
+
+FixedPool.GEMINIState {
+    "text_buf":             Initialize=0, CanChange=True
+    "text_used":            Initialize=0, CanChange=True
+    "tool_slots":           Initialize=0, CanChange=True
+    "tool_count":           Initialize=0, CanChange=True
+    "has_tools_flag":       Initialize=0, CanChange=True
+    "has_stop_flag":        Initialize=0, CanChange=True
+    "last_input_tokens":    Initialize=0, CanChange=True
+    "last_output_tokens":   Initialize=0, CanChange=True
+    "rc_chunk_count":       Initialize=0, CanChange=True
+}
+
+Function.Gemini.Init {
+    Input: auth_mode: Address
+    Input: credential: Address
+    Input: model: Address
+    Input: system_prompt: Address
+    Body: {
+        GEMINICfg.auth_mode = auth_mode
+        GEMINICfg.api_key = credential
+        GEMINICfg.model = model
+        GEMINICfg.system_prompt = system_prompt
+
+        GEMINIState.text_buf     = Allocate(GEMINIConst.TEXT_BUF_SZ)
+        GEMINIState.tool_slots   = Allocate(Multiply(GEMINIConst.MAX_TOOLS, 40))
+
+        i = 0
+        WhileLoop LessThan(i, GEMINIConst.MAX_TOOLS) {
+            slot = Add(GEMINIState.tool_slots, Multiply(i, 40))
+            id_ptr   = Allocate(128)
+            name_ptr = Allocate(128)
+            args_ptr = Allocate(GEMINIConst.ARGS_BUF_SZ)
+            sig_ptr  = Allocate(4096)
+
+            StoreValue(Add(slot, 0),  id_ptr)
+            StoreValue(Add(slot, 8),  name_ptr)
+            StoreValue(Add(slot, 16), args_ptr)
+            StoreValue(Add(slot, 24), 0)
+            StoreValue(Add(slot, 32), sig_ptr)
+            SetByte(sig_ptr, 0, 0)
+
+            i = Add(i, 1)
+        }
+        Gemini.Reset()
+    }
+}
+
+Function.Gemini.SetURL {
+    Input: base_url: Address
+    Input: api_path: Address
+    Body: {
+        GEMINIConst.API_HOST = base_url
+        GEMINIConst.API_PATH = api_path
+    }
+}
+
+Function.Gemini.SetModel {
+    Input: model_name: Address
+    Body: {
+        GEMINICfg.model = model_name
+    }
+}
+
+Function.Gemini.SetMaxTokens {
+    Input: n: Integer
+    Body: {
+        IfCondition GreaterThan(n, 0) ThenBlock: { GEMINICfg.max_tokens = n }
+    }
+}
+
+Function.Gemini.PrintUsage {
+    Body: {
+        IfCondition GreaterThan(GEMINIState.last_input_tokens, 0) ThenBlock: {
+            UI.SetTokens(GEMINIState.last_input_tokens, GEMINIState.last_output_tokens)
+        }
+    }
+}
+
+Function.Gemini.GetToolName {
+    Input: i: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(i, GEMINIConst.MAX_TOOLS) ThenBlock: { ReturnValue(0) }
+        slot = Add(GEMINIState.tool_slots, Multiply(i, 40))
+        ReturnValue(Dereference(Add(slot, 8)))
+    }
+}
+
+Function.Gemini.GetToolId {
+    Input: i: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(i, GEMINIConst.MAX_TOOLS) ThenBlock: { ReturnValue(0) }
+        slot = Add(GEMINIState.tool_slots, Multiply(i, 40))
+        ReturnValue(Dereference(Add(slot, 0)))
+    }
+}
+
+Function.Gemini.BuildHeaders {
+    Output: Address
+    Body: {
+        h1 = StringConcat("Authorization: Bearer ", GEMINICfg.api_key)
+        h2 = StringConcat(h1, "\n")
+        h3 = StringConcat(h2, "Content-Type: application/json\n")
+
+        IfCondition NotEqual(GEMINICfg.auth_mode, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(GEMINICfg.auth_mode, "oauth"), 0) ThenBlock: {
+                ghome = Auth_GetHome()
+                IfCondition EqualTo(ghome, 0) ThenBlock: { ghome = "/root" }
+                oauth_cfg = StringConcat(ghome, "/.claudecode/oauth_config.json")
+                fd = SystemCall(2, oauth_cfg, 0, 0, 0, 0)
+                IfCondition GreaterEqual(fd, 0) ThenBlock: {
+                    buf = Allocate(8192)
+                    nr = SystemCall(0, fd, buf, 8191, 0, 0)
+                    SystemCall(3, fd, 0, 0, 0, 0)
+                    IfCondition GreaterThan(nr, 0) ThenBlock: {
+                        SetByte(buf, nr, 0)
+                        parsed = ParseJSON(buf)
+                        IfCondition NotEqual(parsed, 0) ThenBlock: {
+                            obj = JSON.AsObject(parsed)
+                            gcp = JSON.GetString(obj, "gcp_project_id")
+                            IfCondition NotEqual(gcp, 0) ThenBlock: {
+                                h4 = StringConcat("x-goog-user-project: ", gcp)
+                                h4 = StringConcat(h4, "\n")
+                                h3 = StringConcat(h3, h4)
+                            }
+                            JSON.Free(parsed)
+                        }
+                    }
+                    Deallocate(buf, 8192)
+                }
+            }
+        }
+        ReturnValue(h3)
+    }
+}
+
+
+Function.Gemini.BuildRequest {
+    Input: messages_arr: Address
+    Input: tools_arr: Address
+    Output: Address
+    Body: {
+        // [FIX] Reset tool state if the stream dropped previously
+        IfCondition EqualTo(GEMINIState.has_tools_flag, 0) ThenBlock: {
+            GEMINIState.tool_count = 0
+        }
+
+        req = JSON.NewObject()
+        JSON.SetString(req, "model", GEMINICfg.model)
+        JSON.SetNumber(req, "max_tokens", GEMINICfg.max_tokens)
+        JSON.SetBool(req, "stream", 1)
+
+        opts = JSON.NewObject()
+        JSON.SetBool(opts, "include_usage", 1)
+        JSON.SetObject(req, "stream_options", opts)
+
+        new_msgs = JSON.NewArray()
+        sys_msg = JSON.NewObject()
+        JSON.SetString(sys_msg, "role", "system")
+        JSON.SetString(sys_msg, "content", GEMINICfg.system_prompt)
+        JSON.PushObject(new_msgs, sys_msg)
+
+        msg_len = JSON.ArrayLength(messages_arr)
+        i = 0
+        WhileLoop LessThan(i, msg_len) {
+            m = JSON.ArrayGet(messages_arr, i)
+            m_obj = JSON.AsObject(m)
+            IfCondition NotEqual(m_obj, 0) ThenBlock: {
+                JSON.PushObject(new_msgs, m_obj)
+            }
+            i = Add(i, 1)
+        }
+
+        // [FIX] Stream Resumption: Inject partial text from a dropped connection
+        IfCondition GreaterThan(GEMINIState.text_used, 0) ThenBlock: {
+            partial_msg = JSON.NewObject()
+            JSON.SetString(partial_msg, "role", "assistant")
+            JSON.SetString(partial_msg, "content", GEMINIState.text_buf)
+            JSON.PushObject(new_msgs, partial_msg)
+        }
+
+        JSON.SetArray(req, "messages", new_msgs)
+
+        tool_len = JSON.ArrayLength(tools_arr)
+        IfCondition GreaterThan(tool_len, 0) ThenBlock: {
+            new_tools = JSON.NewArray()
+            j = 0
+            WhileLoop LessThan(j, tool_len) {
+                anth_tool_tag = JSON.ArrayGet(tools_arr, j)
+                anth_tool = JSON.AsObject(anth_tool_tag)
+
+                IfCondition NotEqual(anth_tool, 0) ThenBlock: {
+                    oai_tool = JSON.NewObject()
+                    JSON.SetString(oai_tool, "type", "function")
+
+                    fn_obj = JSON.NewObject()
+
+                    tool_name = JSON.GetString(anth_tool, "name")
+                    IfCondition EqualTo(tool_name, 0) ThenBlock: { tool_name = "unknown_tool" }
+                    JSON.SetString(fn_obj, "name", tool_name)
+
+                    tool_desc = JSON.GetString(anth_tool, "description")
+                    IfCondition EqualTo(tool_desc, 0) ThenBlock: { tool_desc = "" }
+                    JSON.SetString(fn_obj, "description", tool_desc)
+
+                    params = JSON.GetObject(anth_tool, "input_schema")
+                    IfCondition NotEqual(params, 0) ThenBlock: {
+                        JSON.SetObject(fn_obj, "parameters", params)
+                    }
+
+                    JSON.SetObject(oai_tool, "function", fn_obj)
+                    JSON.PushObject(new_tools, oai_tool)
+                }
+                j = Add(j, 1)
+            }
+            JSON.SetArray(req, "tools", new_tools)
+            JSON.SetString(req, "tool_choice", "auto")
+        }
+
+        ReturnValue(JSON.SerializeObject(req))
+    }
+}
+
+Function.Gemini.OnEvent {
+    Input: event_type: Address
+    Input: event_data: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(StringCompare(event_data, "[DONE]"), 0) ThenBlock: {
+            IfCondition EqualTo(GEMINIState.has_tools_flag, 1) ThenBlock: {
+                ReturnValue(GEMINISignal.TURN_DONE_WITH_TOOLS)
+            } ElseBlock: {
+                ReturnValue(GEMINISignal.TURN_DONE_NO_TOOLS)
+            }
+        }
+
+        parsed = ParseJSON(event_data)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            ReturnValue(GEMINISignal.CONTINUE)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            JSON.Free(parsed)
+            ReturnValue(GEMINISignal.CONTINUE)
+        }
+
+        usage = JSON.GetObject(obj, "usage")
+        IfCondition NotEqual(usage, 0) ThenBlock: {
+            GEMINIState.last_input_tokens = JSON.GetNumber(usage, "prompt_tokens")
+            GEMINIState.last_output_tokens = JSON.GetNumber(usage, "completion_tokens")
+        }
+
+        choices = JSON.GetArray(obj, "choices")
+        IfCondition NotEqual(choices, 0) ThenBlock: {
+            c_len = JSON.ArrayLength(choices)
+            IfCondition GreaterThan(c_len, 0) ThenBlock: {
+                c0_tag = JSON.ArrayGet(choices, 0)
+                c0 = JSON.AsObject(c0_tag)
+
+                fr = JSON.GetString(c0, "finish_reason")
+                IfCondition EqualTo(fr, 0) ThenBlock: {
+                    fr = JSON.GetString(c0, "finishReason") // Gemini camelCase quirk
+                }
+                IfCondition NotEqual(fr, 0) ThenBlock: {
+                    IfCondition Or(EqualTo(StringCompare(fr, "tool_calls"), 0), EqualTo(StringCompare(fr, "TOOL_CALLS"), 0)) ThenBlock: {
+                        GEMINIState.has_tools_flag = 1
+                    }
+                    IfCondition Or(EqualTo(StringCompare(fr, "stop"), 0), EqualTo(StringCompare(fr, "STOP"), 0)) ThenBlock: {
+                        GEMINIState.has_stop_flag = 1
+                    }
+                }
+
+                delta = JSON.GetObject(c0, "delta")
+                IfCondition NotEqual(delta, 0) ThenBlock: {
+                    content = JSON.GetString(delta, "content")
+                    IfCondition NotEqual(content, 0) ThenBlock: {
+                        clen = StringLength(content)
+                        IfCondition GreaterThan(clen, 0) ThenBlock: {
+                            i = 0
+                            used = GEMINIState.text_used
+                            WhileLoop LessThan(i, clen) {
+                                IfCondition LessThan(used, Subtract(GEMINIConst.TEXT_BUF_SZ, 1)) ThenBlock: {
+                                    SetByte(GEMINIState.text_buf, used, GetByte(content, i))
+                                    used = Add(used, 1)
+                                }
+                                i = Add(i, 1)
+                            }
+                            SetByte(GEMINIState.text_buf, used, 0)
+                            GEMINIState.text_used = used
+
+                            UI.ChatPrint(content)
+                        }
+                    }
+
+                    tcs = JSON.GetArray(delta, "tool_calls")
+                    IfCondition NotEqual(tcs, 0) ThenBlock: {
+                        tlen = JSON.ArrayLength(tcs)
+                        j = 0
+                        WhileLoop LessThan(j, tlen) {
+                            tc_tag = JSON.ArrayGet(tcs, j)
+                            tc_obj = JSON.AsObject(tc_tag)
+                            Gemini_ParseToolCallDelta(tc_obj)
+                            j = Add(j, 1)
+                        }
+                    }
+                }
+            }
+        }
+
+        JSON.Free(parsed)
+        ReturnValue(GEMINISignal.CONTINUE)
+    }
+}
+
+
+Function.Gemini_ParseToolCallDelta {
+    Input: tc: Address
+    Body: {
+        idx = JSON.GetNumber(tc, "index")
+
+        // Gemini 3.1-pro parallel tool calls all arrive with index=0
+        // (either a Gemini quirk or Library.JSON XSHash collision on "index").
+        // Route by id instead: each unique id gets its own slot; arg-only
+        // chunks (no id) fall back to idx as a best-effort hint.
+        id_str = JSON.GetString(tc, "id")
+        actual_idx = idx
+
+        IfCondition NotEqual(id_str, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(id_str), 0) ThenBlock: {
+                // Search existing slots for a matching id
+                found = -1
+                si = 0
+                WhileLoop LessThan(si, GEMINIState.tool_count) {
+                    s2 = Add(GEMINIState.tool_slots, Multiply(si, 40))
+                    eid = Dereference(Add(s2, 0))
+                    IfCondition NotEqual(eid, 0) ThenBlock: {
+                        IfCondition EqualTo(StringCompare(eid, id_str), 0) ThenBlock: {
+                            found = si
+                            si = GEMINIConst.MAX_TOOLS
+                        }
+                    }
+                    si = Add(si, 1)
+                }
+                IfCondition GreaterEqual(found, 0) ThenBlock: {
+                    actual_idx = found
+                } ElseBlock: {
+                    actual_idx = GEMINIState.tool_count
+                    GEMINIState.tool_count = Add(GEMINIState.tool_count, 1)
+                }
+            }
+        }
+
+        IfCondition GreaterEqual(actual_idx, GEMINIConst.MAX_TOOLS) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        slot     = Add(GEMINIState.tool_slots, Multiply(actual_idx, 40))
+        id_ptr   = Dereference(Add(slot, 0))
+        name_ptr = Dereference(Add(slot, 8))
+        args_ptr = Dereference(Add(slot, 16))
+        args_used = Dereference(Add(slot, 24))
+
+        IfCondition NotEqual(id_str, 0) ThenBlock: {
+            i = 0
+            len = StringLength(id_str)
+            WhileLoop LessThan(i, len) {
+                SetByte(id_ptr, i, GetByte(id_str, i))
+                i = Add(i, 1)
+            }
+            SetByte(id_ptr, len, 0)
+        }
+
+        fn_obj = JSON.GetObject(tc, "function")
+        IfCondition NotEqual(fn_obj, 0) ThenBlock: {
+            name_str = JSON.GetString(fn_obj, "name")
+            IfCondition NotEqual(name_str, 0) ThenBlock: {
+                j = 0
+                nlen = StringLength(name_str)
+                WhileLoop LessThan(j, nlen) {
+                    SetByte(name_ptr, j, GetByte(name_str, j))
+                    j = Add(j, 1)
+                }
+                SetByte(name_ptr, nlen, 0)
+                msg = StringConcat("Preparing tool: ", name_str)
+                UI.ChatTag("⚙", msg, 8)
+            }
+
+            args_str = JSON.GetString(fn_obj, "arguments")
+            IfCondition NotEqual(args_str, 0) ThenBlock: {
+                k = 0
+                alen = StringLength(args_str)
+                WhileLoop LessThan(k, alen) {
+                    IfCondition LessThan(args_used, Subtract(GEMINIConst.ARGS_BUF_SZ, 1)) ThenBlock: {
+                        SetByte(args_ptr, args_used, GetByte(args_str, k))
+                        args_used = Add(args_used, 1)
+                    }
+                    k = Add(k, 1)
+                }
+                SetByte(args_ptr, args_used, 0)
+                StoreValue(Add(slot, 24), args_used)
+            }
+
+            // Gemini 3.1 thinking models return thought_signature at
+            // tc.extra_content.google.thought_signature (not inside fn_obj).
+            // Must be echoed back verbatim or API returns 400.
+            sig_str = 0
+            extra_obj = JSON.GetObject(tc, "extra_content")
+            IfCondition NotEqual(extra_obj, 0) ThenBlock: {
+                google_obj = JSON.GetObject(extra_obj, "google")
+                IfCondition NotEqual(google_obj, 0) ThenBlock: {
+                    sig_str = JSON.GetString(google_obj, "thought_signature")
+                }
+            }
+            IfCondition NotEqual(sig_str, 0) ThenBlock: {
+                sig_ptr = Dereference(Add(slot, 32))
+                slen = StringLength(sig_str)
+                sk = 0
+                WhileLoop LessThan(sk, slen) {
+                    IfCondition LessThan(sk, 4095) ThenBlock: {
+                        SetByte(sig_ptr, sk, GetByte(sig_str, sk))
+                    }
+                    sk = Add(sk, 1)
+                }
+                IfCondition LessThan(slen, 4096) ThenBlock: {
+                    SetByte(sig_ptr, slen, 0)
+                } ElseBlock: {
+                    SetByte(sig_ptr, 4095, 0)
+                }
+            }
+        }
+    }
+}
+
+Function.Gemini.IsCleanStop {
+    Output: Integer
+    Body: {
+        IfCondition Or(EqualTo(GEMINIState.has_stop_flag, 1), EqualTo(GEMINIState.has_tools_flag, 1)) ThenBlock: {
+            ReturnValue(1)
+        }
+        // Gemini Fallback: Salvage the turn if we received ANY text or tool calls before the drop
+        IfCondition Or(GreaterThan(GEMINIState.text_used, 0), GreaterThan(GEMINIState.tool_count, 0)) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Gemini.GetPendingTools {
+    Output: Address
+    Body: {
+        arr = JSON.NewArray()
+        i = 0
+        WhileLoop LessThan(i, GEMINIState.tool_count) {
+            slot = Add(GEMINIState.tool_slots, Multiply(i, 40))
+            id_ptr = Dereference(Add(slot, 0))
+            name_ptr = Dereference(Add(slot, 8))
+            args_ptr = Dereference(Add(slot, 16))
+
+            tu = JSON.NewObject()
+            JSON.SetString(tu, "id", id_ptr)
+            JSON.SetString(tu, "name", name_ptr)
+            
+            parsed_args = JSON.AsObject(ParseJSON(args_ptr))
+            IfCondition EqualTo(parsed_args, 0) ThenBlock: {
+                parsed_args = JSON.NewObject()
+            }
+            JSON.SetObject(tu, "input", parsed_args)
+
+            JSON.PushObject(arr, tu)
+
+            i = Add(i, 1)
+        }
+        ReturnValue(arr)
+    }
+}
+
+Function.Gemini_StrDup {
+    Input: src: Address
+    Output: Address
+    Body: {
+        slen = StringLength(src)
+        dst = Allocate(Add(slen, 1))
+        k = 0
+        WhileLoop LessThan(k, slen) {
+            SetByte(dst, k, GetByte(src, k))
+            k = Add(k, 1)
+        }
+        SetByte(dst, slen, 0)
+        ReturnValue(dst)
+    }
+}
+
+Function.Gemini_BuildAssistantMsgStr {
+    Output: Address
+    Body: {
+        esc_content = JSON.EscapeString(GEMINIState.text_buf)
+        IfCondition EqualTo(esc_content, 0) ThenBlock: { esc_content = "" }
+        s = "{\"role\":\"assistant\",\"content\":\""
+        s = StringConcat(s, esc_content)
+        s = StringConcat(s, "\"")
+
+        IfCondition GreaterThan(GEMINIState.tool_count, 0) ThenBlock: {
+            s = StringConcat(s, ",\"tool_calls\":[")
+            i = 0
+            WhileLoop LessThan(i, GEMINIState.tool_count) {
+                IfCondition GreaterThan(i, 0) ThenBlock: { s = StringConcat(s, ",") }
+                slot = Add(GEMINIState.tool_slots, Multiply(i, 40))
+                id_ptr   = Dereference(Add(slot, 0))
+                name_ptr = Dereference(Add(slot, 8))
+                args_ptr = Dereference(Add(slot, 16))
+                sig_ptr  = Dereference(Add(slot, 32))
+                esc_id   = JSON.EscapeString(id_ptr)
+                esc_name = JSON.EscapeString(name_ptr)
+                safe_args = args_ptr
+                IfCondition EqualTo(args_ptr, 0) ThenBlock: { safe_args = "{}" }
+                IfCondition EqualTo(StringLength(safe_args), 0) ThenBlock: { safe_args = "{}" }
+                esc_args = JSON.EscapeString(safe_args)
+                s = StringConcat(s, "{\"id\":\"")
+                s = StringConcat(s, esc_id)
+                s = StringConcat(s, "\",\"type\":\"function\"")
+                IfCondition NotEqual(sig_ptr, 0) ThenBlock: {
+                    IfCondition GreaterThan(StringLength(sig_ptr), 0) ThenBlock: {
+                        s = StringConcat(s, ",\"extra_content\":{\"google\":{\"thought_signature\":\"")
+                        s = StringConcat(s, sig_ptr)
+                        s = StringConcat(s, "\"}}")
+                    }
+                }
+                s = StringConcat(s, ",\"function\":{\"name\":\"")
+                s = StringConcat(s, esc_name)
+                s = StringConcat(s, "\",\"arguments\":\"")
+                s = StringConcat(s, esc_args)
+                s = StringConcat(s, "\"}}")
+                i = Add(i, 1)
+            }
+            s = StringConcat(s, "]")
+        }
+
+        s = StringConcat(s, "}")
+        ReturnValue(s)
+    }
+}
+
+Function.Gemini.CommitAssistantToHistory {
+    Body: {
+        raw = Gemini_BuildAssistantMsgStr()
+        parsed = ParseJSON(raw)
+        msg = JSON.AsObject(parsed)
+        IfCondition NotEqual(msg, 0) ThenBlock: {
+            History.AppendRaw(msg)
+        } ElseBlock: {
+            IfCondition NotEqual(parsed, 0) ThenBlock: {
+                JSON.Free(parsed)
+            }
+        }
+        Deallocate(raw, Add(StringLength(raw), 1))
+    }
+}
+
+Function.Gemini.AppendToolResultsToHistory {
+    Input: arr: Address
+    Body: {
+        len = JSON.ArrayLength(arr)
+        i = 0
+        WhileLoop LessThan(i, len) {
+            res_tag = JSON.ArrayGet(arr, i)
+            res_obj = JSON.AsObject(res_tag)
+
+            tid     = JSON.GetString(res_obj, "tool_use_id")
+            content = JSON.GetString(res_obj, "content")
+
+            IfCondition NotEqual(tid, 0) ThenBlock: { tid = Gemini_StrDup(tid) }
+            IfCondition NotEqual(content, 0) ThenBlock: { content = Gemini_StrDup(content) }
+
+            msg = JSON.NewObject()
+            JSON.SetString(msg, "role", "tool")
+            JSON.SetString(msg, "tool_call_id", tid)
+            JSON.SetString(msg, "content", content)
+
+            History.AppendRaw(msg)
+
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.Gemini.Reset {
+    Body: {
+        SetByte(GEMINIState.text_buf, 0, 0)
+        GEMINIState.text_used = 0
+        GEMINIState.rc_chunk_count = 0
+        GEMINIState.tool_count = 0
+        GEMINIState.has_tools_flag = 0
+        GEMINIState.has_stop_flag = 0
+
+        i = 0
+        WhileLoop LessThan(i, GEMINIConst.MAX_TOOLS) {
+            slot = Add(GEMINIState.tool_slots, Multiply(i, 40))
+            id_ptr   = Dereference(Add(slot, 0))
+            name_ptr = Dereference(Add(slot, 8))
+            args_ptr = Dereference(Add(slot, 16))
+            sig_ptr  = Dereference(Add(slot, 32))
+
+            SetByte(id_ptr, 0, 0)
+            SetByte(name_ptr, 0, 0)
+            SetByte(args_ptr, 0, 0)
+            StoreValue(Add(slot, 24), 0)
+            IfCondition NotEqual(sig_ptr, 0) ThenBlock: { SetByte(sig_ptr, 0, 0) }
+
+            i = Add(i, 1)
+        }
+    }
+}

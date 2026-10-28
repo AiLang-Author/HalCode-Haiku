@@ -1,0 +1,7 @@
+VIF fonts used by the AppDesk chat raster.
+
+- IBMPlexMono-Regular.vif — IBM Plex Mono (SIL Open Font License)
+- DejaVuSans.vif — DejaVu (Bitstream Vera / Arev licenses)
+
+The desk looks for `fonts/IBMPlexMono-Regular.vif` relative to HALCODE_ROOT
+(the tree `scripts/launch_halcode.sh` cds into).

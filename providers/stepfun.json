@@ -1,0 +1,37 @@
+{
+  "name": "StepFun",
+  "backend": "openai",
+  "base_url": "https://api.stepfun.com/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "STEPFUN_API_KEY",
+  "key_hint": "stepfun",
+  "tier": 2,
+  "models": [
+    {
+      "id": "step-5-preview",
+      "display": "Step 5 Preview"
+    },
+    {
+      "id": "step-3.7-flash",
+      "display": "Step 3.7 Flash"
+    },
+    {
+      "id": "step-3.5-flash",
+      "display": "Step 3.5 Flash"
+    },
+    {
+      "id": "step-1-32k",
+      "display": "Step 1 (32K)"
+    },
+    {
+      "id": "step-2-16k",
+      "display": "Step 2 (16K)"
+    }
+  ],
+  "default_model": "step-1-32k",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no STEPFUN_API_KEY set \u2014 models.dev catalog"
+}

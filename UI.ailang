@@ -1,0 +1,140 @@
+// UI.ailang — headless stand-in for the TUI (HalCodeGTK).
+// Same Function.UI.* names the agent/backends call. No raw mode, no alt screen.
+// Presentation is shell/halcode_shell_gtk + AppDesk. Chat lines can go to
+// /tmp/halcode_app/chat.log for the desk to pick up later.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+FixedPool.UIColors {
+    "ORANGE_FG": Initialize=3
+    "DIM_FG":    Initialize=8
+    "RED_FG":    Initialize=1
+    "GREEN_FG":  Initialize=2
+    "CYAN_FG":   Initialize=6
+}
+
+FixedPool.UIGlyph {
+    "STAR":  Initialize=0, CanChange=True
+    "DOT":   Initialize=0, CanChange=True
+    "CHECK": Initialize=0, CanChange=True
+    "CROSS": Initialize=0, CanChange=True
+    "ARROW": Initialize=0, CanChange=True
+    "RULE":  Initialize=0, CanChange=True
+}
+
+FixedPool.UIHead {
+    "inited": Initialize=0, CanChange=True
+    "intr":   Initialize=0, CanChange=True
+    "intr_s": Initialize=0, CanChange=True
+}
+
+Function.UI.Init {
+    Body: {
+        UIGlyph.STAR  = "*"
+        UIGlyph.DOT   = "."
+        UIGlyph.CHECK = "+"
+        UIGlyph.CROSS = "x"
+        UIGlyph.ARROW = ">"
+        UIGlyph.RULE  = "-"
+        UIHead.inited = 1
+    }
+}
+
+Function.UI.Shutdown { Body: { } }
+Function.UI.ClearChat { Body: { } }
+Function.UI.PumpInput { Body: { } }
+Function.UI.AnimTick { Body: { } }
+Function.UI.TickMascot { Body: { } }
+Function.UI.SessionHeader {
+    Input: version: Address
+    Input: model: Address
+    Input: cwd: Address
+    Body: { }
+}
+Function.UI.SetModelName { Input: name: Address  Body: { } }
+Function.UI.SetProjectThread {
+    Input: project: Address
+    Input: thread: Address
+    Body: { }
+}
+Function.UI.SetState { Input: state: Integer  Body: { } }
+Function.UI.SetTokens {
+    Input: in_tok: Integer
+    Input: out_tok: Integer
+    Body: { }
+}
+Function.UI.SetActiveTool { Input: name: Address  Body: { } }
+Function.UI.SetQuote { Input: q: Address  Body: { } }
+Function.UI.SetReasoning { Input: s: Address  Body: { } }
+Function.UI.PrintHelp { Body: { } }
+Function.UI.BootScroll { Body: { } }
+Function.UI.BootBanner { Input: cwd: Address  Body: { } }
+Function.UI.SplashBoot { Body: { } }
+Function.UI.SplashFile { Input: path: Address  Body: { } }
+Function.UI.StartupAnimation { Body: { } }
+Function.UI.WriteColor {
+    Input: color: Address
+    Input: text: Address
+    Body: { }
+}
+Function.UI.RenderPromptArea {
+    Input: todos_arr: Address
+    Input: hint: Address
+    Body: { }
+}
+Function.UI.RenderPromptClose { Body: { } }
+Function.UI.QuerySize { Body: { } }
+
+Function.UI.ChatPrint {
+    Input: s: Address
+    Body: { }
+}
+Function.UI.ChatPrintln {
+    Input: s: Address
+    Body: { }
+}
+Function.UI.ChatPrintDim {
+    Input: s: Address
+    Body: { }
+}
+Function.UI.ChatTag {
+    Input: tag: Address
+    Input: body: Address
+    Input: color: Integer
+    Body: { }
+}
+
+Function.UI.HasInterrupt {
+    Output: Integer
+    Body: { ReturnValue(UIHead.intr) }
+}
+Function.UI.ConsumeInterrupt {
+    Output: Address
+    Body: {
+        UIHead.intr = 0
+        ReturnValue(UIHead.intr_s)
+    }
+}
+Function.UI.ReadLine {
+    Output: Address
+    Body: { ReturnValue(0) }
+}
+
+Function.UI.ToolGroupStart { Input: n_tools: Integer  Body: { } }
+Function.UI.ToolCallStart {
+    Input: tool_name: Address
+    Input: arg_summary: Address
+    Input: idx: Integer
+    Input: total: Integer
+    Body: { }
+}
+Function.UI.ToolCallEnd {
+    Input: ok: Integer
+    Input: idx: Integer
+    Input: total: Integer
+    Body: { }
+}
+Function.UI.ToolGroupEnd { Input: n_tools: Integer  Body: { } }

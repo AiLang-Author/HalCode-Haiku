@@ -1,0 +1,614 @@
+// cc_write_ipc.ailang — Claude Code Write tool, IPC service.
+//
+// Writes (or appends) string content to a file. Auto-creates the file
+// and its immediate parent directory if missing (one level only — not
+// recursive like mkdir -p). Paths with 2+ levels of missing dirs fail.
+//
+// Schema: path (required string), content (required string), append (bool, default false).
+//
+// Build: ./ailang.x Applications/ClaudeCode/cc_tools/cc_write_ipc.ailang cc_write_ipc.x
+// Run:   ./cc_write_ipc.x   (binds /tmp/ailang_cctools/Write.sock)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCWriteSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_FSTAT":     Initialize=5
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+}
+
+FixedPool.CCWriteFlags {
+    "O_WRONLY":      Initialize=1
+    "O_CREAT":       Initialize=64
+    "O_TRUNC":       Initialize=512
+    "O_APPEND":      Initialize=1024
+}
+
+FixedPool.CCWriteConst {
+    "SOCK_PATH":     Initialize=0, CanChange=True
+    "SOCK_DIR":      Initialize=0, CanChange=True
+    "MODE":          Initialize=420   // 0o644
+    "BACKLOG":       Initialize=8
+}
+
+FixedPool.CCWriteState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+    "bak_len":       Initialize=0, CanChange=True
+}
+
+FixedPool.CCWriteUndo {
+    "JOURNAL_DIR": Initialize=0, CanChange=True
+    "MAX_FILE":    Initialize=4194304
+}
+
+// =============================================================================
+// UNDO JOURNAL (record before-image before modifying a file)
+// =============================================================================
+
+// Read $HOME from /proc/self/environ. Returns 0 if not set.
+Function.CCWrite_UndoGetHome {
+    Output: Address
+    Body: {
+        fd = SystemCall(CCWriteSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(8192)
+        n = SystemCall(CCWriteSys.SYS_READ, fd, buf, 8192, 0, 0)
+        SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 8192)
+            ReturnValue(0)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 72) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, 1)), 79) ThenBlock: {
+                    IfCondition EqualTo(GetByte(buf, Add(i, 2)), 77) ThenBlock: {
+                        IfCondition EqualTo(GetByte(buf, Add(i, 3)), 69) ThenBlock: {
+                            IfCondition EqualTo(GetByte(buf, Add(i, 4)), 61) ThenBlock: {
+                                val_start = Add(i, 5)
+                                val_end = val_start
+                                WhileLoop LessThan(val_end, n) {
+                                    IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                                    val_end = Add(val_end, 1)
+                                }
+                                val_len = Subtract(val_end, val_start)
+                                out = Allocate(Add(val_len, 1))
+                                k = 0
+                                WhileLoop LessThan(k, val_len) {
+                                    SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                                    k = Add(k, 1)
+                                }
+                                SetByte(out, val_len, 0)
+                                Deallocate(buf, 8192)
+                                ReturnValue(out)
+                            }
+                        }
+                    }
+                }
+            }
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 8192)
+        ReturnValue(0)
+    }
+}
+
+Function.CCWrite_UndoEnsureDir {
+    Body: {
+        IfCondition NotEqual(CCWriteUndo.JOURNAL_DIR, 0) ThenBlock: { ReturnValue(0) }
+        home = CCWrite_UndoGetHome()
+        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
+        CCWriteUndo.JOURNAL_DIR = StringConcat(home, "/.halcode/undo")
+        SystemCall(CCWriteSys.SYS_MKDIR, CCWriteUndo.JOURNAL_DIR, 493, 0, 0, 0)
+    }
+}
+
+Function.CCWrite_UndoHeadPath {
+    Output: Address
+    Body: {
+        CCWrite_UndoEnsureDir()
+        ReturnValue(StringConcat(CCWriteUndo.JOURNAL_DIR, "/HEAD"))
+    }
+}
+
+Function.CCWrite_UndoEntryPath {
+    Input: seq: Integer
+    Input: suffix: Address
+    Output: Address
+    Body: {
+        CCWrite_UndoEnsureDir()
+        num = NumberToString(seq)
+        p = StringConcat(CCWriteUndo.JOURNAL_DIR, "/")
+        p = StringConcat(p, num)
+        p = StringConcat(p, suffix)
+        ReturnValue(p)
+    }
+}
+
+Function.CCWrite_UndoReadHead {
+    Output: Integer
+    Body: {
+        path = CCWrite_UndoHeadPath()
+        fd = SystemCall(CCWriteSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(32)
+        n = SystemCall(CCWriteSys.SYS_READ, fd, buf, 31, 0, 0)
+        SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 32)
+            ReturnValue(0)
+        }
+        SetByte(buf, n, 0)
+        val = StringToInt(buf)
+        Deallocate(buf, 32)
+        ReturnValue(val)
+    }
+}
+
+Function.CCWrite_UndoWriteHead {
+    Input: val: Integer
+    Body: {
+        path = CCWrite_UndoHeadPath()
+        str = NumberToString(val)
+        fd = SystemCall(CCWriteSys.SYS_OPEN, path, 577, 420, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        written = 0
+        slen = StringLength(str)
+        WhileLoop LessThan(written, slen) {
+            n = SystemCall(CCWriteSys.SYS_WRITE, fd, Add(str, written), Subtract(slen, written), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            written = Add(written, n)
+        }
+        SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+    }
+}
+
+Function.CCWrite_UndoWriteFile {
+    Input: path: Address
+    Input: data: Address
+    Input: len: Integer
+    Body: {
+        fd = SystemCall(CCWriteSys.SYS_OPEN, path, 577, 420, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        written = 0
+        WhileLoop LessThan(written, len) {
+            n = SystemCall(CCWriteSys.SYS_WRITE, fd, Add(data, written), Subtract(len, written), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            written = Add(written, n)
+        }
+        SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+    }
+}
+
+Function.CCWrite_UnlinkPath {
+    Input: path: Address
+    Body: {
+        SystemCall(CCWriteSys.SYS_UNLINK, path, 0, 0, 0, 0)
+    }
+}
+
+// Drop the redo journal. Any new write invalidates pending redo entries
+// (classic undo/redo semantics: a fresh edit forks a new branch).
+Function.CCWrite_ClearRedo {
+    Body: {
+        CCWrite_UndoEnsureDir()
+        redodir = StringConcat(CCWriteUndo.JOURNAL_DIR, "/redo")
+        SystemCall(CCWriteSys.SYS_MKDIR, redodir, 493, 0, 0, 0)
+
+        hpath = StringConcat(redodir, "/HEAD")
+        rhead = 0
+        fd = SystemCall(CCWriteSys.SYS_OPEN, hpath, 0, 0, 0, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            buf = Allocate(32)
+            n = SystemCall(CCWriteSys.SYS_READ, fd, buf, 31, 0, 0)
+            SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            IfCondition GreaterThan(n, 0) ThenBlock: {
+                SetByte(buf, n, 0)
+                rhead = StringToInt(buf)
+            }
+            Deallocate(buf, 32)
+        }
+
+        i = 1
+        WhileLoop LessEqual(i, rhead) {
+            num = NumberToString(i)
+            base = StringConcat(redodir, "/")
+            base = StringConcat(base, num)
+            CCWrite_UnlinkPath(StringConcat(base, ".path"))
+            CCWrite_UnlinkPath(StringConcat(base, ".bak"))
+            CCWrite_UnlinkPath(StringConcat(base, ".new"))
+            i = Add(i, 1)
+        }
+
+        fd2 = SystemCall(CCWriteSys.SYS_OPEN, hpath, 577, 420, 0, 0)
+        IfCondition GreaterEqual(fd2, 0) ThenBlock: {
+            SystemCall(CCWriteSys.SYS_WRITE, fd2, "0", 1, 0, 0)
+            SystemCall(CCWriteSys.SYS_CLOSE, fd2, 0, 0, 0, 0)
+        }
+    }
+}
+
+// Return 1 if the file exists (openable), else 0.
+Function.CCWrite_FileExists {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        fd = SystemCall(CCWriteSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        ReturnValue(1)
+    }
+}
+
+// Read an entire file into a heap buffer. Returns 0 if unreadable or too large.
+// Stores the byte count in CCWriteState.bak_len.
+Function.CCWrite_ReadFile {
+    Input: path: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(CCWriteSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        stat_buf = Allocate(144)
+        SystemCall(CCWriteSys.SYS_FSTAT, fd, stat_buf, 0, 0, 0)
+        size = Dereference(Add(stat_buf, 48))
+        Deallocate(stat_buf, 144)
+        IfCondition GreaterThan(size, CCWriteUndo.MAX_FILE) ThenBlock: {
+            SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+        buf = Allocate(Add(size, 2))
+        total = 0
+        WhileLoop LessThan(total, size) {
+            n = SystemCall(CCWriteSys.SYS_READ, fd, Add(buf, total), Subtract(size, total), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            total = Add(total, n)
+        }
+        SetByte(buf, total, 0)
+        SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        CCWriteState.bak_len = total
+        ReturnValue(buf)
+    }
+}
+
+// Record a before-image so /undo can restore the original content.
+Function.CCWrite_RecordUndo {
+    Input: path: Address
+    Body: {
+        CCWrite_UndoEnsureDir()
+        existed = CCWrite_FileExists(path)
+        before = 0
+        before_len = 0
+        IfCondition EqualTo(existed, 1) ThenBlock: {
+            before = CCWrite_ReadFile(path)
+            IfCondition EqualTo(before, 0) ThenBlock: { ReturnValue(0) }
+            before_len = CCWriteState.bak_len
+        }
+        head = CCWrite_UndoReadHead()
+        seq = Add(head, 1)
+        ppath = CCWrite_UndoEntryPath(seq, ".path")
+        CCWrite_UndoWriteFile(ppath, path, StringLength(path))
+        IfCondition EqualTo(existed, 1) ThenBlock: {
+            bpath = CCWrite_UndoEntryPath(seq, ".bak")
+            CCWrite_UndoWriteFile(bpath, before, before_len)
+        } ElseBlock: {
+            npath = CCWrite_UndoEntryPath(seq, ".new")
+            CCWrite_UndoWriteFile(npath, "", 0)
+        }
+        CCWrite_UndoWriteHead(seq)
+        CCWrite_ClearRedo()
+    }
+}
+
+Function.CCWrite_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Write", "Write or append string content to a file. Creates the file if missing. Auto-creates the immediate parent directory. Use absolute paths only.")
+        UtilArgs_AddField(s, "path", "path", 1, "Absolute path to write (parent directory is auto-created if missing)", "path")
+        UtilArgs_AddField(s, "content", "string", 1, "Content to write", "content")
+        UtilArgs_AddField(s, "append", "bool", 0, "Append instead of overwrite (default false)", "append")
+        ReturnValue(s)
+    }
+}
+
+// Returns 1 if str starts with prefix (exact byte match).
+Function.CCWrite_HasPrefix {
+    Input: str: Address
+    Input: prefix: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(prefix, 0) ThenBlock: { ReturnValue(0) }
+        plen = StringLength(prefix)
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            IfCondition EqualTo(GetByte(str, i), 0) ThenBlock: { ReturnValue(0) }
+            IfCondition NotEqual(GetByte(str, i), GetByte(prefix, i)) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Returns 1 if path targets an OS-critical directory that must never be overwritten.
+Function.CCWrite_IsSystemPath {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/etc/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/proc/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/sys/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/dev/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/bin/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/sbin/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/usr/bin/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/usr/sbin/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/usr/lib/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/lib/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/lib64/"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCWrite_HasPrefix(path, "/boot/"), 1) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// Auto-create the immediate parent directory of path (best-effort, ignores EEXIST).
+Function.CCWrite_MkdirParent {
+    Input: path: Address
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        plen = StringLength(path)
+        IfCondition LessEqual(plen, 1) ThenBlock: { ReturnValue(0) }
+        // Find last '/' (ASCII 47)
+        i = Subtract(plen, 1)
+        WhileLoop GreaterThan(i, 0) {
+            IfCondition EqualTo(GetByte(path, i), 47) ThenBlock: { BreakLoop }
+            i = Subtract(i, 1)
+        }
+        IfCondition LessEqual(i, 0) ThenBlock: { ReturnValue(0) }
+        parent = Allocate(Add(i, 1))
+        j = 0
+        WhileLoop LessThan(j, i) {
+            SetByte(parent, j, GetByte(path, j))
+            j = Add(j, 1)
+        }
+        SetByte(parent, i, 0)
+        SystemCall(CCWriteSys.SYS_MKDIR, parent, 493, 0, 0, 0)   // 0755
+        Deallocate(parent, Add(i, 1))
+    }
+}
+
+Function.CCWrite_Do {
+    Input: args: Address
+    Input: err_buf: Address
+    Output: Integer
+    Body: {
+        path = UtilArgs_GetString(args, "path")
+        content = UtilArgs_GetString(args, "content")
+        append = UtilArgs_GetBool(args, "append")
+        IfCondition EqualTo(path, 0) ThenBlock: {
+            msg = "missing path — use an absolute path like /home/user/file.txt or /mnt/c/Users/..."
+            i = 0
+            WhileLoop LessThan(i, StringLength(msg)) { SetByte(err_buf, i, GetByte(msg, i))  i = Add(i, 1) }
+            SetByte(err_buf, StringLength(msg), 0)
+            ReturnValue(-1)
+        }
+        IfCondition EqualTo(content, 0) ThenBlock: { content = "" }
+
+        // Block oversized writes — streaming huge content arguments causes TCP stream drops.
+        clen = StringLength(content)
+        IfCondition GreaterThan(clen, 40000) ThenBlock: {
+            msg1 = "Content too large for a single Write ("
+            cs = NumberToString(clen)
+            msg2 = " bytes). Split into multiple Write calls of <=500 lines each and write them sequentially."
+            i = 0
+            WhileLoop LessThan(i, StringLength(msg1)) { SetByte(err_buf, i, GetByte(msg1, i))  i = Add(i, 1) }
+            j = 0
+            WhileLoop LessThan(j, StringLength(cs)) { SetByte(err_buf, Add(i, j), GetByte(cs, j))  j = Add(j, 1) }
+            i = Add(i, j)
+            j = 0
+            WhileLoop LessThan(j, StringLength(msg2)) { SetByte(err_buf, Add(i, j), GetByte(msg2, j))  j = Add(j, 1) }
+            SetByte(err_buf, Add(i, j), 0)
+            ReturnValue(-1)
+        }
+
+        // Block writes to OS-critical directories
+        IfCondition EqualTo(CCWrite_IsSystemPath(path), 1) ThenBlock: {
+            msg = "Blocked: writing to OS system directory is not allowed: "
+            i = 0
+            WhileLoop LessThan(i, StringLength(msg)) { SetByte(err_buf, i, GetByte(msg, i))  i = Add(i, 1) }
+            j = 0
+            WhileLoop LessThan(j, StringLength(path)) { SetByte(err_buf, Add(i, j), GetByte(path, j))  j = Add(j, 1) }
+            SetByte(err_buf, Add(i, j), 0)
+            ReturnValue(-1)
+        }
+
+        // Auto-create the parent directory — common cause of "open failed" when
+        // writing to a new subdirectory the model hasn't created yet.
+        CCWrite_MkdirParent(path)
+
+        // Record before-image BEFORE O_TRUNC destroys the existing content.
+        CCWrite_RecordUndo(path)
+
+        flags = BitwiseOr(CCWriteFlags.O_WRONLY, CCWriteFlags.O_CREAT)
+        IfCondition EqualTo(append, 1) ThenBlock: {
+            flags = BitwiseOr(flags, CCWriteFlags.O_APPEND)
+        } ElseBlock: {
+            flags = BitwiseOr(flags, CCWriteFlags.O_TRUNC)
+        }
+
+        fd = SystemCall(CCWriteSys.SYS_OPEN, path, flags, CCWriteConst.MODE, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            // fd = -errno; report both the number and a human hint
+            errno_val = Subtract(0, fd)
+            hint = "check that the parent directory exists"
+            IfCondition EqualTo(errno_val, 13) ThenBlock: { hint = "permission denied" }
+            IfCondition EqualTo(errno_val, 30) ThenBlock: { hint = "read-only filesystem" }
+            IfCondition EqualTo(errno_val, 20) ThenBlock: { hint = "a component of the path is not a directory" }
+            prefix = "open failed (errno="
+            i = 0
+            WhileLoop LessThan(i, StringLength(prefix)) { SetByte(err_buf, i, GetByte(prefix, i))  i = Add(i, 1) }
+            ens = NumberToString(errno_val)
+            j = 0
+            WhileLoop LessThan(j, StringLength(ens)) { SetByte(err_buf, Add(i, j), GetByte(ens, j))  j = Add(j, 1) }
+            i = Add(i, j)
+            sep = " "
+            j = 0
+            WhileLoop LessThan(j, StringLength(sep)) { SetByte(err_buf, Add(i, j), GetByte(sep, j))  j = Add(j, 1) }
+            i = Add(i, j)
+            j = 0
+            WhileLoop LessThan(j, StringLength(hint)) { SetByte(err_buf, Add(i, j), GetByte(hint, j))  j = Add(j, 1) }
+            i = Add(i, j)
+            SetByte(err_buf, i, 58)  // ':'
+            i = Add(i, 1)
+            SetByte(err_buf, i, 32)  // ' '
+            i = Add(i, 1)
+            j = 0
+            WhileLoop LessThan(j, StringLength(path)) { SetByte(err_buf, Add(i, j), GetByte(path, j))  j = Add(j, 1) }
+            SetByte(err_buf, Add(i, j), 0)
+            ReturnValue(-1)
+        }
+
+        clen = StringLength(content)
+        total_written = 0
+        WhileLoop LessThan(total_written, clen) {
+            n = SystemCall(CCWriteSys.SYS_WRITE, fd, Add(content, total_written), Subtract(clen, total_written), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            total_written = Add(total_written, n)
+        }
+        SystemCall(CCWriteSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        ReturnValue(total_written)
+    }
+}
+
+Function.CCWrite_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWrite_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWrite_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCWriteState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWrite_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCWrite_SendError(client_fd, 0, "invalid JSON")  ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCWrite_SendError(client_fd, 0, "request must be a JSON object")  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCWrite_SendError(client_fd, 0, "missing method")  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCWrite_SendSchema(client_fd)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCWriteState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCWrite_SendError(client_fd, id, "missing required arguments (path, content)")  ReturnValue(0)
+            }
+            err_buf = Allocate(256)
+            SetByte(err_buf, 0, 0)
+            written = CCWrite_Do(validated, err_buf)
+            IfCondition LessThan(written, 0) ThenBlock: {
+                CCWrite_SendError(client_fd, id, err_buf)
+            } ElseBlock: {
+                msg = StringConcat("wrote ", NumberToString(written))
+                msg = StringConcat(msg, " bytes")
+                CCWrite_SendResult(client_fd, id, msg)
+            }
+            Deallocate(err_buf, 256)
+            ReturnValue(0)
+        }
+        CCWrite_SendError(client_fd, 0, "unknown method")
+    }
+}
+
+SubRoutine.Main {
+    CCWriteConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    CCWriteConst.SOCK_PATH = "@halcode/Write"
+    CCWriteState.schema = CCWrite_BuildSchema()
+    SystemCall(CCWriteSys.SYS_MKDIR, CCWriteConst.SOCK_DIR, 493, 0, 0, 0)
+    SystemCall(CCWriteSys.SYS_UNLINK, CCWriteConst.SOCK_PATH, 0, 0, 0, 0)
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
+    Socket.BindUnix(fd, CCWriteConst.SOCK_PATH)
+    Socket.Listen(fd, CCWriteConst.BACKLOG)
+    CCWriteState.listen_fd = fd
+    PrintMessage("[cc_write_ipc] listening on ")  PrintMessage(CCWriteConst.SOCK_PATH)  PrintMessage("\n")
+    WhileLoop EqualTo(CCWriteState.running, 1) {
+        client_fd = Socket.Accept(CCWriteState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCWrite_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Exit(0)
+}
+
+RunTask(Main)

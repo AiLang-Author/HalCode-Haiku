@@ -1,0 +1,432 @@
+// cc_du_ipc.ailang — disk usage IPC tool for HalCode9000.
+//
+// Socket: @halcode/Du
+// Schema: path (required), human (optional bool, default false)
+// Returns: recursive disk usage for path.
+//   human=false: sizes in KB
+//   human=true:  sizes in human-readable form (K/M/G)
+//
+// Uses fstatat for size + type detection — works on NTFS/WSL2 (no DT_UNKNOWN issue).
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCDuSys {
+    "SYS_CLOSE":     Initialize=3
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+    "SYS_OPENAT":    Initialize=257
+    "SYS_GETDENTS64":Initialize=217
+    "SYS_FSTATAT":   Initialize=262
+    "AT_FDCWD":      Initialize=-100
+    "O_RDONLY":      Initialize=0
+    "O_DIRECTORY":   Initialize=65536
+    "S_IFMT":        Initialize=61440
+    "S_IFDIR":       Initialize=16384
+}
+
+FixedPool.CCDuConst {
+    "SOCK_PATH":    Initialize="@halcode/Du", CanChange=True
+    "BACKLOG":      Initialize=8
+    "RESULT_CAP":   Initialize=65536
+    "DIRBUF_SIZE":  Initialize=32768
+    "STAT_SIZE":    Initialize=144
+    "MAX_DEPTH":    Initialize=30
+}
+
+FixedPool.CCDuState {
+    "schema":       Initialize=0,  CanChange=True
+    "listen_fd":    Initialize=-1, CanChange=True
+    "running":      Initialize=1,  CanChange=True
+    "result_buf":   Initialize=0,  CanChange=True
+    "result_pos":   Initialize=0,  CanChange=True
+    "truncated":    Initialize=0,  CanChange=True
+    "human":        Initialize=0,  CanChange=True
+}
+
+// =============================================================================
+// OUTPUT HELPERS
+// =============================================================================
+
+Function.CCDu_AppendStr {
+    Input: s: Address
+    Body: {
+        len = StringLength(s)
+        space = Subtract(CCDuConst.RESULT_CAP, CCDuState.result_pos)
+        IfCondition LessEqual(space, 0) ThenBlock: {
+            CCDuState.truncated = 1
+        } ElseBlock: {
+            copy = len
+            IfCondition GreaterThan(copy, space) ThenBlock: { copy = space  CCDuState.truncated = 1 }
+            MemoryCopy(Add(CCDuState.result_buf, CCDuState.result_pos), s, copy)
+            CCDuState.result_pos = Add(CCDuState.result_pos, copy)
+        }
+    }
+}
+
+Function.CCDu_AppendInt {
+    Input: num: Integer
+    Body: {
+        IfCondition EqualTo(num, 0) ThenBlock: { CCDu_AppendStr("0")  ReturnValue(0) }
+        tmp = Allocate(24)
+        ndig = 0
+        n = num
+        WhileLoop GreaterThan(n, 0) {
+            SetByte(tmp, ndig, Add(48, Modulo(n, 10)))
+            ndig = Add(ndig, 1)
+            n = Divide(n, 10)
+        }
+        i = Subtract(ndig, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            space = Subtract(CCDuConst.RESULT_CAP, CCDuState.result_pos)
+            IfCondition GreaterThan(space, 0) ThenBlock: {
+                SetByte(CCDuState.result_buf, CCDuState.result_pos, GetByte(tmp, i))
+                CCDuState.result_pos = Add(CCDuState.result_pos, 1)
+            }
+            i = Subtract(i, 1)
+        }
+        Deallocate(tmp, 24)
+    }
+}
+
+// Append human-readable size like "1023K", "4M", "2G"
+Function.CCDu_AppendHuman {
+    Input: bytes: Integer
+    Body: {
+        IfCondition LessThan(bytes, 1024) ThenBlock: {
+            CCDu_AppendInt(bytes)
+            CCDu_AppendStr("B")
+            ReturnValue(0)
+        }
+        kb = Divide(bytes, 1024)
+        IfCondition LessThan(kb, 1024) ThenBlock: {
+            CCDu_AppendInt(kb)
+            CCDu_AppendStr("K")
+            ReturnValue(0)
+        }
+        mb = Divide(kb, 1024)
+        IfCondition LessThan(mb, 1024) ThenBlock: {
+            CCDu_AppendInt(mb)
+            CCDu_AppendStr("M")
+            ReturnValue(0)
+        }
+        gb = Divide(mb, 1024)
+        CCDu_AppendInt(gb)
+        CCDu_AppendStr("G")
+    }
+}
+
+// =============================================================================
+// STAT HELPERS
+// =============================================================================
+
+Function.CCDu_U32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        p = Add(buf, off)
+        v = Add(GetByte(p, 0), Multiply(GetByte(p, 1), 256))
+        v = Add(v, Multiply(GetByte(p, 2), 65536))
+        v = Add(v, Multiply(GetByte(p, 3), 16777216))
+        ReturnValue(v)
+    }
+}
+
+Function.CCDu_U64 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        p = Add(buf, off)
+        v = Add(GetByte(p, 0), Multiply(GetByte(p, 1), 256))
+        v = Add(v, Multiply(GetByte(p, 2), 65536))
+        v = Add(v, Multiply(GetByte(p, 3), 16777216))
+        ReturnValue(v)
+    }
+}
+
+// =============================================================================
+// DU ENGINE
+// =============================================================================
+
+// Return apparent bytes for path using fstatat; return 0 on error.
+// Also returns 1 via *is_dir_ptr if path is a directory.
+Function.CCDu_StatPath {
+    Input: path: Address
+    Input: is_dir_ptr: Address
+    Output: Integer
+    Body: {
+        statbuf = Allocate(CCDuConst.STAT_SIZE)
+        rc = SystemCall(CCDuSys.SYS_FSTATAT, CCDuSys.AT_FDCWD, path, statbuf, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            Deallocate(statbuf, CCDuConst.STAT_SIZE)
+            StoreValue(is_dir_ptr, 0, "dword")
+            ReturnValue(0)
+        }
+        mode = CCDu_U32(statbuf, 24)
+        ft = BitwiseAnd(mode, CCDuSys.S_IFMT)
+        is_dir = EqualTo(ft, CCDuSys.S_IFDIR)
+        StoreValue(is_dir_ptr, is_dir, "dword")
+        // Use st_size (apparent bytes) — reliable on NTFS
+        size = CCDu_U64(statbuf, 48)
+        Deallocate(statbuf, CCDuConst.STAT_SIZE)
+        ReturnValue(size)
+    }
+}
+
+// Recursively sum bytes under dir_path; return total bytes
+Function.CCDu_SumDir {
+    Input: dir_path: Address
+    Input: depth: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(depth, CCDuConst.MAX_DEPTH) ThenBlock: { ReturnValue(0) }
+
+        oflags = BitwiseOr(CCDuSys.O_RDONLY, CCDuSys.O_DIRECTORY)
+        dir_fd = SystemCall(CCDuSys.SYS_OPENAT, CCDuSys.AT_FDCWD, dir_path, oflags, 0, 0)
+        IfCondition LessThan(dir_fd, 0) ThenBlock: { ReturnValue(0) }
+
+        dirbuf = Allocate(CCDuConst.DIRBUF_SIZE)
+        dir_len = StringLength(dir_path)
+        total = 0
+        is_dir_holder = Allocate(8)
+
+        WhileLoop 1 {
+            n = SystemCall(CCDuSys.SYS_GETDENTS64, dir_fd, dirbuf, CCDuConst.DIRBUF_SIZE)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            pos = 0
+            WhileLoop LessThan(pos, n) {
+                entry = Add(dirbuf, pos)
+                reclen = Add(GetByte(entry, 16), Multiply(GetByte(entry, 17), 256))
+                IfCondition EqualTo(reclen, 0) ThenBlock: { BreakLoop }
+                dname = Add(entry, 19)
+                d0 = GetByte(dname, 0)
+                d1 = GetByte(dname, 1)
+                skip = 0
+                IfCondition EqualTo(d0, 46) ThenBlock: {
+                    IfCondition Or(EqualTo(d1, 0), EqualTo(d1, 46)) ThenBlock: { skip = 1 }
+                }
+                IfCondition EqualTo(skip, 0) ThenBlock: {
+                    dname_len = StringLength(dname)
+                    child_len = Add(Add(dir_len, dname_len), 2)
+                    child = Allocate(child_len)
+                    MemoryCopy(child, dir_path, dir_len)
+                    last_ch = GetByte(dir_path, Subtract(dir_len, 1))
+                    name_off = dir_len
+                    IfCondition NotEqual(last_ch, 47) ThenBlock: {
+                        SetByte(child, dir_len, 47)
+                        name_off = Add(dir_len, 1)
+                    }
+                    MemoryCopy(Add(child, name_off), dname, dname_len)
+                    SetByte(child, Add(name_off, dname_len), 0)
+
+                    StoreValue(is_dir_holder, 0, "dword")
+                    file_size = CCDu_StatPath(child, is_dir_holder)
+                    is_dir = Dereference(is_dir_holder, "dword")
+                    total = Add(total, file_size)
+                    IfCondition EqualTo(is_dir, 1) ThenBlock: {
+                        sub_total = CCDu_SumDir(child, Add(depth, 1))
+                        total = Add(total, sub_total)
+                    }
+                    Deallocate(child, child_len)
+                }
+                pos = Add(pos, reclen)
+            }
+        }
+
+        Deallocate(is_dir_holder, 8)
+        Deallocate(dirbuf, CCDuConst.DIRBUF_SIZE)
+        SystemCall(CCDuSys.SYS_CLOSE, dir_fd, 0, 0, 0, 0)
+        ReturnValue(total)
+    }
+}
+
+// Emit one output line: size TAB path NEWLINE
+Function.CCDu_EmitLine {
+    Input: bytes: Integer
+    Input: path: Address
+    Body: {
+        IfCondition EqualTo(CCDuState.human, 1) ThenBlock: {
+            CCDu_AppendHuman(bytes)
+        } ElseBlock: {
+            CCDu_AppendInt(Divide(bytes, 1024))
+        }
+        CCDu_AppendStr("\t")
+        CCDu_AppendStr(path)
+        CCDu_AppendStr("\n")
+    }
+}
+
+// =============================================================================
+// IPC LAYER
+// =============================================================================
+
+Function.CCDu_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Du", "Estimate recursive disk usage for a file or directory")
+        UtilArgs_AddField(s, "path",  "path",   1, "Path to measure", "path")
+        UtilArgs_AddField(s, "human", "string", 0, "Human-readable sizes: true or false (default false)", "human")
+        UtilArgs_SetDefault(s, "human", "false")
+        ReturnValue(s)
+    }
+}
+
+Function.CCDu_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCDu_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: truncated: Integer
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", CCDuState.result_buf)
+        IfCondition EqualTo(truncated, 1) ThenBlock: { JSON.SetBool(resp, "truncated", 1) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCDu_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCDuState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCDu_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCDu_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCDu_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCDu_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCDu_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id   = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCDuState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCDu_SendError(client_fd, id, "missing required argument 'path'")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            path = UtilArgs_GetString(validated, "path")
+            IfCondition EqualTo(path, 0) ThenBlock: {
+                CCDu_SendError(client_fd, id, "path is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            human_str = UtilArgs_GetString(validated, "human")
+            CCDuState.human = 0
+            IfCondition NotEqual(human_str, 0) ThenBlock: {
+                IfCondition EqualTo(GetByte(human_str, 0), 116) ThenBlock: { CCDuState.human = 1 }
+            }
+            CCDuState.result_pos = 0
+            CCDuState.truncated  = 0
+
+            is_dir_holder = Allocate(8)
+            StoreValue(is_dir_holder, 0, "dword")
+            self_size = CCDu_StatPath(path, is_dir_holder)
+            is_dir = Dereference(is_dir_holder, "dword")
+            Deallocate(is_dir_holder, 8)
+
+            IfCondition LessThan(self_size, 0) ThenBlock: {
+                CCDu_SendError(client_fd, id, "stat failed")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            total = self_size
+            IfCondition EqualTo(is_dir, 1) ThenBlock: {
+                sub = CCDu_SumDir(path, 0)
+                total = Add(total, sub)
+            }
+            CCDu_EmitLine(total, path)
+            SetByte(CCDuState.result_buf, CCDuState.result_pos, 0)
+            CCDu_SendResult(client_fd, id, CCDuState.truncated)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCDu_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+SubRoutine.Main {
+    CCDuConst.SOCK_PATH  = "@halcode/Du"
+    CCDuState.schema     = CCDu_BuildSchema()
+    CCDuState.result_buf = Allocate(Add(CCDuConst.RESULT_CAP, 1))
+
+    SystemCall(CCDuSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCDuSys.SYS_UNLINK, CCDuConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_du_ipc] socket create failed\n")
+        Exit(1)
+    }
+    Socket.BindUnix(fd, CCDuConst.SOCK_PATH)
+    Socket.Listen(fd, CCDuConst.BACKLOG)
+    CCDuState.listen_fd = fd
+    PrintMessage("[cc_du_ipc] listening on @halcode/Du\n")
+
+    WhileLoop EqualTo(CCDuState.running, 1) {
+        client_fd = Socket.Accept(CCDuState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCDu_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCDuState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

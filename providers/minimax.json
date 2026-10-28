@@ -1,0 +1,45 @@
+{
+  "name": "MiniMax",
+  "backend": "anthropic",
+  "base_url": "https://api.minimax.io/anthropic/v1",
+  "api_path": "/messages",
+  "models_endpoint": "/models",
+  "auth": "x-api-key",
+  "key_env": "MINIMAX_API_KEY",
+  "key_hint": "minimax",
+  "tier": 2,
+  "models": [
+    {
+      "id": "MiniMax-M3",
+      "display": "MiniMax-M3"
+    },
+    {
+      "id": "MiniMax-M2.7",
+      "display": "MiniMax-M2.7"
+    },
+    {
+      "id": "MiniMax-M2.7-highspeed",
+      "display": "MiniMax-M2.7-highspeed"
+    },
+    {
+      "id": "MiniMax-M2.5-highspeed",
+      "display": "MiniMax-M2.5-highspeed"
+    },
+    {
+      "id": "MiniMax-M2.5",
+      "display": "MiniMax-M2.5"
+    },
+    {
+      "id": "MiniMax-M2.1",
+      "display": "MiniMax-M2.1"
+    },
+    {
+      "id": "MiniMax-M2",
+      "display": "MiniMax-M2"
+    }
+  ],
+  "default_model": "MiniMax-M3",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no MINIMAX_API_KEY set \u2014 models.dev catalog"
+}

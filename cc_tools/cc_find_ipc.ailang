@@ -1,0 +1,560 @@
+// cc_find_ipc.ailang — filesystem search IPC tool for HalCode9000.
+//
+// Embedded find engine from AiLang_CoreUtils, argument zoo removed.
+// Structured UtilArgs schema replaces the raw cmdline parser.
+//
+// Socket: @halcode/Find
+// Schema: path (required), name (optional glob), type (optional: f/d),
+//         maxdepth (optional int, default 20), max_results (optional int, default 500)
+//
+// Safety: blocks /, /mnt, /mnt/c, /mnt/c/<one component>. Allows /mnt/c/X/Y/... (4+ slashes).
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCFindSys {
+    "SYS_CLOSE":      Initialize=3
+    "SYS_MKDIR":      Initialize=83
+    "SYS_UNLINK":     Initialize=87
+    "SYS_OPENAT":     Initialize=257
+    "SYS_GETDENTS64": Initialize=217
+    "AT_FDCWD":       Initialize=-100
+    "O_RDONLY":       Initialize=0
+    "O_DIRECTORY":    Initialize=65536
+    "DT_DIR":         Initialize=4
+    "DT_REG":         Initialize=8
+    "DT_LNK":         Initialize=10
+}
+
+FixedPool.CCFindConst {
+    "SOCK_PATH":   Initialize="@halcode/Find", CanChange=True
+    "BACKLOG":     Initialize=8
+    "DIRBUF_SIZE": Initialize=32768
+    "RESULT_CAP":  Initialize=65536
+}
+
+FixedPool.CCFindState {
+    "schema":       Initialize=0,   CanChange=True
+    "listen_fd":    Initialize=-1,  CanChange=True
+    "running":      Initialize=1,   CanChange=True
+    "result_buf":   Initialize=0,   CanChange=True
+    "result_pos":   Initialize=0,   CanChange=True
+    "result_count": Initialize=0,   CanChange=True
+    "max_results":  Initialize=500, CanChange=True
+    "truncated":    Initialize=0,   CanChange=True
+}
+
+FixedPool.CCFindConfig {
+    "name_pattern": Initialize=0, CanChange=True
+    "type_filter":  Initialize=0, CanChange=True
+    "max_depth":    Initialize=20, CanChange=True
+}
+
+// =============================================================================
+// RESULT BUFFER
+// =============================================================================
+
+Function.CCFind_AppendStr {
+    Input: str: Address
+    Body: {
+        len = StringLength(str)
+        space = Subtract(CCFindConst.RESULT_CAP, CCFindState.result_pos)
+        IfCondition LessEqual(space, 0) ThenBlock: {
+            CCFindState.truncated = 1
+        } ElseBlock: {
+            copy_len = len
+            IfCondition GreaterThan(copy_len, space) ThenBlock: {
+                copy_len = space
+                CCFindState.truncated = 1
+            }
+            MemoryCopy(Add(CCFindState.result_buf, CCFindState.result_pos), str, copy_len)
+            CCFindState.result_pos = Add(CCFindState.result_pos, copy_len)
+        }
+    }
+}
+
+Function.CCFind_AppendByte {
+    Input: b: Integer
+    Body: {
+        IfCondition LessThan(CCFindState.result_pos, CCFindConst.RESULT_CAP) ThenBlock: {
+            SetByte(CCFindState.result_buf, CCFindState.result_pos, b)
+            CCFindState.result_pos = Add(CCFindState.result_pos, 1)
+        } ElseBlock: {
+            CCFindState.truncated = 1
+        }
+    }
+}
+
+// =============================================================================
+// FIND ENGINE
+// =============================================================================
+
+Function.CCFind_StrContains {
+    Input: haystack: Address
+    Input: needle: Address
+    Output: Integer
+    Body: {
+        hlen = StringLength(haystack)
+        nlen = StringLength(needle)
+        IfCondition GreaterThan(nlen, hlen) ThenBlock: { ReturnValue(0) }
+        max_pos = Subtract(hlen, nlen)
+        i = 0
+        WhileLoop LessEqual(i, max_pos) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, nlen) {
+                IfCondition NotEqual(GetByte(haystack, Add(i, j)), GetByte(needle, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.CCFind_GlobMatch {
+    Input: str: Address
+    Input: pattern: Address
+    Output: Integer
+    Body: {
+        plen = StringLength(pattern)
+        slen = StringLength(str)
+        star0 = EqualTo(GetByte(pattern, 0), 42)
+        starN = 0
+        IfCondition GreaterThan(plen, 0) ThenBlock: {
+            starN = EqualTo(GetByte(pattern, Subtract(plen, 1)), 42)
+        }
+
+        // *mid* — substring
+        IfCondition And(EqualTo(star0, 1), EqualTo(starN, 1)) ThenBlock: {
+            IfCondition LessEqual(plen, 2) ThenBlock: { ReturnValue(1) }
+            mid_len = Subtract(plen, 2)
+            mid = Allocate(Add(mid_len, 1))
+            i = 0
+            WhileLoop LessThan(i, mid_len) {
+                SetByte(mid, i, GetByte(pattern, Add(i, 1)))
+                i = Add(i, 1)
+            }
+            SetByte(mid, mid_len, 0)
+            r = CCFind_StrContains(str, mid)
+            Deallocate(mid, Add(mid_len, 1))
+            ReturnValue(r)
+        }
+        // *suffix
+        IfCondition EqualTo(star0, 1) ThenBlock: {
+            suf_len = Subtract(plen, 1)
+            IfCondition LessThan(slen, suf_len) ThenBlock: { ReturnValue(0) }
+            base = Subtract(slen, suf_len)
+            i = 0
+            WhileLoop LessThan(i, suf_len) {
+                IfCondition NotEqual(GetByte(str, Add(base, i)), GetByte(pattern, Add(i, 1))) ThenBlock: {
+                    ReturnValue(0)
+                }
+                i = Add(i, 1)
+            }
+            ReturnValue(1)
+        }
+        // prefix*
+        IfCondition EqualTo(starN, 1) ThenBlock: {
+            pre_len = Subtract(plen, 1)
+            IfCondition LessThan(slen, pre_len) ThenBlock: { ReturnValue(0) }
+            i = 0
+            WhileLoop LessThan(i, pre_len) {
+                IfCondition NotEqual(GetByte(str, i), GetByte(pattern, i)) ThenBlock: { ReturnValue(0) }
+                i = Add(i, 1)
+            }
+            ReturnValue(1)
+        }
+        // exact
+        IfCondition NotEqual(slen, plen) ThenBlock: { ReturnValue(0) }
+        ReturnValue(EqualTo(MemCompare(str, pattern, slen), 0))
+    }
+}
+
+Function.CCFind_ShouldPrint {
+    Input: path: Address
+    Input: is_dir: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CCFindConfig.type_filter, 1) ThenBlock: {
+            IfCondition EqualTo(is_dir, 1) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(CCFindConfig.type_filter, 2) ThenBlock: {
+            IfCondition EqualTo(is_dir, 0) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition NotEqual(CCFindConfig.name_pattern, 0) ThenBlock: {
+            plen = StringLength(path)
+            last_slash = -1
+            i = 0
+            WhileLoop LessThan(i, plen) {
+                IfCondition EqualTo(GetByte(path, i), 47) ThenBlock: { last_slash = i }
+                i = Add(i, 1)
+            }
+            fname_start = Add(last_slash, 1)
+            fname_len = Subtract(plen, fname_start)
+            fname = Allocate(Add(fname_len, 1))
+            i = 0
+            WhileLoop LessThan(i, fname_len) {
+                SetByte(fname, i, GetByte(path, Add(fname_start, i)))
+                i = Add(i, 1)
+            }
+            SetByte(fname, fname_len, 0)
+            ok = CCFind_GlobMatch(fname, CCFindConfig.name_pattern)
+            Deallocate(fname, Add(fname_len, 1))
+            IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.CCFind_ProcessDir {
+    Input: dir_path: Address
+    Input: depth: Integer
+    Body: {
+        IfCondition GreaterThan(depth, CCFindConfig.max_depth) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(CCFindState.result_count, CCFindState.max_results) ThenBlock: { ReturnValue(0) }
+
+        // Emit root dir on depth 0 if it passes filters
+        IfCondition EqualTo(depth, 0) ThenBlock: {
+            IfCondition EqualTo(CCFind_ShouldPrint(dir_path, 1), 1) ThenBlock: {
+                CCFind_AppendStr(dir_path)
+                CCFind_AppendByte(10)
+                CCFindState.result_count = Add(CCFindState.result_count, 1)
+            }
+        }
+
+        oflags = BitwiseOr(CCFindSys.O_RDONLY, CCFindSys.O_DIRECTORY)
+        dir_fd = SystemCall(CCFindSys.SYS_OPENAT, CCFindSys.AT_FDCWD, dir_path, oflags, 0, 0)
+        IfCondition LessThan(dir_fd, 0) ThenBlock: { ReturnValue(0) }
+
+        dirbuf = Allocate(CCFindConst.DIRBUF_SIZE)
+        dir_len = StringLength(dir_path)
+
+        WhileLoop 1 {
+            IfCondition GreaterEqual(CCFindState.result_count, CCFindState.max_results) ThenBlock: { BreakLoop }
+            n = SystemCall(CCFindSys.SYS_GETDENTS64, dir_fd, dirbuf, CCFindConst.DIRBUF_SIZE)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+
+            pos = 0
+            WhileLoop LessThan(pos, n) {
+                IfCondition GreaterEqual(CCFindState.result_count, CCFindState.max_results) ThenBlock: { BreakLoop }
+                IfCondition GreaterThan(Add(pos, 19), n) ThenBlock: { BreakLoop }
+
+                entry = Add(dirbuf, pos)
+                reclen = Add(GetByte(entry, 16), Multiply(GetByte(entry, 17), 256))
+                IfCondition Or(LessThan(reclen, 19), GreaterThan(Add(pos, reclen), n)) ThenBlock: { BreakLoop }
+
+                dtype = GetByte(entry, 18)
+                dname = Add(entry, 19)
+
+                max_namelen = Subtract(reclen, 19)
+                dname_len = 0
+                WhileLoop LessThan(dname_len, max_namelen) {
+                    IfCondition EqualTo(GetByte(dname, dname_len), 0) ThenBlock: { BreakLoop }
+                    dname_len = Add(dname_len, 1)
+                }
+
+                d0 = GetByte(dname, 0)
+                d1 = GetByte(dname, 1)
+                skip = 0
+                IfCondition EqualTo(d0, 46) ThenBlock: {
+                    IfCondition EqualTo(d1, 0) ThenBlock: { skip = 1 }
+                    IfCondition And(EqualTo(d1, 46), EqualTo(GetByte(dname, 2), 0)) ThenBlock: { skip = 1 }
+                }
+
+                IfCondition EqualTo(skip, 0) ThenBlock: {
+                    // Build child path: dir_path + "/" + dname
+                    child_len = Add(Add(dir_len, dname_len), 2)
+                    child = Allocate(child_len)
+                    MemoryCopy(child, dir_path, dir_len)
+                    last_ch = GetByte(dir_path, Subtract(dir_len, 1))
+                    slash_pos = dir_len
+                    IfCondition NotEqual(last_ch, 47) ThenBlock: {
+                        SetByte(child, dir_len, 47)
+                        slash_pos = dir_len
+                    } ElseBlock: {
+                        slash_pos = Subtract(dir_len, 1)
+                    }
+                    name_off = Add(slash_pos, 1)
+                    MemoryCopy(Add(child, name_off), dname, dname_len)
+                    SetByte(child, Add(name_off, dname_len), 0)
+
+                    is_dir = EqualTo(dtype, CCFindSys.DT_DIR)
+                    // NTFS via WSL2 returns DT_UNKNOWN (0) for all entries — probe with O_DIRECTORY to detect dirs.
+                    IfCondition EqualTo(dtype, 0) ThenBlock: {
+                        probe_flags = BitwiseOr(CCFindSys.O_RDONLY, CCFindSys.O_DIRECTORY)
+                        probe_fd = SystemCall(CCFindSys.SYS_OPENAT, CCFindSys.AT_FDCWD, child, probe_flags, 0, 0)
+                        IfCondition GreaterEqual(probe_fd, 0) ThenBlock: {
+                            is_dir = 1
+                            SystemCall(CCFindSys.SYS_CLOSE, probe_fd, 0, 0, 0, 0)
+                        }
+                    }
+
+                    IfCondition EqualTo(CCFind_ShouldPrint(child, is_dir), 1) ThenBlock: {
+                        CCFind_AppendStr(child)
+                        CCFind_AppendByte(10)
+                        CCFindState.result_count = Add(CCFindState.result_count, 1)
+                    }
+
+                    IfCondition EqualTo(is_dir, 1) ThenBlock: {
+                        CCFind_ProcessDir(child, Add(depth, 1))
+                    }
+
+                    Deallocate(child, child_len)
+                }
+
+                pos = Add(pos, reclen)
+            }
+        }
+
+        Deallocate(dirbuf, CCFindConst.DIRBUF_SIZE)
+        SystemCall(CCFindSys.SYS_CLOSE, dir_fd, 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// WSL2 SAFETY: block paths that hang forever
+// =============================================================================
+
+Function.CCFind_IsDangerousPath {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(StringCompare(path, "/"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(path, "/mnt"), 0) ThenBlock: { ReturnValue(1) }
+        // Block /mnt/c exactly and /mnt/c/<single component> (e.g. /mnt/c/Users, /mnt/c/Windows).
+        // Allow /mnt/c/<X>/<Y>/... (4+ slashes total) — covers the actual project path.
+        IfCondition EqualTo(MemCompare(path, "/mnt/c", 6), 0) ThenBlock: {
+            nc = GetByte(path, 6)
+            IfCondition Or(EqualTo(nc, 0), EqualTo(nc, 47)) ThenBlock: {
+                slash_count = 0
+                ci = 0
+                WhileLoop NotEqual(GetByte(path, ci), 0) {
+                    IfCondition EqualTo(GetByte(path, ci), 47) ThenBlock: {
+                        slash_count = Add(slash_count, 1)
+                    }
+                    ci = Add(ci, 1)
+                }
+                IfCondition LessEqual(slash_count, 3) ThenBlock: { ReturnValue(1) }
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCHEMA + IPC DISPATCH
+// =============================================================================
+
+Function.CCFind_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Find", "Search for files in a directory tree")
+        UtilArgs_AddField(s, "path",        "path",   1, "Directory to search", "path")
+        UtilArgs_AddField(s, "name",        "string", 0, "Filename glob pattern (e.g. *.ailang, *_ipc*)", "name")
+        UtilArgs_AddField(s, "type",        "string", 0, "Entry type filter: f=files only, d=dirs only", "type")
+        UtilArgs_AddField(s, "maxdepth",    "int",    0, "Maximum recursion depth (default 20)", "maxdepth")
+        UtilArgs_AddField(s, "max_results", "int",    0, "Maximum results returned (default 500)", "max_results")
+        UtilArgs_SetDefault(s, "maxdepth",    "20")
+        UtilArgs_SetDefault(s, "max_results", "500")
+        ReturnValue(s)
+    }
+}
+
+Function.CCFind_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCFind_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Input: truncated: Integer
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        JSON.SetString(resp, "content", content)
+        IfCondition EqualTo(truncated, 1) ThenBlock: { JSON.SetBool(resp, "truncated", 1) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCFind_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCFindState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCFind_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCFind_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCFind_SendError(client_fd, 0, "request must be JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCFind_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCFind_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id        = JSON.GetString(obj, "id")
+            args      = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCFindState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCFind_SendError(client_fd, id, "missing required argument: path")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            path = UtilArgs_GetString(validated, "path")
+            IfCondition EqualTo(path, 0) ThenBlock: {
+                CCFind_SendError(client_fd, id, "path is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition EqualTo(CCFind_IsDangerousPath(path), 1) ThenBlock: {
+                CCFind_SendError(client_fd, id, "Blocked: path too broad — use at least /mnt/c/<user>/<subdir> (e.g. /mnt/c/Users/Sean/Documents/AILangSH) to avoid WSL2 NTFS hangs.")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+
+            // Reset per-request state
+            CCFindConfig.name_pattern = 0
+            CCFindConfig.type_filter  = 0
+            CCFindConfig.max_depth    = 20
+            CCFindState.result_pos    = 0
+            CCFindState.result_count  = 0
+            CCFindState.truncated     = 0
+
+            name_str = UtilArgs_GetString(validated, "name")
+            IfCondition NotEqual(name_str, 0) ThenBlock: { CCFindConfig.name_pattern = name_str }
+
+            type_str = UtilArgs_GetString(validated, "type")
+            IfCondition NotEqual(type_str, 0) ThenBlock: {
+                IfCondition EqualTo(GetByte(type_str, 0), 102) ThenBlock: { CCFindConfig.type_filter = 1 }  // 'f'
+                IfCondition EqualTo(GetByte(type_str, 0), 100) ThenBlock: { CCFindConfig.type_filter = 2 }  // 'd'
+            }
+
+            depth_str = UtilArgs_GetString(validated, "maxdepth")
+            IfCondition NotEqual(depth_str, 0) ThenBlock: {
+                d = StringToInt(depth_str)
+                IfCondition GreaterThan(d, 0) ThenBlock: { CCFindConfig.max_depth = d }
+            }
+
+            maxr_str = UtilArgs_GetString(validated, "max_results")
+            IfCondition NotEqual(maxr_str, 0) ThenBlock: {
+                mr = StringToInt(maxr_str)
+                IfCondition GreaterThan(mr, 0) ThenBlock: { CCFindState.max_results = mr }
+            }
+
+            // A missing path used to be echoed as a match. Require a directory.
+            probe_flags = BitwiseOr(CCFindSys.O_RDONLY, CCFindSys.O_DIRECTORY)
+            probe_fd = SystemCall(CCFindSys.SYS_OPENAT, CCFindSys.AT_FDCWD, path, probe_flags, 0, 0)
+            IfCondition LessThan(probe_fd, 0) ThenBlock: {
+                CCFind_SendError(client_fd, id, StringConcat("not a directory: ", path))
+                JSON.Free(parsed)
+                ReturnValue(0)
+            }
+            SystemCall(CCFindSys.SYS_CLOSE, probe_fd, 0, 0, 0, 0)
+
+            // Run search
+            CCFind_ProcessDir(path, 0)
+
+            // NUL-terminate result (RESULT_CAP+1 allocated so this is always safe)
+            SetByte(CCFindState.result_buf, CCFindState.result_pos, 0)
+
+            content = CCFindState.result_buf
+            IfCondition EqualTo(CCFindState.result_count, 0) ThenBlock: {
+                content = "(no matches)"
+            }
+
+            CCFind_SendResult(client_fd, id, content, CCFindState.truncated)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCFind_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+SubRoutine.Main {
+    CCFindConst.SOCK_PATH = "@halcode/Find"
+    CCFindState.schema    = CCFind_BuildSchema()
+
+    CCFindState.result_buf = Allocate(Add(CCFindConst.RESULT_CAP, 1))
+
+    SystemCall(CCFindSys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCFindSys.SYS_UNLINK, CCFindConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_find_ipc] socket create failed\n")
+        Exit(1)
+    }
+    br = Socket.BindUnix(fd, CCFindConst.SOCK_PATH)
+    IfCondition LessThan(br, 0) ThenBlock: {
+        PrintMessage("[cc_find_ipc] bind failed\n")
+        Socket.Close(fd)  Exit(1)
+    }
+    Socket.Listen(fd, CCFindConst.BACKLOG)
+    CCFindState.listen_fd = fd
+    PrintMessage("[cc_find_ipc] listening on @halcode/Find\n")
+
+    WhileLoop EqualTo(CCFindState.running, 1) {
+        client_fd = Socket.Accept(CCFindState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCFind_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCFindState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

@@ -1,0 +1,538 @@
+// ClaudeCode.History.ailang — conversation message ring.
+//
+// Holds the running list of messages sent to / received from the model.
+// Messages are kept as JSON objects (using Library.JSON tagged values) so
+// the request builder can hand them straight to the API request without
+// re-parsing.
+//
+// Eviction copies survivors and JSON.Free's dropped tagged messages.
+// String values in history must be heap-owned (History_SetStr / ParseJSON).
+//
+// Eviction rule: when count exceeds MAX_MESSAGES, drop the oldest TWO
+// entries (a user/assistant pair). Never drop a tool_use/tool_result pair
+// across the boundary — if the next-to-evict message contains tool_use
+// blocks, also drop the message after it (which holds the matching
+// tool_results). The API rejects requests where a tool_use lacks its
+// paired tool_result.
+//
+// Public API:
+//   History.Init()
+//   History.AppendUser(text_str)              — plain user message
+//   History.AppendAssistantText(text_str)     — plain assistant text reply
+//   History.AppendAssistantBlocks(blocks_arr) — assistant with tool_use blocks
+//   History.AppendToolResults(blocks_arr)     — user message containing tool_results
+//   History.GetMessagesArray()                — JSON array (live ref)
+//   History.Count()                           — number of messages
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+
+FixedPool.HistConst {
+    "MAX_MESSAGES":  Initialize=10
+    "PIN_LONG":      Initialize=400
+}
+
+FixedPool.HistState {
+    "messages":      Initialize=0, CanChange=True
+    "count":         Initialize=0, CanChange=True
+    "initialized":   Initialize=0, CanChange=True
+    "session_id":    Initialize=0, CanChange=True
+    "session_buf":   Initialize=0, CanChange=True
+    "title":         Initialize=0, CanChange=True
+    "last_text":     Initialize=0, CanChange=True
+    "last_text_len": Initialize=0, CanChange=True
+    "last_long":     Initialize=0, CanChange=True
+    "last_long_len": Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// INIT — allocate the messages array
+// =============================================================================
+Function.History.Init {
+    Body: {
+        IfCondition EqualTo(HistState.initialized, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        HistState.messages = JSON.NewArray()
+        HistState.count = 0
+        HistState.initialized = 1
+        HistState.session_id = 0
+        HistState.title = 0
+        HistState.last_text = 0
+        HistState.last_text_len = 0
+        HistState.last_long = 0
+        HistState.last_long_len = 0
+    }
+}
+
+// =============================================================================
+// EVICTION — drop oldest 2 entries (user/assistant pair) when over cap.
+// If the second-oldest is an assistant with tool_use blocks, drop a third
+// to take the matching tool_results with it.
+// =============================================================================
+Function.History_EvictIfNeeded {
+    Body: {
+        WhileLoop GreaterThan(HistState.count, HistConst.MAX_MESSAGES) {
+            n = JSON.ArrayLength(HistState.messages)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                BreakLoop
+            }
+
+            // Always bundle the first message (the user prompt of the oldest turn)
+            drop_n = 1
+            
+            // Count all subsequent messages that belong to this same turn
+            WhileLoop LessThan(drop_n, n) {
+                msg_tag = JSON.ArrayGet(HistState.messages, drop_n)
+                msg = JSON.AsObject(msg_tag)
+                IfCondition EqualTo(msg, 0) ThenBlock: {
+                    drop_n = Add(drop_n, 1)
+                    ContinueLoop
+                }
+                
+                role = JSON.GetString(msg, "role")
+                IfCondition EqualTo(role, 0) ThenBlock: {
+                    drop_n = Add(drop_n, 1)
+                    ContinueLoop
+                }
+                
+                // Tool results (OpenAI) belong to this turn
+                IfCondition EqualTo(StringCompare(role, "tool"), 0) ThenBlock: {
+                    drop_n = Add(drop_n, 1)
+                    ContinueLoop
+                }
+                
+                // Assistant messages (with or without tools) belong to this turn
+                IfCondition EqualTo(StringCompare(role, "assistant"), 0) ThenBlock: {
+                    drop_n = Add(drop_n, 1)
+                    ContinueLoop
+                }
+                
+                // User messages might be Anthropic tool results
+                IfCondition EqualTo(StringCompare(role, "user"), 0) ThenBlock: {
+                    content_arr = JSON.GetArray(msg, "content")
+                    IfCondition NotEqual(content_arr, 0) ThenBlock: {
+                        // Content is an array -> Anthropic tool results, belongs to this turn
+                        drop_n = Add(drop_n, 1)
+                        ContinueLoop
+                    } ElseBlock: {
+                        // Content is a string -> Normal user message -> START OF NEXT TURN!
+                        BreakLoop
+                    }
+                }
+                
+                // Fallback for unknown roles (system, etc.)
+                drop_n = Add(drop_n, 1)
+            }
+
+            // If drop_n equals the total length, the ENTIRE history is just ONE massive
+            // turn (e.g. 15 tool calls in a row). We cannot evict it, or we'd orphan
+            // the ongoing tool results. Allow it to temporarily exceed MAX_MESSAGES.
+            IfCondition EqualTo(drop_n, n) ThenBlock: {
+                BreakLoop
+            }
+            
+            History_DropFront(drop_n)
+        }
+    }
+}
+
+// Internal: drop the first `n` entries from the messages array.
+// Implementation: rebuild the array by skipping the first n.
+// Simple and safe; arrays are small (<=100 entries).
+Function.History_DropFront {
+    Input: drop_n: Integer
+    Body: {
+        old = HistState.messages
+        total = JSON.ArrayLength(old)
+        IfCondition GreaterEqual(drop_n, total) ThenBlock: {
+            History_FreeDropped(old, 0, total)
+            HistState.messages = JSON.NewArray()
+            HistState.count = 0
+            ReturnValue(0)
+        }
+        History_FreeDropped(old, 0, drop_n)
+        new_arr = JSON.NewArray()
+        i = drop_n
+        WhileLoop LessThan(i, total) {
+            elem_tag = JSON.ArrayGet(old, i)
+            elem = JSON.AsObject(elem_tag)
+            IfCondition NotEqual(elem, 0) ThenBlock: {
+                JSON.PushObject(new_arr, elem)
+            }
+            i = Add(i, 1)
+        }
+        HistState.messages = new_arr
+        HistState.count = Subtract(total, drop_n)
+    }
+}
+
+// Drop [start, start+drop_n) without touching the prefix (usually the user
+// prompt). Dropped tagged messages are JSON.Free'd.
+Function.History_DropRange {
+    Input: start: Integer
+    Input: drop_n: Integer
+    Body: {
+        IfCondition LessEqual(drop_n, 0) ThenBlock: { ReturnValue(0) }
+        old = HistState.messages
+        total = JSON.ArrayLength(old)
+        IfCondition LessThan(start, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(start, total) ThenBlock: { ReturnValue(0) }
+        end = Add(start, drop_n)
+        IfCondition GreaterThan(end, total) ThenBlock: { end = total }
+        History_FreeDropped(old, start, Subtract(end, start))
+
+        new_arr = JSON.NewArray()
+        i = 0
+        WhileLoop LessThan(i, total) {
+            IfCondition Or(LessThan(i, start), GreaterEqual(i, end)) ThenBlock: {
+                elem_tag = JSON.ArrayGet(old, i)
+                elem = JSON.AsObject(elem_tag)
+                IfCondition NotEqual(elem, 0) ThenBlock: {
+                    JSON.PushObject(new_arr, elem)
+                }
+            }
+            i = Add(i, 1)
+        }
+        HistState.messages = new_arr
+        HistState.count = JSON.ArrayLength(new_arr)
+    }
+}
+
+// After a turn that requested NO more tools, drop oldest assistant+tool
+// bundles until we are at MAX_MESSAGES. Keeps messages[0] (the user prompt)
+// and the trailing assistant (the final reply).
+Function.History.EvictCompletedTurns {
+    Output: Integer
+    Body: {
+        total_dropped = 0
+        WhileLoop GreaterThan(HistState.count, HistConst.MAX_MESSAGES) {
+            n = JSON.ArrayLength(HistState.messages)
+            IfCondition LessEqual(n, 2) ThenBlock: { BreakLoop }
+
+            a = 1
+            found = 0
+            WhileLoop LessThan(a, n) {
+                msg = JSON.AsObject(JSON.ArrayGet(HistState.messages, a))
+                IfCondition NotEqual(msg, 0) ThenBlock: {
+                    role = JSON.GetString(msg, "role")
+                    IfCondition And(NotEqual(role, 0), EqualTo(StringCompare(role, "assistant"), 0)) ThenBlock: {
+                        found = 1
+                        BreakLoop
+                    }
+                }
+                a = Add(a, 1)
+            }
+            IfCondition EqualTo(found, 0) ThenBlock: { BreakLoop }
+
+            end = Add(a, 1)
+            WhileLoop LessThan(end, n) {
+                msg2 = JSON.AsObject(JSON.ArrayGet(HistState.messages, end))
+                IfCondition EqualTo(msg2, 0) ThenBlock: { BreakLoop }
+                role2 = JSON.GetString(msg2, "role")
+                IfCondition EqualTo(role2, 0) ThenBlock: { BreakLoop }
+                // OpenAI: role=tool. Anthropic: role=user with array content
+                // (tool_result blocks). Keep the pair with this assistant.
+                IfCondition EqualTo(StringCompare(role2, "tool"), 0) ThenBlock: {
+                    end = Add(end, 1)
+                    ContinueLoop
+                }
+                IfCondition EqualTo(StringCompare(role2, "user"), 0) ThenBlock: {
+                    content_arr = JSON.GetArray(msg2, "content")
+                    IfCondition NotEqual(content_arr, 0) ThenBlock: {
+                        end = Add(end, 1)
+                        ContinueLoop
+                    }
+                }
+                BreakLoop
+            }
+
+            // Bundle includes the last message — that is the final reply.
+            IfCondition GreaterEqual(end, n) ThenBlock: { BreakLoop }
+
+            drop_n = Subtract(end, a)
+            IfCondition LessEqual(drop_n, 0) ThenBlock: { BreakLoop }
+            History_DropRange(a, drop_n)
+            total_dropped = Add(total_dropped, drop_n)
+        }
+        ReturnValue(total_dropped)
+    }
+}
+
+// Heap-copy a string. Never nest this inside JSON.SetString(...) —
+// AILang register clobber drops sibling keys (e.g. role).
+Function.History_Own {
+    Input: src: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(src)
+        dst = Allocate(Add(n, 1))
+        MemoryCopy(dst, src, n)
+        SetByte(dst, n, 0)
+        ReturnValue(dst)
+    }
+}
+
+Function.History_SetStr {
+    Input: msg: Address
+    Input: key: Address
+    Input: value: Address
+    Body: {
+        owned = History_Own(value)
+        JSON.SetString(msg, key, owned)
+    }
+}
+
+Function.History_FreeDropped {
+    Input: arr: Address
+    Input: start: Integer
+    Input: n: Integer
+    Body: {
+        IfCondition Or(EqualTo(arr, 0), LessEqual(n, 0)) ThenBlock: { ReturnValue(0) }
+        i = start
+        end = Add(start, n)
+        total = JSON.ArrayLength(arr)
+        IfCondition GreaterThan(end, total) ThenBlock: { end = total }
+        WhileLoop LessThan(i, end) {
+            JSON.Free(JSON.ArrayGet(arr, i))
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// APPENDERS
+// =============================================================================
+
+// {role: "user", content: "<text>"}
+// Copies `text` and the role name onto the heap so eviction can JSON.Free.
+Function.History.AppendUser {
+    Input: text: Address
+    Body: {
+        History_EvictIfNeeded()
+        msg = JSON.NewObject()
+        History_SetStr(msg, "role", "user")
+        History_SetStr(msg, "content", text)
+        JSON.PushObject(HistState.messages, msg)
+        HistState.count = Add(HistState.count, 1)
+    }
+}
+
+// {role: "assistant", content: "<text>"}
+Function.History.AppendAssistantText {
+    Input: text: Address
+    Body: {
+        History_EvictIfNeeded()
+        msg = JSON.NewObject()
+        History_SetStr(msg, "role", "assistant")
+        History_SetStr(msg, "content", text)
+        JSON.PushObject(HistState.messages, msg)
+        HistState.count = Add(HistState.count, 1)
+    }
+}
+
+// {role: "assistant", content: [<blocks>]}
+// blocks_arr is a JSON array of content blocks (text + tool_use blocks).
+Function.History.AppendAssistantBlocks {
+    Input: blocks_arr: Address
+    Body: {
+        History_EvictIfNeeded()
+        msg = JSON.NewObject()
+        History_SetStr(msg, "role", "assistant")
+        JSON.SetArray(msg, "content", blocks_arr)
+        JSON.PushObject(HistState.messages, msg)
+        HistState.count = Add(HistState.count, 1)
+    }
+}
+
+// {role: "user", content: [<tool_result blocks>]}
+// blocks_arr is a JSON array of tool_result content blocks.
+Function.History.AppendToolResults {
+    Input: blocks_arr: Address
+    Body: {
+        History_EvictIfNeeded()
+        msg = JSON.NewObject()
+        History_SetStr(msg, "role", "user")
+        JSON.SetArray(msg, "content", blocks_arr)
+        JSON.PushObject(HistState.messages, msg)
+        HistState.count = Add(HistState.count, 1)
+    }
+}
+
+// Push a pre-built message object as-is (OpenAI backend uses this).
+Function.History.AppendRaw {
+    Input: msg: Address
+    Body: {
+        History_EvictIfNeeded()
+        JSON.PushObject(HistState.messages, msg)
+        HistState.count = Add(HistState.count, 1)
+    }
+}
+
+// =============================================================================
+// ACCESSORS
+// =============================================================================
+Function.History.GetMessagesArray {
+    Output: Address
+    Body: { ReturnValue(HistState.messages) 
+    }
+}
+
+Function.History.Count {
+    Output: Integer
+    Body: { ReturnValue(HistState.count) 
+    }
+}
+
+Function.History.PopLast {
+    Body: {
+        IfCondition GreaterThan(HistState.count, 0) ThenBlock: {
+            HistState.count = Subtract(HistState.count, 1)
+            old = HistState.messages
+            new_arr = JSON.NewArray()
+            i = 0
+            WhileLoop LessThan(i, HistState.count) {
+                JSON.PushObject(new_arr, JSON.AsObject(JSON.ArrayGet(old, i)))
+                i = Add(i, 1)
+            }
+            HistState.messages = new_arr
+        }
+    }
+}
+
+Function.History.GetSessionID {
+    Output: Address
+    Body: { ReturnValue(HistState.session_id) }
+}
+
+// Own the id. Callers pass stack and scratch buffers (session.txt is freed
+// right after this), and a later StringConcat reuses that storage. A stored
+// pointer then becomes a [MEM-STAGE] line and the turn is saved under that
+// key, so the real session id loads an empty shell.
+Function.History.SetSessionID {
+    Input: id: Address
+    Body: {
+        IfCondition EqualTo(id, 0) ThenBlock: {
+            HistState.session_id = 0
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(id, HistState.session_buf) ThenBlock: {
+            HistState.session_id = HistState.session_buf
+            ReturnValue(0)
+        }
+        n = StringLength(id)
+        IfCondition Or(LessThan(n, 1), GreaterThan(n, 80)) ThenBlock: {
+            HistState.session_id = 0
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(HistState.session_buf, 0) ThenBlock: {
+            HistState.session_buf = Allocate(96)
+        }
+        IfCondition EqualTo(HistState.session_buf, 0) ThenBlock: {
+            HistState.session_id = 0
+            ReturnValue(0)
+        }
+        MemoryCopy(HistState.session_buf, id, n)
+        SetByte(HistState.session_buf, n, 0)
+        HistState.session_id = HistState.session_buf
+    }
+}
+
+Function.History.GetTitle {
+    Output: Address
+    Body: { ReturnValue(HistState.title) }
+}
+
+Function.History.SetTitle {
+    Input: title: Address
+    Body: { HistState.title = title }
+}
+
+// Copy visible assistant text out of the live backend buffer. Short
+// "I'll save that" turns must not overwrite a long survey. /save reads
+// last_long if set, else last_text. Survives eviction.
+Function.History.PinAssistantText {
+    Input: text: Address
+    Body: {
+        IfCondition EqualTo(text, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(text)
+        IfCondition EqualTo(n, 0) ThenBlock: { ReturnValue(0) }
+        owned = History_Own(text)
+        IfCondition NotEqual(HistState.last_text, 0) ThenBlock: {
+            Deallocate(HistState.last_text, Add(HistState.last_text_len, 1))
+        }
+        HistState.last_text = owned
+        HistState.last_text_len = n
+        IfCondition GreaterEqual(n, HistConst.PIN_LONG) ThenBlock: {
+            owned2 = History_Own(text)
+            IfCondition NotEqual(HistState.last_long, 0) ThenBlock: {
+                Deallocate(HistState.last_long, Add(HistState.last_long_len, 1))
+            }
+            HistState.last_long = owned2
+            HistState.last_long_len = n
+        }
+    }
+}
+
+Function.History.GetPinnedText {
+    Output: Address
+    Body: {
+        IfCondition NotEqual(HistState.last_long, 0) ThenBlock: {
+            ReturnValue(HistState.last_long)
+        }
+        ReturnValue(HistState.last_text)
+    }
+}
+
+Function.History.GetPinnedLen {
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(HistState.last_long, 0) ThenBlock: {
+            ReturnValue(HistState.last_long_len)
+        }
+        ReturnValue(HistState.last_text_len)
+    }
+}
+
+Function.History.SerializeToJSON {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(HistState.messages, 0) ThenBlock: { ReturnValue("[]") }
+        ReturnValue(JSON.SerializeArray(HistState.messages))
+    }
+}
+
+Function.History.LoadFromJSON {
+    Input: json_str: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(json_str, 0) ThenBlock: { ReturnValue(0) }
+        parsed = ParseJSON(json_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        arr = JSON.AsArray(parsed)
+        IfCondition EqualTo(arr, 0) ThenBlock: {
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        IfCondition NotEqual(HistState.messages, 0) ThenBlock: {
+            History_FreeDropped(HistState.messages, 0, JSON.ArrayLength(HistState.messages))
+        }
+        HistState.messages = arr
+        HistState.count = JSON.ArrayLength(arr)
+        ReturnValue(1)
+    }
+}
+
+Function.History.Clear {
+    Body: {
+        IfCondition NotEqual(HistState.messages, 0) ThenBlock: {
+            History_FreeDropped(HistState.messages, 0, JSON.ArrayLength(HistState.messages))
+        }
+        HistState.messages = JSON.NewArray()
+        HistState.count = 0
+    }
+}

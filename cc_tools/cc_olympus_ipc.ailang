@@ -1,0 +1,507 @@
+// cc_olympus_ipc.ailang — compound VCS workflow tool for HalCode9000.
+//
+// Socket: @halcode/Olympus
+// Schema: op (required), path (optional), message (optional), n (optional)
+// Ops:    snapshot (add+commit), review (status+diff-stat), log, info, init
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCOlySys {
+    "SYS_READ":      Initialize=0
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_POLL":      Initialize=7
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_KILL":      Initialize=62
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+    "SYS_TIME":      Initialize=201
+    "POLLIN":        Initialize=1
+    "SIGKILL":       Initialize=9
+    "WNOHANG":       Initialize=1
+    "TIMEOUT_S":     Initialize=30
+}
+
+FixedPool.CCOlyConst {
+    "SOCK_PATH":  Initialize="@halcode/Olympus", CanChange=True
+    "BACKLOG":    Initialize=8
+    "MAX_OUTPUT": Initialize=65536
+    "READ_CHUNK": Initialize=4096
+}
+
+FixedPool.CCOlyState {
+    "schema":    Initialize=0,  CanChange=True
+    "listen_fd": Initialize=-1, CanChange=True
+    "running":   Initialize=1,  CanChange=True
+}
+
+// =============================================================================
+// ENVP FROM /proc/self/environ
+// =============================================================================
+
+Function.CCOly_GetEnvp {
+    Input: env_data_out: Address
+    Output: Address
+    Body: {
+        StoreValue(env_data_out, 0)
+        fd = SystemCall(CCOlySys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        env_data = Allocate(65536)
+        n = SystemCall(CCOlySys.SYS_READ, fd, env_data, 65536, 0, 0)
+        SystemCall(CCOlySys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(env_data, 65536)
+            ReturnValue(0)
+        }
+        envp = Allocate(8200)
+        pos  = 0
+        idx  = 0
+        WhileLoop LessThan(pos, n) {
+            start = pos
+            WhileLoop LessThan(pos, n) {
+                IfCondition EqualTo(GetByte(env_data, pos), 0) ThenBlock: {
+                    pos = Add(pos, 1)
+                    BreakLoop
+                }
+                pos = Add(pos, 1)
+            }
+            IfCondition GreaterThan(pos, Add(start, 1)) ThenBlock: {
+                StoreValue(Add(envp, Multiply(idx, 8)), Add(env_data, start))
+                idx = Add(idx, 1)
+            }
+        }
+        StoreValue(Add(envp, Multiply(idx, 8)), 0)
+        StoreValue(env_data_out, env_data)
+        ReturnValue(envp)
+    }
+}
+
+// =============================================================================
+// SHELL RUNNER: /bin/sh -c cmd -> "exit=N\n<output>"
+// =============================================================================
+
+Function.CCOly_RunShell {
+    Input: cmd: Address
+    Output: Address
+    Body: {
+        deadline = Add(SystemCall(CCOlySys.SYS_TIME, 0, 0, 0, 0, 0), CCOlySys.TIMEOUT_S)
+
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0),  "/bin/sh")
+        StoreValue(Add(argv, 8),  "-c")
+        StoreValue(Add(argv, 16), cmd)
+        StoreValue(Add(argv, 24), 0)
+
+        env_data_holder = Allocate(8)
+        StoreValue(env_data_holder, 0)
+        envp     = CCOly_GetEnvp(env_data_holder)
+        env_data = Dereference(env_data_holder)
+        Deallocate(env_data_holder, 8)
+
+        pf = Allocate(8)
+        pr = SystemCall(CCOlySys.SYS_PIPE, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)  Deallocate(argv, 32)
+            IfCondition NotEqual(envp,     0) ThenBlock: { Deallocate(envp,     8200) }
+            IfCondition NotEqual(env_data, 0) ThenBlock: { Deallocate(env_data, 65536) }
+            ReturnValue(0)
+        }
+        pipe_r = Dereference(pf, "dword")
+        pipe_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+
+        pid = SystemCall(CCOlySys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(CCOlySys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCOlySys.SYS_DUP2,  pipe_w, 1, 0, 0, 0)
+            SystemCall(CCOlySys.SYS_DUP2,  pipe_w, 2, 0, 0, 0)
+            SystemCall(CCOlySys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            SystemCall(CCOlySys.SYS_EXECVE, "/bin/sh", argv, envp)
+            SystemCall(CCOlySys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(CCOlySys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+            SystemCall(CCOlySys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            Deallocate(argv, 32)
+            IfCondition NotEqual(envp,     0) ThenBlock: { Deallocate(envp,     8200) }
+            IfCondition NotEqual(env_data, 0) ThenBlock: { Deallocate(env_data, 65536) }
+            ReturnValue(0)
+        }
+
+        SystemCall(CCOlySys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+        Deallocate(argv, 32)
+        IfCondition NotEqual(envp,     0) ThenBlock: { Deallocate(envp,     8200) }
+        IfCondition NotEqual(env_data, 0) ThenBlock: { Deallocate(env_data, 65536) }
+
+        pfd       = Allocate(8)
+        out       = Allocate(Add(CCOlyConst.MAX_OUTPUT, 64))
+        used      = 0
+        chunk     = Allocate(CCOlyConst.READ_CHUNK)
+        timed_out = 0
+        body_off  = 32
+
+        WhileLoop 1 {
+            now = SystemCall(CCOlySys.SYS_TIME, 0, 0, 0, 0, 0)
+            IfCondition GreaterEqual(now, deadline) ThenBlock: { timed_out = 1  BreakLoop }
+            free_room = Subtract(CCOlyConst.MAX_OUTPUT, used)
+            IfCondition LessEqual(free_room, 0) ThenBlock: { BreakLoop }
+            remain_ms = Multiply(Subtract(deadline, now), 1000)
+            IfCondition GreaterThan(remain_ms, 1000) ThenBlock: { remain_ms = 1000 }
+            StoreValue(pfd, pipe_r, "dword")
+            SetByte(pfd, 4, CCOlySys.POLLIN)
+            SetByte(pfd, 5, 0)  SetByte(pfd, 6, 0)  SetByte(pfd, 7, 0)
+            poll_r = SystemCall(CCOlySys.SYS_POLL, pfd, 1, remain_ms, 0, 0)
+            IfCondition LessThan(poll_r, 0) ThenBlock: { BreakLoop }
+            IfCondition GreaterThan(poll_r, 0) ThenBlock: {
+                want = CCOlyConst.READ_CHUNK
+                IfCondition GreaterThan(want, free_room) ThenBlock: { want = free_room }
+                n = SystemCall(CCOlySys.SYS_READ, pipe_r, chunk, want, 0, 0)
+                IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+                i = 0
+                WhileLoop LessThan(i, n) {
+                    SetByte(out, Add(body_off, Add(used, i)), GetByte(chunk, i))
+                    i = Add(i, 1)
+                }
+                used = Add(used, n)
+            }
+        }
+
+        Deallocate(pfd, 8)
+        Deallocate(chunk, CCOlyConst.READ_CHUNK)
+        SystemCall(CCOlySys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
+
+        IfCondition EqualTo(timed_out, 1) ThenBlock: {
+            SystemCall(CCOlySys.SYS_KILL, pid, CCOlySys.SIGKILL, 0, 0, 0)
+            note = "\n[timed out]"
+            nlen = StringLength(note)
+            avail = Subtract(CCOlyConst.MAX_OUTPUT, used)
+            IfCondition GreaterThan(nlen, avail) ThenBlock: { nlen = avail }
+            k = 0
+            WhileLoop LessThan(k, nlen) {
+                SetByte(out, Add(body_off, Add(used, k)), GetByte(note, k))
+                k = Add(k, 1)
+            }
+            used = Add(used, nlen)
+        }
+
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        raw_status = 0
+        wi = 0
+        WhileLoop LessThan(wi, 10) {
+            wr = SystemCall(CCOlySys.SYS_WAIT4, pid, status_buf, CCOlySys.WNOHANG, 0, 0)
+            IfCondition NotEqual(wr, 0) ThenBlock: {
+                raw_status = Dereference(status_buf, "dword")
+                wi = 10
+            } ElseBlock: {
+                ts = Allocate(16)
+                StoreValue(ts, 0)
+                StoreValue(Add(ts, 8), 100000000)
+                SystemCall(35, ts, 0, 0, 0, 0)
+                Deallocate(ts, 16)
+                wi = Add(wi, 1)
+            }
+        }
+        Deallocate(status_buf, 8)
+        exit_code = BitwiseAnd(RightShift(raw_status, 8), 255)
+
+        prefix_buf = Allocate(32)
+        prefix_str = "exit="
+        plen = StringLength(prefix_str)
+        pi2  = 0
+        WhileLoop LessThan(pi2, plen) {
+            SetByte(prefix_buf, pi2, GetByte(prefix_str, pi2))
+            pi2 = Add(pi2, 1)
+        }
+        digits = NumberToString(exit_code)
+        dlen   = StringLength(digits)
+        di     = 0
+        WhileLoop LessThan(di, dlen) {
+            SetByte(prefix_buf, Add(plen, di), GetByte(digits, di))
+            di = Add(di, 1)
+        }
+        SetByte(prefix_buf, Add(plen, dlen), 10)
+        prefix_total = Add(plen, Add(dlen, 1))
+
+        final_len = Add(prefix_total, used)
+        final     = Allocate(Add(final_len, 1))
+        k2 = 0
+        WhileLoop LessThan(k2, prefix_total) {
+            SetByte(final, k2, GetByte(prefix_buf, k2))
+            k2 = Add(k2, 1)
+        }
+        m = 0
+        WhileLoop LessThan(m, used) {
+            SetByte(final, Add(prefix_total, m), GetByte(out, Add(body_off, m)))
+            m = Add(m, 1)
+        }
+        SetByte(final, final_len, 0)
+        Deallocate(prefix_buf, 32)
+        Deallocate(out, Add(CCOlyConst.MAX_OUTPUT, 64))
+        ReturnValue(final)
+    }
+}
+
+// =============================================================================
+// OP HANDLERS — build shell command, run, return result string
+// =============================================================================
+
+Function.CCOly_OpSnapshot {
+    Input: path: Address
+    Input: message: Address
+    Output: Address
+    Body: {
+        msg = message
+        IfCondition EqualTo(msg, 0) ThenBlock: { msg = "auto" }
+        cmd = "git add -A && git commit -m '"
+        cmd = StringConcat(cmd, msg)
+        cmd = StringConcat(cmd, "' 2>&1")
+        IfCondition NotEqual(path, 0) ThenBlock: {
+            prefix = StringConcat("cd '", path)
+            prefix = StringConcat(prefix, "' && ")
+            cmd    = StringConcat(prefix, cmd)
+        }
+        ReturnValue(CCOly_RunShell(cmd))
+    }
+}
+
+Function.CCOly_OpReview {
+    Input: path: Address
+    Output: Address
+    Body: {
+        cmd = "git status -s 2>&1 && echo '--- diff stat ---' && git diff --stat HEAD 2>&1 | head -40"
+        IfCondition NotEqual(path, 0) ThenBlock: {
+            prefix = StringConcat("cd '", path)
+            prefix = StringConcat(prefix, "' && ")
+            cmd    = StringConcat(prefix, cmd)
+        }
+        ReturnValue(CCOly_RunShell(cmd))
+    }
+}
+
+Function.CCOly_OpLog {
+    Input: path: Address
+    Input: n_str: Address
+    Output: Address
+    Body: {
+        n = n_str
+        IfCondition EqualTo(n, 0) ThenBlock: { n = "10" }
+        cmd = StringConcat("git log --oneline -", n)
+        cmd = StringConcat(cmd, " 2>&1")
+        IfCondition NotEqual(path, 0) ThenBlock: {
+            prefix = StringConcat("cd '", path)
+            prefix = StringConcat(prefix, "' && ")
+            cmd    = StringConcat(prefix, cmd)
+        }
+        ReturnValue(CCOly_RunShell(cmd))
+    }
+}
+
+Function.CCOly_OpInfo {
+    Input: path: Address
+    Output: Address
+    Body: {
+        cmd = "echo '=== branch ===' && git branch --show-current && echo '=== last commit ===' && git log --oneline -1 && echo '=== remote ===' && git remote -v | head -2 && echo '=== modified ===' && git status --short | wc -l"
+        cmd = StringConcat(cmd, " 2>&1")
+        IfCondition NotEqual(path, 0) ThenBlock: {
+            prefix = StringConcat("cd '", path)
+            prefix = StringConcat(prefix, "' && ")
+            cmd    = StringConcat(prefix, cmd)
+        }
+        ReturnValue(CCOly_RunShell(cmd))
+    }
+}
+
+Function.CCOly_OpInit {
+    Input: path: Address
+    Output: Address
+    Body: {
+        cmd = "git init"
+        IfCondition NotEqual(path, 0) ThenBlock: {
+            cmd = StringConcat("git init '", path)
+            cmd = StringConcat(cmd, "'")
+        }
+        cmd = StringConcat(cmd, " 2>&1")
+        ReturnValue(CCOly_RunShell(cmd))
+    }
+}
+
+// =============================================================================
+// SCHEMA + IPC BOILERPLATE
+// =============================================================================
+
+Function.CCOly_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Olympus", "Compound VCS workflow: snapshot (add+commit), review (status+diff-stat), log, info, init")
+        UtilArgs_AddField(s, "op",      "string", 1, "Operation: snapshot, review, log, info, init", "op")
+        UtilArgs_AddField(s, "path",    "path",   0, "Repository path (default: current dir)", "path")
+        UtilArgs_AddField(s, "message", "string", 0, "Commit message for snapshot (default: auto)", "message")
+        UtilArgs_AddField(s, "n",       "string", 0, "Number of log entries for log op (default: 10)", "n")
+        ReturnValue(s)
+    }
+}
+
+Function.CCOly_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCOly_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCOly_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCOlyState.schema)
+        parsed     = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+// =============================================================================
+// REQUEST DISPATCH
+// =============================================================================
+
+Function.CCOly_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCOly_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCOly_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCOly_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCOly_SendSchema(client_fd)
+            JSON.Free(parsed)  ReturnValue(0)
+        }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id        = JSON.GetString(obj, "id")
+            args      = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCOlyState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCOly_SendError(client_fd, id, "missing required argument 'op'")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            op   = UtilArgs_GetString(validated, "op")
+            path = UtilArgs_GetString(validated, "path")
+            msg  = UtilArgs_GetString(validated, "message")
+            n    = UtilArgs_GetString(validated, "n")
+            IfCondition EqualTo(op, 0) ThenBlock: {
+                CCOly_SendError(client_fd, id, "op is required")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            result = 0
+            IfCondition EqualTo(StringCompare(op, "snapshot"), 0) ThenBlock: {
+                result = CCOly_OpSnapshot(path, msg)
+            }
+            IfCondition EqualTo(StringCompare(op, "review"), 0) ThenBlock: {
+                result = CCOly_OpReview(path)
+            }
+            IfCondition EqualTo(StringCompare(op, "log"), 0) ThenBlock: {
+                result = CCOly_OpLog(path, n)
+            }
+            IfCondition EqualTo(StringCompare(op, "info"), 0) ThenBlock: {
+                result = CCOly_OpInfo(path)
+            }
+            IfCondition EqualTo(StringCompare(op, "init"), 0) ThenBlock: {
+                result = CCOly_OpInit(path)
+            }
+            IfCondition EqualTo(result, 0) ThenBlock: {
+                CCOly_SendError(client_fd, id, "unknown op or fork/exec failed")
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            CCOly_SendResult(client_fd, id, result)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+        CCOly_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+SubRoutine.Main {
+    CCOlyConst.SOCK_PATH = "@halcode/Olympus"
+    CCOlyState.schema    = CCOly_BuildSchema()
+
+    SystemCall(CCOlySys.SYS_MKDIR, "/tmp/ailang_cctools", 493, 0, 0, 0)
+    SystemCall(CCOlySys.SYS_UNLINK, CCOlyConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_olympus_ipc] socket create failed\n")
+        Exit(1)
+    }
+    Socket.BindUnix(fd, CCOlyConst.SOCK_PATH)
+    Socket.Listen(fd, CCOlyConst.BACKLOG)
+    CCOlyState.listen_fd = fd
+    PrintMessage("[cc_olympus_ipc] listening on @halcode/Olympus\n")
+
+    WhileLoop EqualTo(CCOlyState.running, 1) {
+        client_fd = Socket.Accept(CCOlyState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCOly_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Socket.Close(CCOlyState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

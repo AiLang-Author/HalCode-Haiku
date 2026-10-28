@@ -1,0 +1,3053 @@
+// halcode_desk — AppDesk MDI kernel. GTK shell only blits.
+// Writes /tmp/halcode_app/{meta.bin,frame.raw,gen.txt}
+// Reads ptr.txt (d/m/u/w/W x y) and cmd.txt (quit).
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Display.Render.Framebuffer
+LibraryImport.Display.Render.DSurfaceTypes
+LibraryImport.Display.Render.Fonts
+LibraryImport.Display.Theme.UIScale
+LibraryImport.Applications.AppDesk
+LibraryImport.Display.UI.InputBar
+LibraryImport.JSON
+
+Function.DebugLog_Push {
+    Input: tag: Address
+    Input: n: Integer
+    Output: Integer
+    Body: { ReturnValue(0) }
+}
+
+FixedPool.Desk {
+    "run":   Initialize=1, CanChange=True
+    "dirty": Initialize=1, CanChange=True
+    "hdr":   Initialize=0, CanChange=True
+    "genb":  Initialize=0, CanChange=True
+    "gen":   Initialize=0, CanChange=True
+    "fd":    Initialize=0, CanChange=True
+    "n":     Initialize=0, CanChange=True
+    "i":     Initialize=0, CanChange=True
+    "x":     Initialize=0, CanChange=True
+    "y":     Initialize=0, CanChange=True
+    "w":     Initialize=0, CanChange=True
+    "c":     Initialize=0, CanChange=True
+    "ptr":   Initialize=0, CanChange=True
+    "cmd":   Initialize=0, CanChange=True
+    "mx":    Initialize=0, CanChange=True
+    "my":    Initialize=0, CanChange=True
+    "ts":    Initialize=0, CanChange=True
+    "chat":  Initialize=-1, CanChange=True
+    "files": Initialize=-1, CanChange=True
+    "tools": Initialize=-1, CanChange=True
+    "dst":   Initialize=0, CanChange=True
+    "dp":    Initialize=0, CanChange=True
+    "zi":    Initialize=0, CanChange=True
+    "idx":   Initialize=0, CanChange=True
+    "cx":    Initialize=0, CanChange=True
+    "cy":    Initialize=0, CanChange=True
+    "h2":     Initialize=0, CanChange=True
+    "wx":     Initialize=0, CanChange=True
+    "wi":     Initialize=0, CanChange=True
+    "sx":     Initialize=0, CanChange=True
+    "inbuf":  Initialize=0, CanChange=True
+    "inlen":  Initialize=0, CanChange=True
+    "infocus": Initialize=1, CanChange=True
+    "keys":   Initialize=0, CanChange=True
+    "logbase": Initialize=0, CanChange=True
+    "logn":   Initialize=0, CanChange=True
+    "line":   Initialize=0, CanChange=True
+    "kch":    Initialize=0, CanChange=True
+    "bx":     Initialize=0, CanChange=True
+    "by":     Initialize=0, CanChange=True
+    "bw":     Initialize=0, CanChange=True
+    "wincfg": Initialize=-1, CanChange=True
+    "winmod": Initialize=-1, CanChange=True
+    "winses": Initialize=-1, CanChange=True
+    "modptr": Initialize=0, CanChange=True
+    "nmod":   Initialize=0, CanChange=True
+    "curmod": Initialize=-1, CanChange=True
+    "prvbase": Initialize=0, CanChange=True
+    "nprv":   Initialize=0, CanChange=True
+    "curprv": Initialize=-1, CanChange=True
+    "auto":   Initialize=0, CanChange=True
+    "tcomp":  Initialize=0, CanChange=True
+    "reason": Initialize=2, CanChange=True
+    "row":    Initialize=0, CanChange=True
+    "mp":     Initialize=0, CanChange=True
+    "rbuf":   Initialize=0, CanChange=True
+    "proj":   Initialize=0, CanChange=True
+    "thread": Initialize=0, CanChange=True
+    "state":  Initialize=0, CanChange=True
+    "sesbase": Initialize=0, CanChange=True
+    "sesids": Initialize=0, CanChange=True
+    "sesn":   Initialize=0, CanChange=True
+    "sesact": Initialize=-1, CanChange=True
+    "pick":   Initialize=0, CanChange=True
+    "picked": Initialize=0, CanChange=True
+    "chose":  Initialize=1, CanChange=True
+    "kind":   Initialize=0, CanChange=True
+    "logoff": Initialize=0, CanChange=True
+    "logcap": Initialize=500, CanChange=True
+    "lln":    Initialize=256, CanChange=True
+    "fsurf":  Initialize=0, CanChange=True
+    "fused":  Initialize=0, CanChange=True
+    "flh":    Initialize=16, CanChange=True
+    "fbl":    Initialize=12, CanChange=True
+    "vis":    Initialize=12, CanChange=True
+    "chatvis": Initialize=12, CanChange=True
+    "thkvis": Initialize=8, CanChange=True
+    "winthk": Initialize=-1, CanChange=True
+    "thkbase": Initialize=0, CanChange=True
+    "thkn":   Initialize=0, CanChange=True
+    "thkoff": Initialize=0, CanChange=True
+    "wait":   Initialize=0, CanChange=True
+    "waiti":  Initialize=-1, CanChange=True
+    "wtick":  Initialize=0, CanChange=True
+    "qbuf":   Initialize=0, CanChange=True
+    "qarr":   Initialize=0, CanChange=True
+    "qn":     Initialize=0, CanChange=True
+    "qrng":   Initialize=42, CanChange=True
+    "qstr":   Initialize=0, CanChange=True
+    "qoff":   Initialize=0, CanChange=True
+    "qsec":   Initialize=0, CanChange=True
+    "bar":    Initialize=-1, CanChange=True
+    "poff":   Initialize=0, CanChange=True
+    "pend":   Initialize=0, CanChange=True
+    "bv":     Initialize=0, CanChange=True
+    "bdv":    Initialize=48, CanChange=True
+    "barh":   Initialize=24, CanChange=True
+    "logh":   Initialize=200, CanChange=True
+    "fcw":    Initialize=8, CanChange=True
+    "fsz":    Initialize=16, CanChange=True
+    "warmi":  Initialize=0, CanChange=True
+    "warmn":  Initialize=0, CanChange=True
+    "sbw":    Initialize=8, CanChange=True
+    "wbuf":   Initialize=0, CanChange=True
+    "wpx":    Initialize=400, CanChange=True
+    "slen":   Initialize=0, CanChange=True
+    "oldh":   Initialize=0, CanChange=True
+    "oldw":   Initialize=0, CanChange=True
+    "wk":     Initialize=0, CanChange=True
+    "ssrc":   Initialize=0, CanChange=True
+    "s0l":    Initialize=0, CanChange=True
+    "s0c":    Initialize=0, CanChange=True
+    "s1l":    Initialize=0, CanChange=True
+    "s1c":    Initialize=0, CanChange=True
+    "li":     Initialize=0, CanChange=True
+    "sa":     Initialize=0, CanChange=True
+    "sb":     Initialize=0, CanChange=True
+    "pgen":   Initialize=0, CanChange=True
+    "pbuf":   Initialize=0, CanChange=True
+    "prvoff": Initialize=0, CanChange=True
+    "modoff": Initialize=0, CanChange=True
+    "modn":   Initialize=0, CanChange=True
+    "sesoff": Initialize=0, CanChange=True
+    "kmode":  Initialize=0, CanChange=True
+    "klen":   Initialize=0, CanChange=True
+    "kbuf":   Initialize=0, CanChange=True
+    "kprv":   Initialize=-1, CanChange=True
+}
+
+Function.Desk_LE32 {
+    Input: buf: Address
+    Input: off: Integer
+    Input: val: Integer
+    Body: {
+        SetByte(buf, off, BitwiseAnd(val, 255))
+        SetByte(buf, Add(off, 1), BitwiseAnd(ShiftRight(val, 8), 255))
+        SetByte(buf, Add(off, 2), BitwiseAnd(ShiftRight(val, 16), 255))
+        SetByte(buf, Add(off, 3), BitwiseAnd(ShiftRight(val, 24), 255))
+    }
+}
+
+Function.Desk_Atoi {
+    Input: s: Address
+    Output: Integer
+    Body: {
+        Desk.x = 0
+        Desk.w = 0
+        WhileLoop LessThan(Desk.x, 80) {
+            Desk.c = GetByte(s, Desk.x)
+            IfCondition EqualTo(Desk.c, 0) ThenBlock: { ReturnValue(Desk.w) }
+            IfCondition And(GreaterEqual(Desk.c, 48), LessEqual(Desk.c, 57)) ThenBlock: {
+                Desk.w = Add(Multiply(Desk.w, 10), Subtract(Desk.c, 48))
+            }
+            IfCondition EqualTo(Desk.c, 32) ThenBlock: {
+                IfCondition GreaterThan(Desk.w, 0) ThenBlock: { ReturnValue(Desk.w) }
+            }
+            Desk.x = Add(Desk.x, 1)
+        }
+        ReturnValue(Desk.w)
+    }
+}
+
+Function.Desk_ParseXY {
+    Output: Integer
+    Body: {
+        Desk.mx = 0
+        Desk.my = 0
+        Desk.i = 1
+        Desk.n = 0
+        WhileLoop LessThan(Desk.i, 80) {
+            Desk.c = GetByte(Desk.ptr, Desk.i)
+            IfCondition EqualTo(Desk.c, 0) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(Desk.c, 32) ThenBlock: {
+                IfCondition EqualTo(Desk.n, 0) ThenBlock: {
+                    Desk.mx = Desk_Atoi(Add(Desk.ptr, Add(Desk.i, 1)))
+                    Desk.n = 1
+                }
+                ElseBlock: {
+                    Desk.my = Desk_Atoi(Add(Desk.ptr, Add(Desk.i, 1)))
+                    ReturnValue(1)
+                }
+            }
+            Desk.i = Add(Desk.i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Desk_Sleep {
+    Input: ms: Integer
+    Body: {
+        IfCondition EqualTo(Desk.ts, 0) ThenBlock: { Desk.ts = Allocate(16) }
+        IfCondition LessThan(ms, 1) ThenBlock: { ms = 1 }
+        StoreValue(Desk.ts, Divide(ms, 1000))
+        StoreValue(Add(Desk.ts, 8), Multiply(Modulo(ms, 1000), 1000000))
+        SystemCall(35, Desk.ts, 0, 0, 0, 0)
+    }
+}
+
+Function.Desk_EnsureIpc {
+    Body: {
+        SystemCall(83, "/tmp/halcode_app", 493, 0, 0, 0)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/cmd.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/ptr.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/keys.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        IfCondition EqualTo(Desk.inbuf, 0) ThenBlock: { Desk.inbuf = Allocate(80) }
+        IfCondition EqualTo(Desk.line, 0) ThenBlock: { Desk.line = Allocate(80) }
+        IfCondition EqualTo(Desk.wbuf, 0) ThenBlock: { Desk.wbuf = Allocate(256) }
+        IfCondition EqualTo(Desk.logbase, 0) ThenBlock: { Desk.logbase = Allocate(128000) }
+        IfCondition EqualTo(Desk.rbuf, 0) ThenBlock: { Desk.rbuf = Allocate(8192) }
+        IfCondition EqualTo(Desk.thkbase, 0) ThenBlock: { Desk.thkbase = Allocate(128000) }
+        IfCondition EqualTo(Desk.proj, 0) ThenBlock: { Desk.proj = Allocate(80) }
+        IfCondition EqualTo(Desk.thread, 0) ThenBlock: { Desk.thread = Allocate(80) }
+        IfCondition EqualTo(Desk.state, 0) ThenBlock: { Desk.state = Allocate(200) }
+        IfCondition EqualTo(Desk.sesbase, 0) ThenBlock: { Desk.sesbase = Allocate(648) }
+        IfCondition EqualTo(Desk.sesids, 0) ThenBlock: { Desk.sesids = Allocate(648) }
+        IfCondition EqualTo(Desk.pick, 0) ThenBlock: { Desk.pick = Allocate(2048) }
+        IfCondition EqualTo(Desk.prvbase, 0) ThenBlock: { Desk.prvbase = Allocate(640) }
+        IfCondition EqualTo(Desk.kbuf, 0) ThenBlock: { Desk.kbuf = Allocate(512) }
+        IfCondition NotEqual(Desk.kbuf, 0) ThenBlock: { SetByte(Desk.kbuf, 0, 0) }
+        SetByte(Desk.inbuf, 0, 0)
+        SetByte(Desk.proj, 0, 0)
+        SetByte(Desk.thread, 0, 0)
+        SetByte(Desk.state, 0, 0)
+        Desk.inlen = 0
+        Desk.logn = 0
+        Desk.sesn = 0
+        Desk.picked = 0
+    }
+}
+
+Function.Desk_DrawBtn {
+    Input: x: Integer
+    Input: y: Integer
+    Input: w: Integer
+    Input: h: Integer
+    Input: lab: Address
+    Input: on: Integer
+    Body: {
+        IfCondition EqualTo(on, 1) ThenBlock: {
+            FB_FillRect(x, y, w, h, FB_RGB(10, 72, 74))
+            FB_Rect(x, y, w, h, FB_RGB(0, 196, 198))
+        }
+        ElseBlock: {
+            FB_FillRect(x, y, w, h, FB_RGB(36, 44, 58))
+            FB_Rect(x, y, w, h, FB_RGB(90, 110, 130))
+        }
+        Desk.n = Divide(Subtract(w, 16), Desk.fcw)
+        IfCondition LessThan(Desk.n, 1) ThenBlock: { Desk.n = 1 }
+        IfCondition GreaterThan(Desk.n, 78) ThenBlock: { Desk.n = 78 }
+        Desk.i = 0
+        WhileLoop And(LessThan(Desk.i, Desk.n), NotEqual(GetByte(lab, Desk.i), 0)) {
+            SetByte(Desk.line, Desk.i, GetByte(lab, Desk.i))
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(Desk.line, Desk.i, 0)
+        IfCondition EqualTo(on, 1) ThenBlock: {
+            Desk_DrawTxt(Add(x, 8), Add(y, Divide(Subtract(h, Desk.flh), 2)), Desk.line, FB_RGB(0, 220, 222))
+        }
+        ElseBlock: {
+            Desk_DrawTxt(Add(x, 8), Add(y, Divide(Subtract(h, Desk.flh), 2)), Desk.line, FB_RGB(232, 238, 248))
+        }
+    }
+}
+
+Function.Desk_DrawVScroll {
+    Input: x: Integer
+    Input: y: Integer
+    Input: h: Integer
+    Input: vis: Integer
+    Input: tot: Integer
+    Input: off: Integer
+    Body: {
+        IfCondition LessEqual(h, 8) ThenBlock: { ReturnValue(0) }
+        FB_FillRect(x, y, Desk.sbw, h, FB_RGB(16, 20, 28))
+        Desk.n = tot
+        IfCondition LessThan(Desk.n, vis) ThenBlock: { Desk.n = vis }
+        IfCondition LessThan(Desk.n, 1) ThenBlock: { Desk.n = 1 }
+        Desk.w = Divide(Multiply(h, vis), Desk.n)
+        IfCondition LessThan(Desk.w, 10) ThenBlock: { Desk.w = 10 }
+        IfCondition GreaterThan(Desk.w, h) ThenBlock: { Desk.w = h }
+        Desk.i = off
+        IfCondition LessThan(Desk.i, 0) ThenBlock: { Desk.i = 0 }
+        Desk.i = Divide(Multiply(h, Desk.i), Desk.n)
+        IfCondition GreaterThan(Add(Desk.i, Desk.w), h) ThenBlock: {
+            Desk.i = Subtract(h, Desk.w)
+        }
+        FB_FillRect(x, Add(y, Desk.i), Desk.sbw, Desk.w, FB_RGB(0, 196, 198))
+    }
+}
+
+Function.Desk_HitVScroll {
+    Input: y: Integer
+    Input: h: Integer
+    Input: vis: Integer
+    Input: tot: Integer
+    Output: Integer
+    Body: {
+        IfCondition Or(LessEqual(tot, vis), LessEqual(h, 1)) ThenBlock: { ReturnValue(0) }
+        Desk.n = Subtract(Desk.my, y)
+        IfCondition LessThan(Desk.n, 0) ThenBlock: { Desk.n = 0 }
+        IfCondition GreaterThan(Desk.n, h) ThenBlock: { Desk.n = h }
+        Desk.i = Divide(Multiply(Desk.n, tot), h)
+        IfCondition GreaterThan(Desk.i, Subtract(tot, vis)) ThenBlock: {
+            Desk.i = Subtract(tot, vis)
+        }
+        IfCondition LessThan(Desk.i, 0) ThenBlock: { Desk.i = 0 }
+        ReturnValue(Desk.i)
+    }
+}
+
+Function.Desk_InWin {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(idx, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(Desk.mx, AppDesk.CX(idx)) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(Desk.my, AppDesk.CY(idx)) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.mx, Add(AppDesk.CX(idx), AppDesk.CW(idx))) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.my, Add(AppDesk.CY(idx), AppDesk.CH(idx))) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_HitBtn {
+    Input: x: Integer
+    Input: y: Integer
+    Input: w: Integer
+    Input: h: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(Desk.mx, x) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(Desk.my, y) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.mx, Add(x, w)) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.my, Add(y, h)) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_DoNew {
+    Body: {
+        Desk.logn = 0
+        Desk.logoff = 0
+        Desk.thkn = 0
+        Desk.thkoff = 0
+        Desk.wait = 0
+        Desk.waiti = -1
+        Desk.ssrc = 0
+        InputBar.Clear()
+        Desk_WriteFile("/tmp/halcode_app/session.txt", "new")
+        Desk.chose = 1
+        Desk.sesact = 0
+        Desk_LogPush("new conversation")
+        AppDesk.Raise(Desk.chat)
+        Desk.infocus = 1
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_DoResume {
+    Body: {
+        Desk_WriteFile("/tmp/halcode_app/session.txt", "last")
+        Desk.chose = 1
+        Desk.sesact = 1
+        Desk_LogPush("resume last pgmem session")
+        AppDesk.Raise(Desk.chat)
+        Desk.infocus = 1
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_WriteFile {
+    Input: path: Address
+    Input: src: Address
+    Body: {
+        Desk.fd = SystemCall(2, path, 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: {
+            SystemCall(1, Desk.fd, src, StringLength(src), 0, 0)
+            SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+Function.Desk_Note {
+    Input: src: Address
+    Body: {
+        Desk_LogPush(src)
+        PrintMessage("[desk] ")
+        PrintMessage(src)
+        PrintMessage("\n")
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_KeyWipe {
+    Body: {
+        IfCondition NotEqual(Desk.kbuf, 0) ThenBlock: {
+            Desk.i = 0
+            WhileLoop LessEqual(Desk.i, Desk.klen) {
+                SetByte(Desk.kbuf, Desk.i, 0)
+                Desk.i = Add(Desk.i, 1)
+            }
+        }
+        Desk.klen = 0
+        Desk.kmode = 0
+    }
+}
+
+Function.Desk_KeyPush {
+    Input: ch: Integer
+    Body: {
+        IfCondition EqualTo(Desk.kbuf, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition Or(EqualTo(ch, 10), EqualTo(ch, 13)) ThenBlock: { ReturnValue(0) }
+        IfCondition Or(LessThan(ch, 32), GreaterThan(ch, 126)) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.klen, 240) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.kbuf, Desk.klen, ch)
+        Desk.klen = Add(Desk.klen, 1)
+        SetByte(Desk.kbuf, Desk.klen, 0)
+    }
+}
+
+Function.Desk_SaveKey {
+    Body: {
+        IfCondition LessThan(Desk.kprv, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(Desk.klen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.kbuf, 0) ThenBlock: { ReturnValue(0) }
+        Desk.mp = Add(Desk.prvbase, Multiply(Desk.kprv, 16))
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/keysave.tmp", 577, 384, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: {
+            Desk_Note("configure: could not save")
+            ReturnValue(0)
+        }
+        Desk.n = 0
+        WhileLoop And(LessThan(Desk.n, 15), NotEqual(GetByte(Desk.mp, Desk.n), 0)) {
+            Desk.n = Add(Desk.n, 1)
+        }
+        SystemCall(1, Desk.fd, Desk.mp, Desk.n, 0, 0)
+        SetByte(Desk.line, 0, 10)
+        SystemCall(1, Desk.fd, Desk.line, 1, 0, 0)
+        SystemCall(1, Desk.fd, Desk.kbuf, Desk.klen, 0, 0)
+        SystemCall(1, Desk.fd, Desk.line, 1, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        Desk.fd = SystemCall(82, "/tmp/halcode_app/keysave.tmp", "/tmp/halcode_app/keysave.txt", 0, 0, 0)
+        IfCondition NotEqual(Desk.fd, 0) ThenBlock: {
+            SystemCall(87, "/tmp/halcode_app/keysave.tmp", 0, 0, 0, 0)
+            Desk_Note("configure: could not save")
+            ReturnValue(0)
+        }
+        Desk_CopyZ(Desk.line, "saving key for ")
+        Desk.i = StringLength(Desk.line)
+        Desk.n = 0
+        Desk.sx = Desk_ProvLabel(Desk.mp)
+        WhileLoop And(LessThan(Desk.i, 78), NotEqual(GetByte(Desk.sx, Desk.n), 0)) {
+            SetByte(Desk.line, Desk.i, GetByte(Desk.sx, Desk.n))
+            Desk.i = Add(Desk.i, 1)
+            Desk.n = Add(Desk.n, 1)
+        }
+        SetByte(Desk.line, Desk.i, 0)
+        Desk_KeyWipe()
+        Desk_Note(Desk.line)
+    }
+}
+
+Function.Desk_LogConfigure {
+    Body: {
+        Desk.mp = Add(Desk.prvbase, Multiply(Desk.curprv, 16))
+        Desk.sx = Desk_ProvLabel(Desk.mp)
+        Desk_CopyZ(Desk.line, "Configure ")
+        Desk.i = StringLength(Desk.line)
+        Desk.n = 0
+        WhileLoop And(LessThan(Desk.i, 28), NotEqual(GetByte(Desk.sx, Desk.n), 0)) {
+            SetByte(Desk.line, Desk.i, GetByte(Desk.sx, Desk.n))
+            Desk.i = Add(Desk.i, 1)
+            Desk.n = Add(Desk.n, 1)
+        }
+        Desk.sx = ": paste the API key, Enter saves, Esc cancels"
+        Desk.n = 0
+        WhileLoop And(LessThan(Desk.i, 78), NotEqual(GetByte(Desk.sx, Desk.n), 0)) {
+            SetByte(Desk.line, Desk.i, GetByte(Desk.sx, Desk.n))
+            Desk.i = Add(Desk.i, 1)
+            Desk.n = Add(Desk.n, 1)
+        }
+        SetByte(Desk.line, Desk.i, 0)
+        Desk_Note(Desk.line)
+    }
+}
+
+Function.Desk_DrawKeyStatus {
+    Input: x: Integer
+    Input: y: Integer
+    Body: {
+        IfCondition NotEqual(Desk.kmode, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(Desk.kprv, 0) ThenBlock: { ReturnValue(0) }
+        Desk.mp = Add(Desk.prvbase, Multiply(Desk.kprv, 16))
+        Desk.sx = Desk_ProvLabel(Desk.mp)
+        Desk.i = 0
+        WhileLoop And(LessThan(Desk.i, 16), NotEqual(GetByte(Desk.sx, Desk.i), 0)) {
+            SetByte(Desk.line, Desk.i, GetByte(Desk.sx, Desk.i))
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(Desk.line, Desk.i, 32)
+        Desk.i = Add(Desk.i, 1)
+        Desk.w = Desk.klen
+        IfCondition GreaterEqual(Desk.w, 100) ThenBlock: {
+            SetByte(Desk.line, Desk.i, Add(48, Divide(Desk.w, 100)))
+            Desk.i = Add(Desk.i, 1)
+            Desk.w = Modulo(Desk.w, 100)
+            SetByte(Desk.line, Desk.i, Add(48, Divide(Desk.w, 10)))
+            Desk.i = Add(Desk.i, 1)
+            Desk.w = Modulo(Desk.w, 10)
+        }
+        ElseBlock: {
+            IfCondition GreaterEqual(Desk.w, 10) ThenBlock: {
+                SetByte(Desk.line, Desk.i, Add(48, Divide(Desk.w, 10)))
+                Desk.i = Add(Desk.i, 1)
+                Desk.w = Modulo(Desk.w, 10)
+            }
+        }
+        SetByte(Desk.line, Desk.i, Add(48, Desk.w))
+        Desk.i = Add(Desk.i, 1)
+        Desk.sx = " chars  Enter saves  Esc cancels"
+        Desk.n = 0
+        WhileLoop And(LessThan(Desk.i, 78), NotEqual(GetByte(Desk.sx, Desk.n), 0)) {
+            SetByte(Desk.line, Desk.i, GetByte(Desk.sx, Desk.n))
+            Desk.i = Add(Desk.i, 1)
+            Desk.n = Add(Desk.n, 1)
+        }
+        SetByte(Desk.line, Desk.i, 0)
+        Desk_DrawTxt(x, y, Desk.line, FB_RGB(0, 196, 198))
+    }
+}
+
+Function.Desk_PollKeyResult {
+    Body: {
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/keyresult.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.rbuf, 80, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        SystemCall(87, "/tmp/halcode_app/keyresult.txt", 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.rbuf, Desk.n, 0)
+        IfCondition EqualTo(GetByte(Desk.rbuf, 0), 111) ThenBlock: {
+            Desk_CopyZ(Desk.line, "key saved for ")
+            Desk.i = StringLength(Desk.line)
+            Desk.x = 3
+            WhileLoop And(LessThan(Desk.i, 78), And(NotEqual(GetByte(Desk.rbuf, Desk.x), 0), NotEqual(GetByte(Desk.rbuf, Desk.x), 10))) {
+                SetByte(Desk.line, Desk.i, GetByte(Desk.rbuf, Desk.x))
+                Desk.i = Add(Desk.i, 1)
+                Desk.x = Add(Desk.x, 1)
+            }
+            SetByte(Desk.line, Desk.i, 0)
+            Desk_Note(Desk.line)
+        }
+        ElseBlock: {
+            Desk_Note("configure failed")
+        }
+    }
+}
+
+Function.Desk_BindSurf {
+    Body: {
+        IfCondition EqualTo(Desk.fsurf, 0) ThenBlock: {
+            Desk.fsurf = Allocate(SurfaceConst.HEADER_SIZE)
+        }
+        IfCondition EqualTo(Desk.fsurf, 0) ThenBlock: { ReturnValue(0) }
+        StoreValue(Add(Desk.fsurf, SurfaceFields.FORMAT), SurfaceFormat.PIXEL_32)
+        StoreValue(Add(Desk.fsurf, SurfaceFields.WIDTH), FB.width)
+        StoreValue(Add(Desk.fsurf, SurfaceFields.HEIGHT), FB.height)
+        StoreValue(Add(Desk.fsurf, SurfaceFields.PITCH), FB.pitch)
+        StoreValue(Add(Desk.fsurf, SurfaceFields.DATA), FB_GetDrawBuffer())
+    }
+}
+
+Function.Desk_ApplyFontMetrics {
+    Body: {
+        Desk.flh = Add(VFont_GetLineHeight(), 6)
+        Desk.fbl = VFont_GetBaseline()
+        IfCondition LessThan(Desk.flh, 18) ThenBlock: { Desk.flh = 18 }
+        SetByte(Desk.line, 0, 77)
+        SetByte(Desk.line, 1, 0)
+        Desk.fcw = VFont_MeasureWidth(Desk.line, 1)
+        IfCondition LessThan(Desk.fcw, 6) ThenBlock: { Desk.fcw = 6 }
+        Desk.sbw = UIScale.scrollbar_w
+        IfCondition LessThan(Desk.sbw, 8) ThenBlock: { Desk.sbw = 8 }
+        Desk_BindSurf()
+        InputBar.SetMetrics(Desk.fcw, Desk.flh, 1, Desk.fsurf)
+        Desk_Dbg("vfont metrics")
+    }
+}
+
+Function.Desk_VFontInit {
+    Body: {
+        Desk.fused = 0
+        Desk.warmi = 0
+        Desk.warmn = 0
+        Desk.flh = 16
+        Desk.fbl = 12
+        Desk.fcw = 8
+        IfCondition EqualTo(VIF_Init(), 0) ThenBlock: {
+            Desk_Dbg("vif init fail")
+            Desk.fused = -1
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(VFont_Init(), 0) ThenBlock: {
+            Desk_Dbg("vfont init fail")
+            Desk.fused = -1
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(VFont_LoadVIF("fonts/IBMPlexMono-Regular.vif"), 0) ThenBlock: {
+            IfCondition EqualTo(VFont_LoadVIF("/usr/local/share/halcode/fonts/IBMPlexMono-Regular.vif"), 0) ThenBlock: {
+                IfCondition EqualTo(VFont_LoadVIF("/home/bob/Ailang-Self-Hosting-/fonts/IBMPlexMono-Regular.vif"), 0) ThenBlock: {
+                    IfCondition EqualTo(VFont_LoadVIF("fonts/DejaVuSans.vif"), 0) ThenBlock: {
+                        IfCondition EqualTo(VFont_LoadVIF("/home/bob/Ailang-Self-Hosting-/fonts/DejaVuSans.vif"), 0) ThenBlock: {
+                            Desk_Dbg("vfont load fail")
+                            Desk.fused = -1
+                            ReturnValue(0)
+                        }
+                    }
+                }
+            }
+        }
+        Desk.fsz = UIScale.font_body
+        IfCondition LessThan(Desk.fsz, 14) ThenBlock: { Desk.fsz = 14 }
+        IfCondition GreaterThan(Desk.fsz, 28) ThenBlock: { Desk.fsz = 28 }
+        Desk.i = VFont_UseSize(Desk.fsz)
+        IfCondition LessThan(Desk.i, 0) ThenBlock: {
+            Desk_Dbg("vfont size fail")
+            Desk.fused = -1
+            ReturnValue(0)
+        }
+        Desk.warmn = FontState.glyph_count
+        IfCondition LessThan(Desk.warmn, 1) ThenBlock: { Desk.warmn = 1 }
+        Desk.warmi = 0
+        Desk_Dbg("vfont warmup")
+        PrintMessage("[desk] VFont warmup glyphs=")
+        PrintNumber(Desk.warmn)
+        PrintMessage(" size=")
+        PrintNumber(Desk.fsz)
+        PrintMessage("\n")
+    }
+}
+
+Function.Desk_WarmTick {
+    Body: {
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.fused, -1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.warmn, 0) ThenBlock: {
+            Desk_VFontInit()
+            ReturnValue(0)
+        }
+        Desk.n = 0
+        WhileLoop And(LessThan(Desk.n, 3), LessThan(Desk.warmi, Desk.warmn)) {
+            VFont_RasterGlyph(Desk.warmi)
+            Desk.warmi = Add(Desk.warmi, 1)
+            Desk.n = Add(Desk.n, 1)
+        }
+        IfCondition GreaterEqual(Desk.warmi, Desk.warmn) ThenBlock: {
+            Desk.fused = 1
+            Desk_ApplyFontMetrics()
+            Desk.dirty = 1
+            PrintMessage("[desk] VFont live\n")
+            Desk_Dbg("vfont live")
+        }
+    }
+}
+
+Function.Desk_DrawTxt {
+    Input: x: Integer
+    Input: y: Integer
+    Input: src: Address
+    Input: color: Integer
+    Body: {
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+            Desk.n = StringLength(src)
+            VFont_DrawString(Desk.fsurf, src, Desk.n, x, y, color)
+        }
+        ElseBlock: {
+            FB_DrawString(x, y, src, color, -1)
+        }
+    }
+}
+
+Function.Desk_DrawTxtN {
+    Input: x: Integer
+    Input: y: Integer
+    Input: src: Address
+    Input: n: Integer
+    Input: color: Integer
+    Body: {
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+            VFont_DrawString(Desk.fsurf, src, n, x, y, color)
+        }
+        ElseBlock: {
+            Desk.li = 0
+            WhileLoop And(LessThan(Desk.li, n), LessThan(Desk.li, 79)) {
+                SetByte(Desk.line, Desk.li, GetByte(src, Desk.li))
+                Desk.li = Add(Desk.li, 1)
+            }
+            SetByte(Desk.line, Desk.li, 0)
+            FB_DrawString(x, y, Desk.line, color, -1)
+        }
+    }
+}
+
+Function.Desk_FitCount {
+    Input: src: Address
+    Input: px: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(px, 8) ThenBlock: { ReturnValue(1) }
+        Desk.c = StringLength(src)
+        IfCondition LessEqual(Desk.c, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+            Desk.wk = VFont_PixelToCol(src, Desk.c, px)
+            IfCondition GreaterThan(Desk.wk, Desk.c) ThenBlock: { ReturnValue(Desk.c) }
+            IfCondition LessThan(Desk.wk, 1) ThenBlock: { ReturnValue(1) }
+            ReturnValue(Desk.wk)
+        }
+        Desk.wk = Divide(px, 8)
+        IfCondition LessThan(Desk.wk, 1) ThenBlock: { Desk.wk = 1 }
+        IfCondition GreaterThan(Desk.wk, Desk.c) ThenBlock: { ReturnValue(Desk.c) }
+        ReturnValue(Desk.wk)
+    }
+}
+
+Function.Desk_DrawLogLine {
+    Body: {
+        Desk.wk = Desk.i
+        Desk.sa = 0
+        Desk.kch = 0
+        IfCondition And(EqualTo(GetByte(Desk.mp, 0), 85), EqualTo(GetByte(Desk.mp, 1), 83)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(Desk.mp, 2), 69), EqualTo(GetByte(Desk.mp, 3), 82)) ThenBlock: {
+                IfCondition EqualTo(GetByte(Desk.mp, 4), 58) ThenBlock: {
+                    Desk.sa = 5
+                    Desk.kch = 1
+                }
+            }
+        }
+        IfCondition And(EqualTo(GetByte(Desk.mp, 0), 121), EqualTo(GetByte(Desk.mp, 1), 111)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(Desk.mp, 2), 117), EqualTo(GetByte(Desk.mp, 3), 58)) ThenBlock: {
+                Desk.sa = 4
+                Desk.kch = 1
+            }
+        }
+        IfCondition And(EqualTo(GetByte(Desk.mp, 0), 72), EqualTo(GetByte(Desk.mp, 1), 65)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(Desk.mp, 2), 76), EqualTo(GetByte(Desk.mp, 3), 58)) ThenBlock: { Desk.sa = 4 }
+        }
+        IfCondition And(EqualTo(GetByte(Desk.mp, 0), 104), EqualTo(GetByte(Desk.mp, 1), 97)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(Desk.mp, 2), 108), EqualTo(GetByte(Desk.mp, 3), 58)) ThenBlock: { Desk.sa = 4 }
+        }
+        IfCondition EqualTo(Desk.sa, 0) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.cx, 12), Desk.y, Desk.mp, FB_RGB(232, 238, 248))
+            Desk.i = Desk.wk
+            ReturnValue(0)
+        }
+        Desk.sb = 0
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+            Desk.sb = VFont_MeasureWidth(Desk.mp, Desk.sa)
+        }
+        IfCondition LessThan(Desk.sb, 1) ThenBlock: {
+            Desk.sb = Multiply(Desk.sa, Desk.fcw)
+        }
+        Desk.n = FB_RGB(0, 220, 222)
+        IfCondition EqualTo(Desk.kch, 1) ThenBlock: { Desk.n = FB_RGB(255, 220, 64) }
+        Desk_DrawTxtN(Add(Desk.cx, 12), Desk.y, Desk.mp, Desk.sa, Desk.n)
+        Desk_DrawTxtN(Add(Desk.cx, 13), Desk.y, Desk.mp, Desk.sa, Desk.n)
+        IfCondition EqualTo(Desk.kch, 1) ThenBlock: {
+            FB_FillRect(Add(Desk.cx, 12), Add(Desk.y, Subtract(Desk.flh, 4)), Desk.sb, 2, Desk.n)
+        }
+        IfCondition NotEqual(GetByte(Desk.mp, Desk.sa), 0) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.cx, Add(12, Desk.sb)), Desk.y, Add(Desk.mp, Desk.sa), FB_RGB(232, 238, 248))
+        }
+        Desk.i = Desk.wk
+    }
+}
+
+Function.Desk_LineLen {
+    Input: src: Address
+    Output: Integer
+    Body: {
+        Desk.li = 0
+        mx = Subtract(Desk.lln, 1)
+        WhileLoop LessThan(Desk.li, mx) {
+            IfCondition EqualTo(GetByte(src, Desk.li), 0) ThenBlock: { ReturnValue(Desk.li) }
+            Desk.li = Add(Desk.li, 1)
+        }
+        ReturnValue(mx)
+    }
+}
+
+Function.Desk_HitLog {
+    Input: kind: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(kind, 0) ThenBlock: {
+            Desk.x = Add(AppDesk.CX(Desk.chat), 12)
+            Desk.y = Add(AppDesk.CY(Desk.chat), 32)
+            Desk.h2 = Desk.logh
+            Desk.vis = Desk.chatvis
+            Desk.n = Desk.logn
+            Desk.sx = Desk.logoff
+        }
+        ElseBlock: {
+            Desk.x = Add(AppDesk.CX(Desk.winthk), 12)
+            Desk.y = Add(AppDesk.CY(Desk.winthk), 28)
+            Desk.h2 = Subtract(AppDesk.CH(Desk.winthk), 32)
+            Desk.vis = Desk.thkvis
+            Desk.n = Desk.thkn
+            Desk.sx = Desk.thkoff
+        }
+        IfCondition LessThan(Desk.mx, Desk.x) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(Desk.my, Desk.y) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.my, Add(Desk.y, Desk.h2)) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(kind, 0) ThenBlock: {
+            IfCondition GreaterEqual(Desk.mx, Subtract(Add(AppDesk.CX(Desk.chat), AppDesk.CW(Desk.chat)), Add(Desk.sbw, 4))) ThenBlock: { ReturnValue(0) }
+        }
+        ElseBlock: {
+            IfCondition GreaterEqual(Desk.mx, Subtract(Add(AppDesk.CX(Desk.winthk), AppDesk.CW(Desk.winthk)), Add(Desk.sbw, 4))) ThenBlock: { ReturnValue(0) }
+        }
+        Desk.row = Divide(Subtract(Desk.my, Desk.y), Desk.flh)
+        IfCondition LessThan(Desk.row, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.row, Desk.vis) ThenBlock: { ReturnValue(0) }
+        Desk.row = Add(Desk.sx, Desk.row)
+        IfCondition GreaterEqual(Desk.row, Desk.n) ThenBlock: { ReturnValue(0) }
+        Desk.wi = Divide(Subtract(Desk.mx, Desk.x), Desk.fcw)
+        IfCondition LessThan(Desk.wi, 0) ThenBlock: { Desk.wi = 0 }
+        IfCondition GreaterThan(Desk.wi, Subtract(Desk.lln, 1)) ThenBlock: { Desk.wi = Subtract(Desk.lln, 1) }
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_DrawSelLine {
+    Input: y: Integer
+    Input: line: Integer
+    Input: src: Address
+    Input: kind: Integer
+    Body: {
+        IfCondition NotEqual(Desk.ssrc, kind) ThenBlock: { ReturnValue(0) }
+        l0 = Desk.s0l
+        c0 = Desk.s0c
+        l1 = Desk.s1l
+        c1 = Desk.s1c
+        IfCondition Or(GreaterThan(l0, l1), And(EqualTo(l0, l1), GreaterThan(c0, c1))) ThenBlock: {
+            l0 = Desk.s1l
+            c0 = Desk.s1c
+            l1 = Desk.s0l
+            c1 = Desk.s0c
+        }
+        IfCondition Or(LessThan(line, l0), GreaterThan(line, l1)) ThenBlock: { ReturnValue(0) }
+        Desk.sa = 0
+        Desk.sb = Subtract(Desk.lln, 1)
+        IfCondition EqualTo(line, l0) ThenBlock: { Desk.sa = c0 }
+        IfCondition EqualTo(line, l1) ThenBlock: { Desk.sb = c1 }
+        IfCondition GreaterThan(Desk.sa, Desk.sb) ThenBlock: {
+            t = Desk.sa
+            Desk.sa = Desk.sb
+            Desk.sb = t
+        }
+        Desk.wk = Desk.i
+        Desk.n = Desk_LineLen(src)
+        Desk.i = Desk.wk
+        IfCondition LessThan(Desk.sa, 0) ThenBlock: { Desk.sa = 0 }
+        IfCondition GreaterThan(Desk.sb, Desk.n) ThenBlock: { Desk.sb = Desk.n }
+        IfCondition GreaterThan(Desk.sb, Desk.sa) ThenBlock: {
+            FB_FillRect(Add(Desk.cx, Add(12, Multiply(Desk.sa, Desk.fcw))), Desk.y, Multiply(Subtract(Desk.sb, Desk.sa), Desk.fcw), Desk.flh, FB_RGB(20, 78, 82))
+        }
+    }
+}
+
+Function.Desk_CopyLog {
+    Input: base: Address
+    Body: {
+        Desk.sa = Desk.s0l
+        Desk.sb = Desk.s0c
+        Desk.oldh = Desk.s1l
+        Desk.oldw = Desk.s1c
+        IfCondition Or(GreaterThan(Desk.sa, Desk.oldh), And(EqualTo(Desk.sa, Desk.oldh), GreaterThan(Desk.sb, Desk.oldw))) ThenBlock: {
+            Desk.sa = Desk.s1l
+            Desk.sb = Desk.s1c
+            Desk.oldh = Desk.s0l
+            Desk.oldw = Desk.s0c
+        }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/copy.txt", 577, 420, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.sx = Desk.sa
+        WhileLoop LessEqual(Desk.sx, Desk.oldh) {
+            Desk.mp = Add(base, Multiply(Desk.sx, Desk.lln))
+            Desk.n = Desk_LineLen(Desk.mp)
+            Desk.wi = 0
+            Desk.li = Desk.n
+            IfCondition EqualTo(Desk.sx, Desk.sa) ThenBlock: { Desk.wi = Desk.sb }
+            IfCondition EqualTo(Desk.sx, Desk.oldh) ThenBlock: { Desk.li = Desk.oldw }
+            IfCondition LessThan(Desk.wi, 0) ThenBlock: { Desk.wi = 0 }
+            IfCondition GreaterThan(Desk.li, Desk.n) ThenBlock: { Desk.li = Desk.n }
+            IfCondition GreaterThan(Desk.li, Desk.wi) ThenBlock: {
+                SystemCall(1, Desk.fd, Add(Desk.mp, Desk.wi), Subtract(Desk.li, Desk.wi), 0, 0)
+            }
+            IfCondition LessThan(Desk.sx, Desk.oldh) ThenBlock: {
+                SetByte(Desk.line, 0, 10)
+                SystemCall(1, Desk.fd, Desk.line, 1, 0, 0)
+            }
+            Desk.sx = Add(Desk.sx, 1)
+        }
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_DoCopy {
+    Body: {
+        IfCondition EqualTo(Desk.ssrc, 1) ThenBlock: {
+            IfCondition Or(NotEqual(Desk.s0l, Desk.s1l), NotEqual(Desk.s0c, Desk.s1c)) ThenBlock: {
+                Desk_CopyLog(Desk.logbase)
+                ReturnValue(1)
+            }
+        }
+        IfCondition EqualTo(Desk.ssrc, 2) ThenBlock: {
+            IfCondition Or(NotEqual(Desk.s0l, Desk.s1l), NotEqual(Desk.s0c, Desk.s1c)) ThenBlock: {
+                Desk_CopyLog(Desk.thkbase)
+                ReturnValue(1)
+            }
+        }
+        IfCondition EqualTo(InputBar.HasSel(), 1) ThenBlock: {
+            Desk.fd = SystemCall(2, "/tmp/halcode_app/copy.txt", 577, 420, 0)
+            IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: {
+                SystemCall(1, Desk.fd, Add(InputBar.Text(), InputBar.SelLo()), Subtract(InputBar.SelHi(), InputBar.SelLo()), 0, 0)
+                SystemCall(3, Desk.fd, 0, 0, 0, 0)
+            }
+            ReturnValue(1)
+        }
+        Desk_WriteFile("/tmp/halcode_app/copy.txt", InputBar.Text())
+        ReturnValue(1)
+    }
+}
+
+// First JSON object in intrusivethoughts.json. The file buffer stays
+// allocated because the quote strings point into it.
+Function.Desk_LoadQuotes {
+    Body: {
+        Desk.fd = SystemCall(2, "./intrusivethoughts.json", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qbuf = Allocate(65536)
+        Desk.n = SystemCall(0, Desk.fd, Desk.qbuf, 65535, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, Subtract(Desk.n, 3)) {
+            IfCondition EqualTo(GetByte(Desk.qbuf, Desk.i), 125) ThenBlock: {
+                IfCondition EqualTo(GetByte(Desk.qbuf, Add(Desk.i, 1)), 10) ThenBlock: {
+                    IfCondition EqualTo(GetByte(Desk.qbuf, Add(Desk.i, 2)), 10) ThenBlock: {
+                        IfCondition EqualTo(GetByte(Desk.qbuf, Add(Desk.i, 3)), 123) ThenBlock: {
+                            SetByte(Desk.qbuf, Add(Desk.i, 1), 0)
+                            Desk.i = Desk.n
+                        }
+                    }
+                }
+            }
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(Desk.qbuf, Desk.n, 0)
+        Desk.mp = ParseJSON(Desk.qbuf)
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { ReturnValue(0) }
+        Desk.mp = JSON.AsObject(Desk.mp)
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qarr = JSON.GetArray(Desk.mp, "main_set")
+        IfCondition EqualTo(Desk.qarr, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qn = JSON.ArrayLength(Desk.qarr)
+        Desk.qrng = SystemCall(201, 0, 0, 0, 0, 0)
+    }
+}
+
+Function.Desk_NextQuote {
+    Body: {
+        IfCondition LessEqual(Desk.qn, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qrng = Add(Multiply(Desk.qrng, 1664525), 1013904223)
+        Desk.n = Desk.qrng
+        IfCondition LessThan(Desk.n, 0) ThenBlock: { Desk.n = Subtract(0, Desk.n) }
+        Desk.n = Modulo(Desk.n, Desk.qn)
+        Desk.mp = JSON.ArrayGet(Desk.qarr, Desk.n)
+        Desk.mp = JSON.AsString(Desk.mp)
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qstr = Desk.mp
+        Desk.qoff = 0
+    }
+}
+
+Function.Desk_DrawThinkLamp {
+    Input: x: Integer
+    Input: y: Integer
+    Input: w: Integer
+    Body: {
+        FB_FillRect(x, y, w, 18, FB_RGB(10, 10, 12))
+        Desk.n = Add(40, Divide(Multiply(Desk.bv, 180), 1000))
+        IfCondition GreaterThan(Desk.n, 220) ThenBlock: { Desk.n = 220 }
+        FB_FillCircle(Add(x, 12), Add(y, 9), 6, FB_RGB(Desk.n, 4, 4))
+        FB_FillCircle(Add(x, 12), Add(y, 9), 2, FB_RGB(255, 80, 80))
+        Desk.mp = Desk.qstr
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { Desk.mp = "HAL thinking" }
+        Desk.slen = StringLength(Desk.mp)
+        IfCondition LessEqual(Desk.slen, 0) ThenBlock: { ReturnValue(0) }
+        Desk.sa = Subtract(w, 32)
+        IfCondition LessThan(Desk.sa, 48) ThenBlock: { Desk.sa = 48 }
+        Desk.li = Divide(Desk.sa, 6)
+        IfCondition LessThan(Desk.li, 8) ThenBlock: { Desk.li = 8 }
+        IfCondition GreaterThan(Desk.li, 200) ThenBlock: { Desk.li = 200 }
+        Desk.oldw = Add(Desk.slen, 5)
+        Desk.wk = Desk.qoff
+        IfCondition LessThan(Desk.wk, 0) ThenBlock: { Desk.wk = 0 }
+        Desk.wk = Modulo(Desk.wk, Desk.oldw)
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, Desk.li) {
+            Desk.c = Modulo(Add(Desk.wk, Desk.i), Desk.oldw)
+            IfCondition LessThan(Desk.c, Desk.slen) ThenBlock: {
+                SetByte(Desk.wbuf, Desk.i, GetByte(Desk.mp, Desk.c))
+            } ElseBlock: {
+                SetByte(Desk.wbuf, Desk.i, GetByte(" *** ", Subtract(Desk.c, Desk.slen)))
+            }
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(Desk.wbuf, Desk.i, 0)
+        Desk.n = Desk_FitCount(Desk.wbuf, Desk.sa)
+        Desk_DrawTxtN(Add(x, 24), y, Desk.wbuf, Desk.n, FB_RGB(176, 156, 112))
+    }
+}
+
+Function.Desk_Dbg {
+    Input: msg: Address
+    Body: {
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/debug.log", 1089, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: {
+            SystemCall(1, Desk.fd, "[desk] ", 7, 0, 0)
+            SystemCall(1, Desk.fd, msg, StringLength(msg), 0, 0)
+            SetByte(Desk.line, 0, 10)
+            SystemCall(1, Desk.fd, Desk.line, 1, 0, 0)
+            SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+Function.Desk_CopyZ {
+    Input: dst: Address
+    Input: src: Address
+    Body: {
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, 80) {
+            Desk.c = GetByte(src, Desk.i)
+            SetByte(dst, Desk.i, Desk.c)
+            IfCondition EqualTo(Desk.c, 0) ThenBlock: { ReturnValue(0) }
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(dst, 79, 0)
+    }
+}
+
+Function.Desk_CopyLine {
+    Input: dst: Address
+    Input: src: Address
+    Body: {
+        mx = Subtract(Desk.lln, 1)
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, mx) {
+            Desk.c = GetByte(src, Desk.i)
+            SetByte(dst, Desk.i, Desk.c)
+            IfCondition EqualTo(Desk.c, 0) ThenBlock: { ReturnValue(0) }
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(dst, mx, 0)
+    }
+}
+
+Function.Desk_ThinkPush {
+    Input: src: Address
+    Body: {
+        IfCondition GreaterEqual(Desk.thkn, Desk.logcap) ThenBlock: {
+            Desk.sx = 0
+            WhileLoop LessThan(Desk.sx, Subtract(Desk.logcap, 1)) {
+                Desk_CopyLine(Add(Desk.thkbase, Multiply(Desk.sx, Desk.lln)), Add(Desk.thkbase, Multiply(Add(Desk.sx, 1), Desk.lln)))
+                Desk.sx = Add(Desk.sx, 1)
+            }
+            Desk.thkn = Subtract(Desk.logcap, 1)
+        }
+        Desk_CopyLine(Add(Desk.thkbase, Multiply(Desk.thkn, Desk.lln)), src)
+        Desk.thkn = Add(Desk.thkn, 1)
+        IfCondition GreaterThan(Desk.thkn, Desk.thkvis) ThenBlock: {
+            Desk.thkoff = Subtract(Desk.thkn, Desk.thkvis)
+        }
+        ElseBlock: {
+            Desk.thkoff = 0
+        }
+    }
+}
+
+Function.Desk_WrapWidth {
+    Input: kind: Integer
+    Output: Integer
+    Body: {
+        wpx = 400
+        IfCondition EqualTo(kind, 1) ThenBlock: {
+            IfCondition GreaterEqual(Desk.winthk, 0) ThenBlock: {
+                wpx = Subtract(AppDesk.CW(Desk.winthk), Add(18, Desk.sbw))
+            }
+        }
+        ElseBlock: {
+            IfCondition GreaterEqual(Desk.chat, 0) ThenBlock: {
+                wpx = Subtract(AppDesk.CW(Desk.chat), Add(18, Desk.sbw))
+            }
+        }
+        IfCondition LessThan(wpx, 80) ThenBlock: { wpx = 80 }
+        ReturnValue(wpx)
+    }
+}
+
+Function.Desk_WrapFlush {
+    Input: kind: Integer
+    Body: {
+        SetByte(Desk.wbuf, Desk.wi, 0)
+        IfCondition EqualTo(kind, 1) ThenBlock: { Desk_ThinkPush(Desk.wbuf) }
+        ElseBlock: { Desk_LogPush(Desk.wbuf) }
+        Desk.wi = 0
+        Desk.h2 = -1
+    }
+}
+
+Function.Desk_WrapEmit {
+    Input: kind: Integer
+    Body: {
+        IfCondition EqualTo(Desk.wi, 0) ThenBlock: {
+            Desk.h2 = -1
+            ReturnValue(0)
+        }
+        Desk_WrapFlush(kind)
+    }
+}
+
+Function.Desk_WrapReset {
+    Body: {
+        IfCondition EqualTo(Desk.wbuf, 0) ThenBlock: { Desk.wbuf = Allocate(256) }
+        Desk.wi = 0
+        Desk.h2 = -1
+        SetByte(Desk.wbuf, 0, 0)
+    }
+}
+
+Function.Desk_WrapPrefix {
+    Input: pre: Address
+    Body: {
+        IfCondition EqualTo(pre, 0) ThenBlock: { ReturnValue(0) }
+        Desk.i = 0
+        Desk.c = GetByte(pre, 0)
+        WhileLoop And(NotEqual(Desk.c, 0), LessThan(Desk.wi, Subtract(Desk.lln, 2))) {
+            SetByte(Desk.wbuf, Desk.wi, Desk.c)
+            IfCondition EqualTo(Desk.c, 32) ThenBlock: { Desk.h2 = Desk.wi }
+            Desk.wi = Add(Desk.wi, 1)
+            Desk.i = Add(Desk.i, 1)
+            Desk.c = GetByte(pre, Desk.i)
+        }
+        SetByte(Desk.wbuf, Desk.wi, 0)
+    }
+}
+
+Function.Desk_WrapFits {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(Desk.wi, Subtract(Desk.lln, 2)) ThenBlock: { ReturnValue(0) }
+        mw = 0
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+            mw = VFont_MeasureWidth(Desk.wbuf, Add(Desk.wi, 1))
+        }
+        IfCondition LessThan(mw, 1) ThenBlock: {
+            mw = Multiply(Add(Desk.wi, 1), Desk.fcw)
+        }
+        IfCondition GreaterThan(mw, Desk.wpx) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_WrapCarry {
+    Body: {
+        Desk.n = 0
+        Desk.i = Add(Desk.oldh, 1)
+        WhileLoop LessThan(Desk.i, Desk.oldw) {
+            SetByte(Desk.wbuf, Desk.n, GetByte(Desk.wbuf, Desk.i))
+            Desk.n = Add(Desk.n, 1)
+            Desk.i = Add(Desk.i, 1)
+        }
+        Desk.wi = Desk.n
+        Desk.h2 = -1
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, Desk.wi) {
+            IfCondition EqualTo(GetByte(Desk.wbuf, Desk.i), 32) ThenBlock: { Desk.h2 = Desk.i }
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(Desk.wbuf, Desk.wi, 0)
+    }
+}
+
+Function.Desk_WrapPut {
+    Body: {
+        Desk.kch = Desk.c
+        IfCondition And(EqualTo(Desk.kch, 32), EqualTo(Desk.wi, 0)) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.wbuf, Desk.wi, Desk.kch)
+        IfCondition EqualTo(Desk_WrapFits(), 1) ThenBlock: {
+            IfCondition EqualTo(Desk.kch, 32) ThenBlock: { Desk.h2 = Desk.wi }
+            Desk.wi = Add(Desk.wi, 1)
+            SetByte(Desk.wbuf, Desk.wi, 0)
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.wi, 0) ThenBlock: {
+            Desk.wi = 1
+            SetByte(Desk.wbuf, 1, 0)
+            Desk_WrapFlush(Desk.wk)
+            ReturnValue(1)
+        }
+        IfCondition GreaterEqual(Desk.h2, 0) ThenBlock: {
+            Desk.oldh = Desk.h2
+            Desk.oldw = Desk.wi
+            SetByte(Desk.wbuf, Desk.oldh, 0)
+            Desk.wi = Desk.oldh
+            Desk_WrapEmit(Desk.wk)
+            Desk_WrapCarry()
+        }
+        ElseBlock: {
+            SetByte(Desk.wbuf, Desk.wi, 0)
+            Desk_WrapFlush(Desk.wk)
+        }
+        IfCondition And(EqualTo(Desk.kch, 32), EqualTo(Desk.wi, 0)) ThenBlock: { ReturnValue(1) }
+        SetByte(Desk.wbuf, Desk.wi, Desk.kch)
+        IfCondition EqualTo(Desk_WrapFits(), 0) ThenBlock: {
+            IfCondition GreaterThan(Desk.wi, 0) ThenBlock: {
+                SetByte(Desk.wbuf, Desk.wi, 0)
+                Desk_WrapFlush(Desk.wk)
+                SetByte(Desk.wbuf, 0, Desk.kch)
+                Desk.wi = 0
+            }
+        }
+        IfCondition EqualTo(Desk.kch, 32) ThenBlock: { Desk.h2 = Desk.wi }
+        Desk.wi = Add(Desk.wi, 1)
+        SetByte(Desk.wbuf, Desk.wi, 0)
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_WrapFeed {
+    Input: src: Address
+    Input: n: Integer
+    Input: kind: Integer
+    Input: wpx: Integer
+    Body: {
+        Desk.slen = n
+        Desk.wpx = wpx
+        Desk.wk = kind
+        Desk.wx = 0
+        WhileLoop LessThan(Desk.wx, Desk.slen) {
+            Desk.c = GetByte(src, Desk.wx)
+            Desk.wx = Add(Desk.wx, 1)
+            IfCondition GreaterEqual(Desk.c, 128) ThenBlock: {
+                u1 = 0
+                u2 = 0
+                IfCondition LessThan(Desk.wx, Desk.slen) ThenBlock: { u1 = GetByte(src, Desk.wx) }
+                IfCondition LessThan(Add(Desk.wx, 1), Desk.slen) ThenBlock: { u2 = GetByte(src, Add(Desk.wx, 1)) }
+                IfCondition And(EqualTo(Desk.c, 226), EqualTo(u1, 128)) ThenBlock: {
+                    IfCondition Or(EqualTo(u2, 152), EqualTo(u2, 153)) ThenBlock: { Desk.c = 39 }
+                    IfCondition Or(EqualTo(u2, 156), EqualTo(u2, 157)) ThenBlock: { Desk.c = 34 }
+                    IfCondition Or(EqualTo(u2, 147), EqualTo(u2, 148)) ThenBlock: { Desk.c = 45 }
+                    IfCondition EqualTo(u2, 166) ThenBlock: { Desk.c = 46 }
+                    Desk.wx = Add(Desk.wx, 2)
+                    IfCondition GreaterEqual(Desk.c, 128) ThenBlock: { Desk.c = 32 }
+                }
+                ElseBlock: {
+                    IfCondition And(EqualTo(Desk.c, 194), EqualTo(u1, 160)) ThenBlock: {
+                        Desk.c = 32
+                        Desk.wx = Add(Desk.wx, 1)
+                    }
+                    ElseBlock: {
+                        IfCondition GreaterEqual(Desk.c, 240) ThenBlock: { Desk.wx = Add(Desk.wx, 3) }
+                        ElseBlock: {
+                            IfCondition GreaterEqual(Desk.c, 224) ThenBlock: { Desk.wx = Add(Desk.wx, 2) }
+                            ElseBlock: {
+                                IfCondition GreaterEqual(Desk.c, 192) ThenBlock: { Desk.wx = Add(Desk.wx, 1) }
+                            }
+                        }
+                        Desk.c = 32
+                    }
+                }
+            }
+            IfCondition Or(EqualTo(Desk.c, 10), EqualTo(Desk.c, 13)) ThenBlock: {
+                Desk_WrapFlush(Desk.wk)
+            }
+            ElseBlock: {
+                IfCondition EqualTo(Desk.c, 9) ThenBlock: { Desk.c = 32 }
+                IfCondition And(GreaterEqual(Desk.c, 32), LessThan(Desk.c, 127)) ThenBlock: {
+                    Desk_WrapPut()
+                }
+            }
+        }
+    }
+}
+
+Function.Desk_PushWrap {
+    Input: src: Address
+    Input: n: Integer
+    Input: kind: Integer
+    Input: pre: Address
+    Body: {
+        Desk.wpx = Desk_WrapWidth(kind)
+        Desk_WrapReset()
+        Desk_WrapPrefix(pre)
+        Desk_WrapFeed(src, n, kind, Desk.wpx)
+        IfCondition GreaterThan(Desk.wi, 0) ThenBlock: { Desk_WrapEmit(kind) }
+    }
+}
+
+Function.Desk_LogPush {
+    Input: src: Address
+    Body: {
+        IfCondition GreaterEqual(Desk.logn, Desk.logcap) ThenBlock: {
+            Desk.sx = 0
+            WhileLoop LessThan(Desk.sx, Subtract(Desk.logcap, 1)) {
+                Desk_CopyLine(Add(Desk.logbase, Multiply(Desk.sx, Desk.lln)), Add(Desk.logbase, Multiply(Add(Desk.sx, 1), Desk.lln)))
+                Desk.sx = Add(Desk.sx, 1)
+            }
+            Desk.logn = Subtract(Desk.logcap, 1)
+        }
+        Desk_CopyLine(Add(Desk.logbase, Multiply(Desk.logn, Desk.lln)), src)
+        Desk.logn = Add(Desk.logn, 1)
+        IfCondition GreaterThan(Desk.logn, Desk.chatvis) ThenBlock: {
+            Desk.logoff = Subtract(Desk.logn, Desk.chatvis)
+        }
+        ElseBlock: {
+            Desk.logoff = 0
+        }
+    }
+}
+
+Function.Desk_LogBlank {
+    Body: {
+        IfCondition EqualTo(Desk.logn, 0) ThenBlock: { ReturnValue(0) }
+        Desk.mp = Add(Desk.logbase, Multiply(Subtract(Desk.logn, 1), Desk.lln))
+        IfCondition EqualTo(GetByte(Desk.mp, 0), 0) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.line, 0, 0)
+        Desk_LogPush(Desk.line)
+    }
+}
+
+Function.Desk_KeyChar {
+    Input: ch: Integer
+    Body: {
+        Desk.infocus = 1
+        AppDesk.Raise(Desk.chat)
+        Desk.ssrc = 3
+        InputBar.Char(ch)
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_KeyBs {
+    Body: {
+        Desk.infocus = 1
+        AppDesk.Raise(Desk.chat)
+        InputBar.Bs()
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_KeyRet {
+    Body: {
+        Desk.infocus = 1
+        AppDesk.Raise(Desk.chat)
+        IfCondition EqualTo(InputBar.Len(), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.chose, 0) ThenBlock: {
+            Desk.c = GetByte(InputBar.Text(), 0)
+            Desk.kind = 0
+            IfCondition EqualTo(InputBar.Len(), 1) ThenBlock: {
+                IfCondition Or(EqualTo(Desk.c, 49), Or(EqualTo(Desk.c, 110), EqualTo(Desk.c, 78))) ThenBlock: { Desk.kind = 1 }
+                IfCondition Or(EqualTo(Desk.c, 50), Or(EqualTo(Desk.c, 121), Or(EqualTo(Desk.c, 89), EqualTo(Desk.c, 114)))) ThenBlock: { Desk.kind = 2 }
+            }
+            IfCondition EqualTo(Desk.kind, 1) ThenBlock: {
+                Desk.chose = 1
+                Desk_WriteFile("/tmp/halcode_app/session.txt", "new")
+                Desk_LogPush("new session")
+                InputBar.Clear()
+                Desk.dirty = 1
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(Desk.kind, 2) ThenBlock: {
+                Desk.chose = 1
+                Desk_WriteFile("/tmp/halcode_app/session.txt", "last")
+                Desk_LogPush("resume last pgmem session")
+                InputBar.Clear()
+                Desk.dirty = 1
+                ReturnValue(0)
+            }
+            Desk.chose = 1
+            Desk_WriteFile("/tmp/halcode_app/session.txt", "new")
+            Desk_LogPush("new session")
+        }
+        Desk.inlen = InputBar.Len()
+        Desk.inbuf = InputBar.Text()
+        Desk_LogBlank()
+        Desk_PushWrap(Desk.inbuf, Desk.inlen, 0, "USER: ")
+        Desk_Dbg("KeyRet send")
+        Desk_WriteFile("/tmp/halcode_app/wait.txt", "1")
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/prompt.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: {
+            SystemCall(1, Desk.fd, Desk.inbuf, Desk.inlen, 0, 0)
+            SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        }
+        IfCondition GreaterEqual(Desk.curmod, 0) ThenBlock: {
+            Desk.fd = SystemCall(2, "/tmp/halcode_app/model.txt", 577, 420, 0)
+            IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: {
+                Desk.mp = Dereference(Add(Desk.modptr, Multiply(Desk.curmod, 8)))
+                SystemCall(1, Desk.fd, Desk.mp, StringLength(Desk.mp), 0, 0)
+                SystemCall(3, Desk.fd, 0, 0, 0, 0)
+            }
+        }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/go.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: {
+            SetByte(Desk.line, 0, 49)
+            SetByte(Desk.line, 1, 10)
+            SystemCall(1, Desk.fd, Desk.line, 2, 0, 0)
+            SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        }
+        InputBar.Clear()
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_PollReply {
+    Body: {
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/reply.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition And(EqualTo(Desk.wait, 1), GreaterEqual(Desk.waiti, 0)) ThenBlock: {
+            IfCondition LessEqual(Desk.waiti, Desk.logn) ThenBlock: { Desk.logn = Desk.waiti }
+        }
+        wpx = Desk_WrapWidth(0)
+        Desk_WrapReset()
+        Desk_WrapPrefix("HAL: ")
+        Desk.n = 1
+        Desk.i = 0
+        WhileLoop GreaterThan(Desk.n, 0) {
+            Desk.n = SystemCall(0, Desk.fd, Desk.rbuf, 4095, 0, 0)
+            IfCondition GreaterThan(Desk.n, 0) ThenBlock: {
+                SetByte(Desk.rbuf, Desk.n, 0)
+                Desk_WrapFeed(Desk.rbuf, Desk.n, 0, wpx)
+                Desk.i = 1
+            }
+        }
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition EqualTo(Desk.i, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(Desk.wi, 0) ThenBlock: { Desk_WrapEmit(0) }
+        Desk.wait = 0
+        Desk.waiti = -1
+        SystemCall(87, "/tmp/halcode_app/wait.txt", 0, 0, 0, 0)
+        SystemCall(82, "/tmp/halcode_app/reply.txt", "/tmp/halcode_app/reply.seen", 0, 0, 0)
+        Desk.dirty = 1
+    }
+}
+
+Function.Desk_PollThink {
+    Body: {
+        Desk.fd = SystemCall(82, "/tmp/halcode_app/think.txt", "/tmp/halcode_app/think.seen", 0, 0, 0)
+        IfCondition NotEqual(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk_Dbg("think take")
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/think.seen", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: {
+            Desk_Dbg("think seen missing")
+            ReturnValue(0)
+        }
+        wpx = Desk_WrapWidth(1)
+        Desk_WrapReset()
+        Desk.thkn = 0
+        Desk.n = 1
+        Desk.i = 0
+        WhileLoop GreaterThan(Desk.n, 0) {
+            Desk.n = SystemCall(0, Desk.fd, Desk.rbuf, 4095, 0, 0)
+            IfCondition GreaterThan(Desk.n, 0) ThenBlock: {
+                SetByte(Desk.rbuf, Desk.n, 0)
+                Desk_WrapFeed(Desk.rbuf, Desk.n, 1, wpx)
+                Desk.i = 1
+            }
+        }
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        SystemCall(87, "/tmp/halcode_app/think.seen", 0, 0, 0, 0)
+        IfCondition EqualTo(Desk.i, 0) ThenBlock: {
+            Desk_Dbg("think empty")
+            ReturnValue(0)
+        }
+        IfCondition GreaterThan(Desk.wi, 0) ThenBlock: { Desk_WrapEmit(1) }
+        Desk_Dbg("think wrapped")
+        IfCondition GreaterThan(Desk.thkn, Desk.thkvis) ThenBlock: {
+            Desk.thkoff = Subtract(Desk.thkn, Desk.thkvis)
+        }
+        ElseBlock: {
+            Desk.thkoff = 0
+        }
+        Desk.dirty = 1
+        Desk_Dbg("think done")
+    }
+}
+
+Function.Desk_PollPaste {
+    Body: {
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/paste.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.i = 0
+        Desk.n = 1
+        WhileLoop GreaterThan(Desk.n, 0) {
+            Desk.n = SystemCall(0, Desk.fd, Desk.rbuf, 4095, 0, 0)
+            IfCondition GreaterThan(Desk.n, 0) ThenBlock: {
+                IfCondition EqualTo(Desk.kmode, 1) ThenBlock: {
+                    Desk.x = 0
+                    WhileLoop LessThan(Desk.x, Desk.n) {
+                        Desk_KeyPush(GetByte(Desk.rbuf, Desk.x))
+                        Desk.x = Add(Desk.x, 1)
+                    }
+                }
+                ElseBlock: {
+                    SetByte(Desk.rbuf, Desk.n, 0)
+                    InputBar.Paste(Desk.rbuf)
+                }
+                Desk.i = 1
+            }
+        }
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition EqualTo(Desk.i, 0) ThenBlock: { ReturnValue(0) }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/paste.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        Desk.dirty = 1
+        IfCondition EqualTo(Desk.kmode, 0) ThenBlock: { Desk_Dbg("paste") }
+    }
+}
+
+Function.Desk_PollWait {
+    Body: {
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/wait.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition EqualTo(Desk.wait, 0) ThenBlock: {
+            Desk.wait = 1
+            Desk_LogBlank()
+            Desk_LogPush("HAL thinking")
+            Desk.waiti = Subtract(Desk.logn, 1)
+            Desk.bv = 80
+            Desk.bdv = 12
+            Desk.wtick = 0
+            IfCondition EqualTo(Desk.qstr, 0) ThenBlock: { Desk_NextQuote() }
+            Desk.qsec = SystemCall(201, 0, 0, 0, 0, 0)
+            Desk.dirty = 1
+            Desk_Dbg("wait on")
+        }
+        Desk.bv = Add(Desk.bv, Desk.bdv)
+        IfCondition GreaterThan(Desk.bv, 1000) ThenBlock: {
+            Desk.bv = 1000
+            Desk.bdv = Subtract(0, 12)
+        }
+        IfCondition LessThan(Desk.bv, 0) ThenBlock: {
+            Desk.bv = 0
+            Desk.bdv = 12
+        }
+        // One character about every 80ms, a new line from the file every 10s.
+        // The old clock reset itself on the frame it drew, so a phase never moved.
+        Desk.wtick = Add(Desk.wtick, 1)
+        IfCondition GreaterEqual(Desk.wtick, 5) ThenBlock: {
+            Desk.wtick = 0
+            Desk.qoff = Add(Desk.qoff, 1)
+            Desk.n = SystemCall(201, 0, 0, 0, 0, 0)
+            IfCondition GreaterEqual(Subtract(Desk.n, Desk.qsec), 10) ThenBlock: {
+                Desk_NextQuote()
+                Desk.qsec = Desk.n
+            }
+            Desk.dirty = 1
+        }
+    }
+}
+
+Function.Desk_PollPickup {
+    Body: {
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/pickup.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.pick, 2047, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.pick, Desk.n, 0)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/pickup.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        Desk.sesn = 0
+        Desk.x = 0
+        WhileLoop LessThan(Desk.x, Desk.n) {
+            Desk.i = Desk.x
+            WhileLoop And(LessThan(Desk.i, Desk.n), NotEqual(GetByte(Desk.pick, Desk.i), 10)) {
+                Desk.i = Add(Desk.i, 1)
+            }
+            SetByte(Desk.pick, Desk.i, 0)
+            Desk.c = GetByte(Desk.pick, Desk.x)
+            IfCondition And(EqualTo(Desk.c, 80), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+                Desk_CopyZ(Desk.proj, Add(Desk.pick, Add(Desk.x, 2)))
+            }
+            IfCondition And(EqualTo(Desk.c, 84), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+                Desk_CopyZ(Desk.thread, Add(Desk.pick, Add(Desk.x, 2)))
+            }
+            IfCondition And(EqualTo(Desk.c, 87), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+                Desk.w = StringLength(Add(Desk.pick, Add(Desk.x, 2)))
+                IfCondition GreaterThan(Desk.w, 199) ThenBlock: { Desk.w = 199 }
+                Desk.h2 = 0
+                WhileLoop LessThan(Desk.h2, Desk.w) {
+                    SetByte(Desk.state, Desk.h2, GetByte(Desk.pick, Add(Add(Desk.x, 2), Desk.h2)))
+                    Desk.h2 = Add(Desk.h2, 1)
+                }
+                SetByte(Desk.state, Desk.w, 0)
+            }
+            IfCondition And(EqualTo(Desk.c, 69), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+                Desk_CopyZ(Desk.line, Add(Desk.pick, Add(Desk.x, 2)))
+                Desk_LogPush(Desk.line)
+            }
+            IfCondition And(EqualTo(Desk.c, 83), LessThan(Desk.sesn, 8)) ThenBlock: {
+                Desk_CopyZ(Add(Desk.sesbase, Multiply(Desk.sesn, 81)), Add(Desk.pick, Add(Desk.x, 2)))
+                Desk.h2 = 0
+                WhileLoop And(LessThan(Desk.h2, 40), NotEqual(GetByte(Desk.pick, Add(Add(Desk.x, 2), Desk.h2)), 0)) {
+                    Desk.c = GetByte(Desk.pick, Add(Add(Desk.x, 2), Desk.h2))
+                    IfCondition EqualTo(Desk.c, 32) ThenBlock: { BreakLoop }
+                    SetByte(Add(Desk.sesids, Multiply(Desk.sesn, 81)), Desk.h2, Desk.c)
+                    Desk.h2 = Add(Desk.h2, 1)
+                }
+                SetByte(Add(Desk.sesids, Multiply(Desk.sesn, 81)), Desk.h2, 0)
+                Desk.sesn = Add(Desk.sesn, 1)
+            }
+            Desk.x = Add(Desk.i, 1)
+        }
+        Desk_Dbg("PollPickup bytes")
+        SystemCall(87, "/tmp/halcode_app/pickup.txt", 0, 0, 0, 0)
+        IfCondition EqualTo(Desk.picked, 0) ThenBlock: {
+            Desk_LogPush("New chat. No session loaded.")
+            Desk.picked = 1
+        }
+        Desk.dirty = 1
+        PrintMessage("[desk] pickup consumed\n")
+    }
+}
+
+Function.Desk_Present {
+    Output: Integer
+    Body: {
+        Desk.w = FB.width
+        Desk.h2 = FB.height
+        Desk.dp = FB.pitch
+        Desk.dst = FB_GetDrawBuffer()
+        IfCondition EqualTo(Desk.dst, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.hdr, 0) ThenBlock: { Desk.hdr = Allocate(16) }
+        Desk_LE32(Desk.hdr, 0, Desk.w)
+        Desk_LE32(Desk.hdr, 4, Desk.h2)
+        Desk_LE32(Desk.hdr, 8, Desk.dp)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/meta.bin", 577, 420, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(1, Desk.fd, Desk.hdr, 12, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/frame.tmp", 577, 420, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(1, Desk.fd, Desk.dst, Multiply(Desk.dp, Desk.h2), 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        SystemCall(82, "/tmp/halcode_app/frame.tmp", "/tmp/halcode_app/frame.raw", 0, 0, 0)
+        Desk.gen = Add(Desk.gen, 1)
+        IfCondition EqualTo(Desk.genb, 0) ThenBlock: { Desk.genb = Allocate(32) }
+        Desk.n = 0
+        Desk.i = Desk.gen
+        IfCondition LessThan(Desk.i, 1) ThenBlock: { Desk.i = 1 }
+        WhileLoop GreaterThan(Desk.i, 0) {
+            SetByte(Add(Desk.genb, 16), Desk.n, Add(48, Modulo(Desk.i, 10)))
+            Desk.n = Add(Desk.n, 1)
+            Desk.i = Divide(Desk.i, 10)
+        }
+        Desk.x = 0
+        WhileLoop LessThan(Desk.x, Desk.n) {
+            SetByte(Desk.genb, Desk.x, GetByte(Add(Desk.genb, 16), Subtract(Subtract(Desk.n, 1), Desk.x)))
+            Desk.x = Add(Desk.x, 1)
+        }
+        SetByte(Desk.genb, Desk.n, 10)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/gen.tmp", 577, 420, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(1, Desk.fd, Desk.genb, Add(Desk.n, 1), 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        SystemCall(82, "/tmp/halcode_app/gen.tmp", "/tmp/halcode_app/gen.txt", 0, 0, 0)
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_DrawBg {
+    Body: {
+        FB_FillRect(0, 0, FB.width, FB.height, FB_RGB(14, 18, 24))
+        Desk.y = 0
+        WhileLoop LessThan(Desk.y, FB.height) {
+            FB_HLine(0, Subtract(FB.width, 1), Desk.y, FB_RGB(22, 32, 48))
+            Desk.y = Add(Desk.y, 32)
+        }
+        Desk.x = 0
+        WhileLoop LessThan(Desk.x, FB.width) {
+            FB_VLine(Desk.x, 0, Subtract(FB.height, 1), FB_RGB(22, 32, 48))
+            Desk.x = Add(Desk.x, 32)
+        }
+        FB_FillRect(0, 0, FB.width, 28, FB_RGB(14, 56, 58))
+        Desk_DrawTxt(12, 8, "HALCODE GTK", FB_RGB(0, 196, 198))
+        IfCondition And(GreaterThan(Desk.nmod, 0), GreaterEqual(Desk.curmod, 0)) ThenBlock: {
+            Desk.mp = Dereference(Add(Desk.modptr, Multiply(Desk.curmod, 8)))
+            Desk_DrawTxt(140, 8, Desk.mp, FB_RGB(197, 203, 216))
+        }
+        FB_FillRect(0, Subtract(FB.height, 28), FB.width, 28, FB_RGB(16, 20, 28))
+        Desk_DrawTxt(12, Subtract(FB.height, 20), "menus: File Session Model Config Help   Ctrl+Q quit", FB_RGB(154, 164, 184))
+    }
+}
+
+Function.Desk_SesRows {
+    Output: Integer
+    Body: {
+        Desk.w = Divide(Subtract(AppDesk.CH(Desk.winses), 66), 30)
+        IfCondition LessThan(Desk.w, 1) ThenBlock: { ReturnValue(1) }
+        ReturnValue(Desk.w)
+    }
+}
+
+Function.Desk_ListTrack {
+    Output: Integer
+    Body: {
+        Desk.sa = 88
+        IfCondition EqualTo(Desk.kmode, 1) ThenBlock: { Desk.sa = 108 }
+        Desk.sa = Subtract(AppDesk.CH(Desk.winmod), Desk.sa)
+        IfCondition LessThan(Desk.sa, 16) ThenBlock: { Desk.sa = 16 }
+        ReturnValue(Desk.sa)
+    }
+}
+
+Function.Desk_ListRows {
+    Output: Integer
+    Body: {
+        Desk.w = 88
+        IfCondition EqualTo(Desk.kmode, 1) ThenBlock: { Desk.w = 108 }
+        Desk.w = Divide(Subtract(AppDesk.CH(Desk.winmod), Desk.w), 16)
+        IfCondition LessThan(Desk.w, 1) ThenBlock: { ReturnValue(1) }
+        ReturnValue(Desk.w)
+    }
+}
+
+Function.Desk_DrawContent {
+    Input: idx: Integer
+    Body: {
+        Desk.cx = AppDesk.CX(idx)
+        Desk.cy = AppDesk.CY(idx)
+        FB_SetClip(Desk.cx, Desk.cy, AppDesk.CW(idx), AppDesk.CH(idx))
+        FB_FillRect(Desk.cx, Desk.cy, AppDesk.CW(idx), AppDesk.CH(idx), FB_RGB(22, 28, 38))
+        IfCondition EqualTo(idx, Desk.chat) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 6), "Conversation", FB_RGB(0, 196, 198))
+            Desk_DrawBtn(Subtract(Add(Desk.cx, AppDesk.CW(idx)), 88), Add(Desk.cy, 4), 76, 24, "HOME", 0)
+            Desk.bx = Add(Desk.cx, 8)
+            Desk.bw = Subtract(AppDesk.CW(idx), 16)
+            InputBar.SetRect(Desk.bx, 0, Desk.bw, 24)
+            Desk.barh = InputBar.BoxH()
+            Desk.n = Subtract(AppDesk.CH(idx), Add(62, Desk.flh))
+            IfCondition GreaterThan(Desk.barh, Desk.n) ThenBlock: { Desk.barh = Desk.n }
+            IfCondition LessThan(Desk.barh, 24) ThenBlock: { Desk.barh = 24 }
+            Desk.by = Subtract(Add(Desk.cy, AppDesk.CH(idx)), Add(8, Desk.barh))
+            InputBar.SetRect(Desk.bx, Desk.by, Desk.bw, Desk.barh)
+            InputBar.SetFocus(Desk.infocus)
+            IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+                InputBar.SetMetrics(Desk.fcw, Desk.flh, 1, Desk.fsurf)
+            }
+            Desk.logh = Subtract(Subtract(Desk.by, 22), Add(Desk.cy, 32))
+            IfCondition LessThan(Desk.logh, Desk.flh) ThenBlock: { Desk.logh = Desk.flh }
+            Desk.chatvis = Divide(Desk.logh, Desk.flh)
+            IfCondition LessThan(Desk.chatvis, 1) ThenBlock: { Desk.chatvis = 1 }
+            IfCondition GreaterThan(Desk.logn, Desk.chatvis) ThenBlock: {
+                IfCondition GreaterThan(Desk.logoff, Subtract(Desk.logn, Desk.chatvis)) ThenBlock: {
+                    Desk.logoff = Subtract(Desk.logn, Desk.chatvis)
+                }
+            }
+            ElseBlock: {
+                Desk.logoff = 0
+            }
+            Desk.i = 0
+            WhileLoop And(LessThan(Desk.i, Desk.chatvis), LessThan(Add(Desk.logoff, Desk.i), Desk.logn)) {
+                Desk.y = Add(Add(Desk.cy, 32), Multiply(Desk.i, Desk.flh))
+                Desk.mp = Add(Desk.logbase, Multiply(Add(Desk.logoff, Desk.i), Desk.lln))
+                Desk_DrawSelLine(Desk.y, Add(Desk.logoff, Desk.i), Desk.mp, 1)
+                Desk_DrawLogLine()
+                Desk.i = Add(Desk.i, 1)
+            }
+            Desk_DrawVScroll(Subtract(Add(Desk.cx, AppDesk.CW(idx)), Add(Desk.sbw, 2)), Add(Desk.cy, 32), Desk.logh, Desk.chatvis, Desk.logn, Desk.logoff)
+            FB_FillRect(Desk.bx, Subtract(Desk.by, 22), Desk.bw, 18, FB_RGB(10, 10, 12))
+            IfCondition EqualTo(Desk.wait, 1) ThenBlock: {
+                Desk_DrawThinkLamp(Desk.bx, Subtract(Desk.by, 22), Desk.bw)
+            }
+            InputBar.Draw()
+        }
+        IfCondition EqualTo(idx, Desk.winthk) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 6), "Chain of thought", FB_RGB(0, 196, 198))
+            Desk.thkvis = Divide(Subtract(AppDesk.CH(idx), 32), Desk.flh)
+            IfCondition LessThan(Desk.thkvis, 1) ThenBlock: { Desk.thkvis = 1 }
+            IfCondition GreaterThan(Desk.thkn, Desk.thkvis) ThenBlock: {
+                IfCondition GreaterThan(Desk.thkoff, Subtract(Desk.thkn, Desk.thkvis)) ThenBlock: {
+                    Desk.thkoff = Subtract(Desk.thkn, Desk.thkvis)
+                }
+            }
+            ElseBlock: {
+                Desk.thkoff = 0
+            }
+            Desk.i = 0
+            WhileLoop And(LessThan(Desk.i, Desk.thkvis), LessThan(Add(Desk.thkoff, Desk.i), Desk.thkn)) {
+                Desk.y = Add(Add(Desk.cy, 28), Multiply(Desk.i, Desk.flh))
+                Desk.mp = Add(Desk.thkbase, Multiply(Add(Desk.thkoff, Desk.i), Desk.lln))
+                Desk_DrawSelLine(Desk.y, Add(Desk.thkoff, Desk.i), Desk.mp, 2)
+                Desk_DrawTxt(Add(Desk.cx, 12), Desk.y, Desk.mp, FB_RGB(197, 203, 216))
+                Desk.i = Add(Desk.i, 1)
+            }
+            Desk_DrawVScroll(Subtract(Add(Desk.cx, AppDesk.CW(idx)), 10), Add(Desk.cy, 28), Subtract(AppDesk.CH(idx), 32), Desk.thkvis, Desk.thkn, Desk.thkoff)
+        }
+        IfCondition EqualTo(idx, Desk.winmod) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 6), "Models", FB_RGB(0, 196, 198))
+            Desk.bx = Add(Desk.cx, 8)
+            Desk.by = Add(Desk.cy, 24)
+            Desk.bw = 200
+            Desk.h2 = 60
+            IfCondition EqualTo(Desk.kmode, 1) ThenBlock: { Desk.h2 = 80 }
+            Desk.h2 = Subtract(AppDesk.CH(idx), Desk.h2)
+            FB_FillRect(Desk.bx, Desk.by, Desk.bw, Desk.h2, FB_RGB(16, 20, 28))
+            FB_Rect(Desk.bx, Desk.by, Desk.bw, Desk.h2, FB_RGB(80, 90, 110))
+            Desk_DrawTxt(Add(Desk.bx, 8), Add(Desk.by, 4), "provider", FB_RGB(154, 164, 184))
+            Desk.li = Desk_ListRows()
+            IfCondition LessEqual(Desk.nprv, Desk.li) ThenBlock: { Desk.prvoff = 0 }
+            ElseBlock: {
+                IfCondition GreaterThan(Desk.prvoff, Subtract(Desk.nprv, Desk.li)) ThenBlock: {
+                    Desk.prvoff = Subtract(Desk.nprv, Desk.li)
+                }
+            }
+            IfCondition LessThan(Desk.prvoff, 0) ThenBlock: { Desk.prvoff = 0 }
+            Desk.i = 0
+            WhileLoop LessThan(Desk.i, Desk.li) {
+                Desk.sx = Add(Desk.prvoff, Desk.i)
+                IfCondition LessThan(Desk.sx, Desk.nprv) ThenBlock: {
+                    Desk.y = Add(Add(Desk.by, 22), Multiply(Desk.i, 16))
+                    IfCondition EqualTo(Desk.sx, Desk.curprv) ThenBlock: {
+                        FB_FillRect(Add(Desk.bx, 4), Subtract(Desk.y, 2), Subtract(Subtract(Desk.bw, Desk.sbw), 12), 16, FB_RGB(26, 92, 94))
+                        Desk_DrawTxt(Add(Desk.bx, 8), Desk.y, Desk_ProvLabel(Add(Desk.prvbase, Multiply(Desk.sx, 16))), FB_RGB(0, 196, 198))
+                    }
+                    ElseBlock: {
+                        Desk_DrawTxt(Add(Desk.bx, 8), Desk.y, Desk_ProvLabel(Add(Desk.prvbase, Multiply(Desk.sx, 16))), FB_RGB(232, 238, 248))
+                    }
+                }
+                Desk.i = Add(Desk.i, 1)
+            }
+            Desk_DrawVScroll(Subtract(Add(Desk.bx, Desk.bw), Add(Desk.sbw, 2)), Add(Desk.by, 22), Subtract(Desk.h2, 28), Desk.li, Desk.nprv, Desk.prvoff)
+            Desk.x = Add(Desk.cx, 216)
+            Desk.w = Subtract(AppDesk.CW(idx), 224)
+            FB_FillRect(Desk.x, Desk.by, Desk.w, Desk.h2, FB_RGB(16, 20, 28))
+            FB_Rect(Desk.x, Desk.by, Desk.w, Desk.h2, FB_RGB(80, 90, 110))
+            Desk_DrawTxt(Add(Desk.x, 8), Add(Desk.by, 4), "model", FB_RGB(154, 164, 184))
+            IfCondition LessThan(Desk.curprv, 0) ThenBlock: {
+                Desk.modn = 0
+                Desk_DrawTxt(Add(Desk.x, 8), Add(Desk.by, 22), "select provider", FB_RGB(154, 164, 184))
+            }
+            ElseBlock: {
+                Desk.sa = 0
+                Desk.i = 0
+                WhileLoop LessThan(Desk.i, Desk.nmod) {
+                    Desk.mp = Dereference(Add(Desk.modptr, Multiply(Desk.i, 8)))
+                    IfCondition EqualTo(Desk_SpecProv(Desk.mp, Add(Desk.prvbase, Multiply(Desk.curprv, 16))), 1) ThenBlock: {
+                        Desk.sa = Add(Desk.sa, 1)
+                    }
+                    Desk.i = Add(Desk.i, 1)
+                }
+                IfCondition LessEqual(Desk.sa, Desk.li) ThenBlock: { Desk.modoff = 0 }
+                ElseBlock: {
+                    IfCondition GreaterThan(Desk.modoff, Subtract(Desk.sa, Desk.li)) ThenBlock: {
+                        Desk.modoff = Subtract(Desk.sa, Desk.li)
+                    }
+                }
+                IfCondition LessThan(Desk.modoff, 0) ThenBlock: { Desk.modoff = 0 }
+                Desk.row = 0
+                Desk.sx = 0
+                Desk.i = 0
+                WhileLoop LessThan(Desk.i, Desk.nmod) {
+                    Desk.mp = Dereference(Add(Desk.modptr, Multiply(Desk.i, 8)))
+                    IfCondition EqualTo(Desk_SpecProv(Desk.mp, Add(Desk.prvbase, Multiply(Desk.curprv, 16))), 1) ThenBlock: {
+                        IfCondition GreaterEqual(Desk.sx, Desk.modoff) ThenBlock: {
+                            IfCondition LessThan(Desk.row, Desk.li) ThenBlock: {
+                                Desk.y = Add(Add(Desk.by, 22), Multiply(Desk.row, 16))
+                                Desk.n = Desk_SpecName(Desk.mp)
+                                Desk.kch = Desk.n
+                                Desk.n = Desk_FitCount(Add(Desk.mp, Desk.kch), Subtract(Subtract(Desk.w, Desk.sbw), Add(Desk.fcw, 14)))
+                                IfCondition EqualTo(Desk.i, Desk.curmod) ThenBlock: {
+                                    FB_FillRect(Add(Desk.x, 4), Subtract(Desk.y, 2), Subtract(Subtract(Desk.w, Desk.sbw), 12), 16, FB_RGB(26, 92, 94))
+                                    Desk_DrawTxtN(Add(Desk.x, 8), Desk.y, Add(Desk.mp, Desk.kch), Desk.n, FB_RGB(0, 196, 198))
+                                }
+                                ElseBlock: {
+                                    Desk_DrawTxtN(Add(Desk.x, 8), Desk.y, Add(Desk.mp, Desk.kch), Desk.n, FB_RGB(232, 238, 248))
+                                }
+                                Desk.row = Add(Desk.row, 1)
+                            }
+                        }
+                        Desk.sx = Add(Desk.sx, 1)
+                    }
+                    Desk.i = Add(Desk.i, 1)
+                }
+                Desk.modn = Desk.sa
+            }
+            Desk_DrawVScroll(Subtract(Add(Desk.x, Desk.w), Add(Desk.sbw, 2)), Add(Desk.by, 22), Subtract(Desk.h2, 28), Desk.li, Desk.modn, Desk.modoff)
+            Desk_DrawBtn(Add(Desk.cx, 8), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "UPDATE", 0)
+            IfCondition GreaterEqual(Desk.curprv, 0) ThenBlock: {
+                Desk_DrawBtn(Add(Desk.cx, 156), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "CONFIGURE", 1)
+            }
+            ElseBlock: {
+                Desk_DrawBtn(Add(Desk.cx, 156), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "CONFIGURE", 0)
+            }
+            Desk_DrawKeyStatus(Add(Desk.cx, 8), Add(Add(Desk.by, Desk.h2), 2))
+        }
+        IfCondition EqualTo(idx, Desk.wincfg) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 6), "Config  —  click a control", FB_RGB(0, 196, 198))
+            Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 28), 140, 28, "AUTO", Desk.auto)
+            Desk_DrawBtn(Add(Desk.cx, 156), Add(Desk.cy, 28), 140, 28, "TOOLS", Desk.tcomp)
+            IfCondition EqualTo(Desk.reason, 0) ThenBlock: {
+                Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 64), 288, 28, "REASON  off", 0)
+            }
+            IfCondition EqualTo(Desk.reason, 1) ThenBlock: {
+                Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 64), 288, 28, "REASON  min", 0)
+            }
+            IfCondition EqualTo(Desk.reason, 2) ThenBlock: {
+                Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 64), 288, 28, "REASON  medium", 0)
+            }
+            IfCondition EqualTo(Desk.reason, 3) ThenBlock: {
+                Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 64), 288, 28, "REASON  max", 0)
+            }
+            IfCondition GreaterThan(StringLength(Desk.proj), 0) ThenBlock: {
+                Desk_CopyZ(Desk.line, "project: ")
+                Desk.i = StringLength(Desk.line)
+                Desk.x = 0
+                WhileLoop And(LessThan(Desk.i, 78), NotEqual(GetByte(Desk.proj, Desk.x), 0)) {
+                    SetByte(Desk.line, Desk.i, GetByte(Desk.proj, Desk.x))
+                    Desk.i = Add(Desk.i, 1)
+                    Desk.x = Add(Desk.x, 1)
+                }
+                SetByte(Desk.line, Desk.i, 0)
+                Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 92), Desk.line, FB_RGB(0, 196, 198))
+            }
+            ElseBlock: {
+                Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 92), "project: (none)", FB_RGB(154, 164, 184))
+            }
+            IfCondition GreaterThan(StringLength(Desk.thread), 0) ThenBlock: {
+                Desk_CopyZ(Desk.line, "thread: ")
+                Desk.i = StringLength(Desk.line)
+                Desk.x = 0
+                WhileLoop And(LessThan(Desk.i, 78), NotEqual(GetByte(Desk.thread, Desk.x), 0)) {
+                    SetByte(Desk.line, Desk.i, GetByte(Desk.thread, Desk.x))
+                    Desk.i = Add(Desk.i, 1)
+                    Desk.x = Add(Desk.x, 1)
+                }
+                SetByte(Desk.line, Desk.i, 0)
+                Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 108), Desk.line, FB_RGB(0, 196, 198))
+            }
+            ElseBlock: {
+                Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 108), "thread: (none)", FB_RGB(154, 164, 184))
+            }
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 124), "providers: anthropic deepseek gemini", FB_RGB(232, 238, 248))
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 140), "            groq ollama openai xai", FB_RGB(232, 238, 248))
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 164), "./setup.sh writes ~/.halcode/", FB_RGB(154, 164, 184))
+        }
+        IfCondition EqualTo(idx, Desk.winses) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 4), "Session", FB_RGB(0, 196, 198))
+            IfCondition EqualTo(Desk.sesact, 0) ThenBlock: {
+                Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 22), 100, 28, "NEW", 1)
+                Desk_DrawBtn(Add(Desk.cx, 116), Add(Desk.cy, 22), 110, 28, "RESUME", 0)
+            }
+            ElseBlock: {
+                IfCondition EqualTo(Desk.sesact, 1) ThenBlock: {
+                    Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 22), 100, 28, "NEW", 0)
+                    Desk_DrawBtn(Add(Desk.cx, 116), Add(Desk.cy, 22), 110, 28, "RESUME", 1)
+                }
+                ElseBlock: {
+                    Desk_DrawBtn(Add(Desk.cx, 8), Add(Desk.cy, 22), 100, 28, "NEW", 0)
+                    Desk_DrawBtn(Add(Desk.cx, 116), Add(Desk.cy, 22), 110, 28, "RESUME", 0)
+                }
+            }
+            Desk_DrawBtn(Add(Desk.cx, 234), Add(Desk.cy, 22), 90, 28, "HOME", 0)
+            Desk.li = Desk_SesRows()
+            IfCondition LessEqual(Desk.sesn, Desk.li) ThenBlock: { Desk.sesoff = 0 }
+            ElseBlock: {
+                IfCondition GreaterThan(Desk.sesoff, Subtract(Desk.sesn, Desk.li)) ThenBlock: {
+                    Desk.sesoff = Subtract(Desk.sesn, Desk.li)
+                }
+            }
+            IfCondition LessThan(Desk.sesoff, 0) ThenBlock: { Desk.sesoff = 0 }
+            IfCondition EqualTo(Desk.sesn, 0) ThenBlock: {
+                Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 60), "no saved sessions", FB_RGB(154, 164, 184))
+            }
+            ElseBlock: {
+                Desk.i = 0
+                WhileLoop LessThan(Desk.i, Desk.li) {
+                    Desk.sx = Add(Desk.sesoff, Desk.i)
+                    IfCondition LessThan(Desk.sx, Desk.sesn) ThenBlock: {
+                        Desk.y = Add(Add(Desk.cy, 58), Multiply(Desk.i, 30))
+                        Desk_DrawBtn(Add(Desk.cx, 8), Desk.y, Subtract(AppDesk.CW(idx), Add(20, Desk.sbw)), 26, Add(Desk.sesbase, Multiply(Desk.sx, 81)), 0)
+                    }
+                    Desk.i = Add(Desk.i, 1)
+                }
+            }
+            Desk_DrawVScroll(Subtract(Add(Desk.cx, AppDesk.CW(idx)), Add(Desk.sbw, 4)), Add(Desk.cy, 58), Subtract(AppDesk.CH(idx), 66), Desk.li, Desk.sesn, Desk.sesoff)
+        }
+        FB_ClearClip()
+    }
+}
+
+Function.Desk_Draw {
+    Body: {
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: { Desk_BindSurf() }
+        Desk_DrawBg()
+        Desk.zi = 0
+        WhileLoop LessThan(Desk.zi, AppDesk.Count()) {
+            Desk.idx = AppDesk.AtZ(Desk.zi)
+            AppDesk.DrawChrome(Desk.idx)
+            IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+                Desk.cx = AppDesk.CX(Desk.idx)
+                Desk.cy = AppDesk.CY(Desk.idx)
+                FB_FillRect(Add(Desk.cx, 4), Add(Desk.cy, 2), Subtract(AppDesk.CW(Desk.idx), 30), 20, FB_RGB(0, 196, 196))
+                IfCondition EqualTo(Desk.idx, AppDesk.focus) ThenBlock: {
+                    FB_FillRect(Add(Desk.cx, 4), Add(Desk.cy, 2), Subtract(AppDesk.CW(Desk.idx), 30), 20, FB_RGB(0, 160, 220))
+                }
+                Desk.mp = AppDesk.Get(Desk.idx, AppDeskWin.TITLE)
+                IfCondition EqualTo(Desk.mp, 0) ThenBlock: { Desk.mp = "win" }
+                Desk_DrawTxt(Add(Desk.cx, 8), Add(Desk.cy, 2), Desk.mp, FB_RGB(0, 0, 0))
+            }
+            Desk_DrawContent(Desk.idx)
+            Desk.zi = Add(Desk.zi, 1)
+        }
+        // START splash removed — Sessions has NEW/RESUME.
+    }
+}
+
+Function.Desk_DrawModal {
+    Body: {
+        PrintMessage("[desk] DRAW START MENU\n")
+        Desk.bx = Divide(Subtract(FB.width, 460), 2)
+        Desk.by = Divide(Subtract(FB.height, 320), 2)
+        IfCondition LessThan(Desk.bx, 20) ThenBlock: { Desk.bx = 20 }
+        IfCondition LessThan(Desk.by, 36) ThenBlock: { Desk.by = 36 }
+        FB_FillRect(0, 0, FB.width, FB.height, FB_RGB(8, 10, 14))
+        FB_FillRect(Desk.bx, Desk.by, 460, 320, FB_RGB(22, 28, 38))
+        FB_Rect(Desk.bx, Desk.by, 460, 320, FB_RGB(0, 196, 198))
+        FB_FillRect(Desk.bx, Desk.by, 460, 28, FB_RGB(10, 72, 74))
+        Desk_DrawTxt(Add(Desk.bx, 14), Add(Desk.by, 8), "START", FB_RGB(0, 220, 222))
+        Desk_DrawTxt(Add(Desk.bx, 14), Add(Desk.by, 40), "Choose how to begin", FB_RGB(154, 164, 184))
+        Desk_DrawBtn(Add(Desk.bx, 20), Add(Desk.by, 64), 200, 36, "NEW", 0)
+        Desk_DrawBtn(Add(Desk.bx, 240), Add(Desk.by, 64), 200, 36, "RESUME", 1)
+        IfCondition EqualTo(Desk.sesn, 0) ThenBlock: {
+            Desk_DrawTxt(Add(Desk.bx, 20), Add(Desk.by, 116), "no saved sessions in pgmem", FB_RGB(154, 164, 184))
+        }
+        ElseBlock: {
+            Desk.i = 0
+            WhileLoop And(LessThan(Desk.i, Desk.sesn), LessThan(Desk.i, 5)) {
+                Desk.y = Add(Add(Desk.by, 116), Multiply(Desk.i, 32))
+                Desk_DrawBtn(Add(Desk.bx, 20), Desk.y, 420, 28, Add(Desk.sesbase, Multiply(Desk.i, 81)), 0)
+                Desk.i = Add(Desk.i, 1)
+            }
+        }
+    }
+}
+
+Function.Desk_PtrEvent {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Desk.h2, 100) ThenBlock: {
+            Desk_Dbg("ptr down")
+            AppDesk.Down(Desk.mx, Desk.my)
+            Desk.bar = 0
+            IfCondition And(EqualTo(AppDesk.HitKind(), 1), EqualTo(AppDesk.hit_idx, Desk.chat)) ThenBlock: {
+                Desk.infocus = 1
+                IfCondition EqualTo(Desk_HitBtn(Subtract(Add(AppDesk.CX(Desk.chat), AppDesk.CW(Desk.chat)), 88), Add(AppDesk.CY(Desk.chat), 4), 76, 24), 1) ThenBlock: {
+                    AppDesk.Raise(Desk.chat)
+                    Desk.infocus = 1
+                    Desk.dirty = 1
+                }
+                IfCondition EqualTo(InputBar.HitScroll(Desk.mx, Desk.my), 1) ThenBlock: {
+                    InputBar.Drag(Desk.my)
+                    Desk.bar = 3
+                }
+                IfCondition And(GreaterThan(Desk.logn, Desk.chatvis), GreaterEqual(Desk.mx, Subtract(Add(AppDesk.CX(Desk.chat), AppDesk.CW(Desk.chat)), Add(Desk.sbw, 2)))) ThenBlock: {
+                    Desk.logoff = Desk_HitVScroll(Add(AppDesk.CY(Desk.chat), 32), Desk.logh, Desk.chatvis, Desk.logn)
+                    Desk.bar = 1
+                }
+                IfCondition And(EqualTo(Desk.bar, 0), EqualTo(InputBar.Hit(Desk.mx, Desk.my), 1)) ThenBlock: {
+                    InputBar.Click(Desk.mx, Desk.my)
+                    Desk.ssrc = 3
+                    Desk.bar = 4
+                }
+                IfCondition And(EqualTo(Desk.bar, 0), EqualTo(Desk_HitLog(0), 1)) ThenBlock: {
+                    Desk.s0l = Desk.row
+                    Desk.s0c = Desk.wi
+                    Desk.s1l = Desk.row
+                    Desk.s1c = Desk.wi
+                    Desk.ssrc = 1
+                    InputBar.ClearSel()
+                    Desk.bar = 5
+                }
+            }
+            ElseBlock: {
+                IfCondition EqualTo(AppDesk.HitKind(), 1) ThenBlock: { Desk.infocus = 0 }
+            }
+            IfCondition And(EqualTo(AppDesk.HitKind(), 1), EqualTo(AppDesk.hit_idx, Desk.winthk)) ThenBlock: {
+                IfCondition And(GreaterThan(Desk.thkn, Desk.thkvis), GreaterEqual(Desk.mx, Subtract(Add(AppDesk.CX(Desk.winthk), AppDesk.CW(Desk.winthk)), 10))) ThenBlock: {
+                    Desk.thkoff = Desk_HitVScroll(Add(AppDesk.CY(Desk.winthk), 28), Subtract(AppDesk.CH(Desk.winthk), 32), Desk.thkvis, Desk.thkn)
+                    Desk.bar = 2
+                }
+                IfCondition And(EqualTo(Desk.bar, 0), EqualTo(Desk_HitLog(1), 1)) ThenBlock: {
+                    Desk.s0l = Desk.row
+                    Desk.s0c = Desk.wi
+                    Desk.s1l = Desk.row
+                    Desk.s1c = Desk.wi
+                    Desk.ssrc = 2
+                    InputBar.ClearSel()
+                    Desk.bar = 6
+                }
+            }
+            IfCondition EqualTo(AppDesk.HitKind(), 1) ThenBlock: {
+                Desk_ClickRow(AppDesk.hit_idx)
+            }
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.h2, 109) ThenBlock: {
+            IfCondition EqualTo(Desk.bar, 1) ThenBlock: {
+                Desk.logoff = Desk_HitVScroll(Add(AppDesk.CY(Desk.chat), 32), Desk.logh, Desk.chatvis, Desk.logn)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 2) ThenBlock: {
+                Desk.thkoff = Desk_HitVScroll(Add(AppDesk.CY(Desk.winthk), 28), Subtract(AppDesk.CH(Desk.winthk), 32), Desk.thkvis, Desk.thkn)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 3) ThenBlock: {
+                InputBar.Drag(Desk.my)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 4) ThenBlock: {
+                InputBar.DragSel(Desk.mx, Desk.my)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 5) ThenBlock: {
+                IfCondition EqualTo(Desk_HitLog(0), 1) ThenBlock: {
+                    Desk.s1l = Desk.row
+                    Desk.s1c = Desk.wi
+                }
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 6) ThenBlock: {
+                IfCondition EqualTo(Desk_HitLog(1), 1) ThenBlock: {
+                    Desk.s1l = Desk.row
+                    Desk.s1c = Desk.wi
+                }
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 7) ThenBlock: {
+                Desk.sa = Desk_ListTrack()
+                Desk.prvoff = Desk_HitVScroll(Add(AppDesk.CY(Desk.winmod), 46), Desk.sa, Desk_ListRows(), Desk.nprv)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 8) ThenBlock: {
+                Desk.sa = Desk_ListTrack()
+                Desk.modoff = Desk_HitVScroll(Add(AppDesk.CY(Desk.winmod), 46), Desk.sa, Desk_ListRows(), Desk.modn)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.bar, 9) ThenBlock: {
+                Desk.sesoff = Desk_HitVScroll(Add(AppDesk.CY(Desk.winses), 58), Subtract(AppDesk.CH(Desk.winses), 66), Desk_SesRows(), Desk.sesn)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(AppDesk.Move(Desk.mx, Desk.my), 1) ThenBlock: { Desk.dirty = 1 }
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.h2, 117) ThenBlock: {
+            Desk.bar = 0
+            AppDesk.Up()
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition Or(EqualTo(Desk.h2, 119), EqualTo(Desk.h2, 87)) ThenBlock: {
+            IfCondition EqualTo(Desk.h2, 119) ThenBlock: { Desk.n = 3 }
+            ElseBlock: { Desk.n = Subtract(0, 3) }
+            IfCondition EqualTo(Desk_InWin(Desk.chat), 1) ThenBlock: {
+                IfCondition EqualTo(InputBar.Hit(Desk.mx, Desk.my), 1) ThenBlock: {
+                    InputBar.Wheel(Desk.n)
+                    Desk.dirty = 1
+                    ReturnValue(1)
+                }
+                Desk.logoff = Add(Desk.logoff, Desk.n)
+                IfCondition LessThan(Desk.logoff, 0) ThenBlock: { Desk.logoff = 0 }
+                IfCondition GreaterThan(Desk.logn, Desk.chatvis) ThenBlock: {
+                    IfCondition GreaterThan(Desk.logoff, Subtract(Desk.logn, Desk.chatvis)) ThenBlock: {
+                        Desk.logoff = Subtract(Desk.logn, Desk.chatvis)
+                    }
+                }
+                ElseBlock: { Desk.logoff = 0 }
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk_InWin(Desk.winthk), 1) ThenBlock: {
+                Desk.thkoff = Add(Desk.thkoff, Desk.n)
+                IfCondition LessThan(Desk.thkoff, 0) ThenBlock: { Desk.thkoff = 0 }
+                IfCondition GreaterThan(Desk.thkn, Desk.thkvis) ThenBlock: {
+                    IfCondition GreaterThan(Desk.thkoff, Subtract(Desk.thkn, Desk.thkvis)) ThenBlock: {
+                        Desk.thkoff = Subtract(Desk.thkn, Desk.thkvis)
+                    }
+                }
+                ElseBlock: { Desk.thkoff = 0 }
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk_InWin(Desk.winmod), 1) ThenBlock: {
+                IfCondition LessThan(Desk.mx, Add(AppDesk.CX(Desk.winmod), 210)) ThenBlock: {
+                    Desk.prvoff = Add(Desk.prvoff, Desk.n)
+                    IfCondition LessThan(Desk.prvoff, 0) ThenBlock: { Desk.prvoff = 0 }
+                }
+                ElseBlock: {
+                    Desk.modoff = Add(Desk.modoff, Desk.n)
+                    IfCondition LessThan(Desk.modoff, 0) ThenBlock: { Desk.modoff = 0 }
+                }
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk_InWin(Desk.winses), 1) ThenBlock: {
+                Desk.sesoff = Add(Desk.sesoff, Desk.n)
+                IfCondition LessThan(Desk.sesoff, 0) ThenBlock: { Desk.sesoff = 0 }
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Desk_PollPtr {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Desk.ptr, 0) ThenBlock: { Desk.ptr = Allocate(80) }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/ptr.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.rbuf, 2047, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.rbuf, Desk.n, 0)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/ptr.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        Desk.pend = Desk.n
+        Desk.poff = 0
+        Desk.c = 0
+        PrintMessage("[desk] pollptr in\n")
+        WhileLoop LessThan(Desk.poff, Desk.pend) {
+            Desk.i = 0
+            WhileLoop And(LessThan(Desk.poff, Desk.pend), NotEqual(GetByte(Desk.rbuf, Desk.poff), 10)) {
+                IfCondition LessThan(Desk.i, 79) ThenBlock: {
+                    SetByte(Desk.ptr, Desk.i, GetByte(Desk.rbuf, Desk.poff))
+                    Desk.i = Add(Desk.i, 1)
+                }
+                Desk.poff = Add(Desk.poff, 1)
+            }
+            IfCondition EqualTo(GetByte(Desk.rbuf, Desk.poff), 10) ThenBlock: { Desk.poff = Add(Desk.poff, 1) }
+            IfCondition GreaterThan(Desk.i, 0) ThenBlock: {
+                SetByte(Desk.ptr, Desk.i, 0)
+                Desk.h2 = GetByte(Desk.ptr, 0)
+                IfCondition EqualTo(Desk_ParseXY(), 1) ThenBlock: {
+                    Desk_PtrEvent()
+                    Desk.c = 1
+                }
+            }
+        }
+        PrintMessage("[desk] pollptr out\n")
+        ReturnValue(Desk.c)
+    }
+}
+
+Function.Desk_PollCmd {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Desk.cmd, 0) ThenBlock: { Desk.cmd = Allocate(80) }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/cmd.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.cmd, 79, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.cmd, Desk.n, 0)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/cmd.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        Desk.c = GetByte(Desk.cmd, 0)
+        IfCondition EqualTo(Desk.c, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.c, 113) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Desk.c, 77) ThenBlock: {
+            AppDesk.Raise(Desk.winmod)
+            Desk.dirty = 1
+            ReturnValue(2)
+        }
+        IfCondition EqualTo(Desk.c, 67) ThenBlock: {
+            AppDesk.Raise(Desk.wincfg)
+            Desk.dirty = 1
+            ReturnValue(2)
+        }
+        IfCondition EqualTo(Desk.c, 83) ThenBlock: {
+            Desk_WriteFile("/tmp/halcode_app/session.txt", "last")
+            Desk.chose = 1
+            Desk_LogPush("resume last pgmem session")
+            AppDesk.Raise(Desk.winses)
+            Desk.dirty = 1
+            ReturnValue(2)
+        }
+        IfCondition EqualTo(Desk.c, 78) ThenBlock: {
+            Desk_DoNew()
+            ReturnValue(2)
+        }
+        IfCondition EqualTo(Desk.c, 65) ThenBlock: {
+            Desk.auto = Subtract(1, Desk.auto)
+            Desk.dirty = 1
+            ReturnValue(2)
+        }
+        IfCondition EqualTo(Desk.c, 84) ThenBlock: {
+            Desk.tcomp = Subtract(1, Desk.tcomp)
+            Desk.dirty = 1
+            ReturnValue(2)
+        }
+        IfCondition EqualTo(Desk.c, 72) ThenBlock: {
+            Desk_LogPush("/help /model /models /config")
+            Desk_LogPush("/sessions /resume /new /clear /save")
+            Desk_LogPush("/auto /tools /project /thread")
+            Desk_LogPush("/reasoning /undo /redo /quit")
+            AppDesk.Raise(Desk.chat)
+            Desk.infocus = 1
+            Desk.dirty = 1
+            ReturnValue(2)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Desk_PollKeys {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Desk.keys, 0) ThenBlock: { Desk.keys = Allocate(80) }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/keys.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.keys, 79, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.keys, Desk.n, 0)
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/keys.txt", 577, 420, 0)
+        IfCondition GreaterEqual(Desk.fd, 0) ThenBlock: { SystemCall(3, Desk.fd, 0, 0, 0, 0) }
+        Desk.c = GetByte(Desk.keys, 0)
+        IfCondition EqualTo(Desk.c, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.kmode, 1) ThenBlock: {
+            IfCondition EqualTo(Desk.c, 101) ThenBlock: {
+                Desk_KeyWipe()
+                Desk_Note("configure cancelled")
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.c, 114) ThenBlock: {
+                IfCondition GreaterEqual(Desk.klen, 1) ThenBlock: {
+                    Desk_SaveKey()
+                }
+                ElseBlock: {
+                    Desk_Note("paste an API key first")
+                }
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.c, 98) ThenBlock: {
+                IfCondition GreaterThan(Desk.klen, 0) ThenBlock: {
+                    Desk.klen = Subtract(Desk.klen, 1)
+                    SetByte(Desk.kbuf, Desk.klen, 0)
+                    Desk.dirty = 1
+                }
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Desk.c, 99) ThenBlock: {
+                Desk.kch = Desk_Atoi(Add(Desk.keys, 2))
+                Desk_KeyPush(Desk.kch)
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 98) ThenBlock: {
+            Desk_KeyBs()
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 114) ThenBlock: {
+            Desk_KeyRet()
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 99) ThenBlock: {
+            Desk.kch = Desk_Atoi(Add(Desk.keys, 2))
+            Desk_KeyChar(Desk.kch)
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 121) ThenBlock: {
+            Desk_DoCopy()
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 97) ThenBlock: {
+            IfCondition EqualTo(Desk.ssrc, 1) ThenBlock: {
+                Desk.s0l = 0
+                Desk.s0c = 0
+                Desk.s1l = Subtract(Desk.logn, 1)
+                Desk.s1c = Subtract(Desk.lln, 1)
+                IfCondition LessThan(Desk.s1l, 0) ThenBlock: { Desk.s1l = 0 }
+            }
+            ElseBlock: {
+                InputBar.SelectAll()
+                Desk.ssrc = 3
+            }
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        Desk.infocus = 1
+        AppDesk.Raise(Desk.chat)
+        IfCondition EqualTo(Desk.c, 108) ThenBlock: {
+            InputBar.ShiftLeft()
+            Desk.ssrc = 3
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 109) ThenBlock: {
+            InputBar.ShiftRight()
+            Desk.ssrc = 3
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 76) ThenBlock: {
+            IfCondition EqualTo(InputBar.HasSel(), 1) ThenBlock: {
+                InputBar.Collapse(0)
+            }
+            ElseBlock: {
+                InputBar.Left()
+                InputBar.ClearSel()
+            }
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 82) ThenBlock: {
+            IfCondition EqualTo(InputBar.HasSel(), 1) ThenBlock: {
+                InputBar.Collapse(1)
+            }
+            ElseBlock: {
+                InputBar.Right()
+                InputBar.ClearSel()
+            }
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 85) ThenBlock: {
+            InputBar.Up()
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 68) ThenBlock: {
+            InputBar.Down()
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 72) ThenBlock: {
+            InputBar.Home()
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 69) ThenBlock: {
+            InputBar.End()
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 88) ThenBlock: {
+            InputBar.Del()
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk.c, 84) ThenBlock: {
+            InputBar.Tab()
+            Desk.dirty = 1
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Desk_ClickModal {
+    Output: Integer
+    Body: {
+        Desk.bx = Divide(Subtract(FB.width, 460), 2)
+        Desk.by = Divide(Subtract(FB.height, 320), 2)
+        IfCondition LessThan(Desk.bx, 20) ThenBlock: { Desk.bx = 20 }
+        IfCondition LessThan(Desk.by, 36) ThenBlock: { Desk.by = 36 }
+        IfCondition EqualTo(Desk_HitBtn(Add(Desk.bx, 20), Add(Desk.by, 64), 200, 36), 1) ThenBlock: {
+            PrintMessage("[desk] START MENU click NEW\n")
+            Desk_DoNew()
+            PrintMessage("[desk] START MENU left via NEW\n")
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Desk_HitBtn(Add(Desk.bx, 240), Add(Desk.by, 64), 200, 36), 1) ThenBlock: {
+            PrintMessage("[desk] START MENU click RESUME\n")
+            Desk_DoResume()
+            PrintMessage("[desk] START MENU left via RESUME\n")
+            ReturnValue(1)
+        }
+        Desk.i = 0
+        WhileLoop And(LessThan(Desk.i, Desk.sesn), LessThan(Desk.i, 5)) {
+            Desk.y = Add(Add(Desk.by, 116), Multiply(Desk.i, 32))
+            IfCondition EqualTo(Desk_HitBtn(Add(Desk.bx, 20), Desk.y, 420, 28), 1) ThenBlock: {
+                Desk_WriteFile("/tmp/halcode_app/session.txt", Add(Desk.sesids, Multiply(Desk.i, 81)))
+                Desk.chose = 1
+                Desk_LogPush(Add(Desk.sesids, Multiply(Desk.i, 81)))
+                AppDesk.Raise(Desk.chat)
+                Desk.infocus = 1
+                Desk.dirty = 1
+                ReturnValue(1)
+            }
+            Desk.i = Add(Desk.i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Desk_ClickRow {
+    Input: idx: Integer
+    Body: {
+        Desk.row = Divide(Subtract(Desk.my, Add(AppDesk.CY(idx), 28)), 16)
+        IfCondition LessThan(Desk.row, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(idx, Desk.winmod) ThenBlock: {
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 8), Subtract(Add(AppDesk.CY(idx), AppDesk.CH(idx)), 32), 140, 26), 1) ThenBlock: {
+                Desk_WriteFile("/tmp/halcode_app/provupd.txt", "1")
+                Desk_LogPush("UPDATE providers (fetch_providers.py)")
+            }
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 156), Subtract(Add(AppDesk.CY(idx), AppDesk.CH(idx)), 32), 140, 26), 1) ThenBlock: {
+                IfCondition LessThan(Desk.curprv, 0) ThenBlock: {
+                    Desk_Note("select a provider")
+                }
+                ElseBlock: {
+                    Desk.mp = Add(Desk.prvbase, Multiply(Desk.curprv, 16))
+                    IfCondition EqualTo(StringCompare(Desk.mp, "ollama"), 0) ThenBlock: {
+                        Desk_Note("ollama is local and needs no API key")
+                    }
+                    ElseBlock: {
+                        IfCondition EqualTo(Desk.kbuf, 0) ThenBlock: { Desk.kbuf = Allocate(512) }
+                        Desk_KeyWipe()
+                        Desk.kmode = 1
+                        Desk.kprv = Desk.curprv
+                        Desk_LogConfigure()
+                    }
+                }
+            }
+            Desk.bx = Add(AppDesk.CX(idx), 8)
+            Desk.by = Add(AppDesk.CY(idx), 46)
+            Desk.h2 = Desk_ListTrack()
+            IfCondition And(GreaterEqual(Desk.mx, Subtract(Add(Desk.bx, 200), Add(Desk.sbw, 2))), LessThan(Desk.mx, Add(Desk.bx, 200))) ThenBlock: {
+                IfCondition And(GreaterEqual(Desk.my, Desk.by), LessThan(Desk.my, Add(Desk.by, Desk.h2))) ThenBlock: {
+                    Desk.prvoff = Desk_HitVScroll(Desk.by, Desk.h2, Desk_ListRows(), Desk.nprv)
+                    Desk.bar = 7
+                    ReturnValue(0)
+                }
+            }
+            IfCondition And(GreaterEqual(Desk.mx, Desk.bx), LessThan(Desk.mx, Subtract(Add(Desk.bx, 200), Add(Desk.sbw, 2)))) ThenBlock: {
+                IfCondition And(GreaterEqual(Desk.my, Desk.by), LessThan(Desk.my, Add(Desk.by, Desk.h2))) ThenBlock: {
+                    Desk.row = Divide(Subtract(Desk.my, Desk.by), 16)
+                    IfCondition LessThan(Desk.row, Desk_ListRows()) ThenBlock: {
+                        Desk.row = Add(Desk.row, Desk.prvoff)
+                        IfCondition And(GreaterEqual(Desk.row, 0), LessThan(Desk.row, Desk.nprv)) ThenBlock: {
+                            IfCondition And(EqualTo(Desk.kmode, 1), NotEqual(Desk.kprv, Desk.row)) ThenBlock: {
+                                Desk_KeyWipe()
+                                Desk_Note("configure cancelled")
+                            }
+                            Desk.curprv = Desk.row
+                            Desk.curmod = -1
+                            Desk.modoff = 0
+                        }
+                    }
+                }
+            }
+            Desk.x = Add(AppDesk.CX(idx), 216)
+            Desk.bw = Subtract(AppDesk.CW(idx), 224)
+            Desk.w = Subtract(Add(Desk.x, Desk.bw), Add(Desk.sbw, 2))
+            IfCondition And(GreaterEqual(Desk.mx, Desk.w), LessThan(Desk.mx, Add(Desk.x, Desk.bw))) ThenBlock: {
+                IfCondition And(GreaterEqual(Desk.my, Desk.by), LessThan(Desk.my, Add(Desk.by, Desk.h2))) ThenBlock: {
+                    Desk.modoff = Desk_HitVScroll(Desk.by, Desk.h2, Desk_ListRows(), Desk.modn)
+                    Desk.bar = 8
+                    ReturnValue(0)
+                }
+            }
+            IfCondition And(GreaterEqual(Desk.curprv, 0), And(GreaterEqual(Desk.mx, Desk.x), LessThan(Desk.mx, Desk.w))) ThenBlock: {
+                IfCondition And(GreaterEqual(Desk.my, Desk.by), LessThan(Desk.my, Add(Desk.by, Desk.h2))) ThenBlock: {
+                    Desk.row = Add(Divide(Subtract(Desk.my, Desk.by), 16), Desk.modoff)
+                    Desk.h2 = 0
+                    Desk.i = 0
+                    WhileLoop LessThan(Desk.i, Desk.nmod) {
+                        Desk.mp = Dereference(Add(Desk.modptr, Multiply(Desk.i, 8)))
+                        IfCondition EqualTo(Desk_SpecProv(Desk.mp, Add(Desk.prvbase, Multiply(Desk.curprv, 16))), 1) ThenBlock: {
+                            IfCondition EqualTo(Desk.h2, Desk.row) ThenBlock: {
+                                Desk.curmod = Desk.i
+                                Desk_WriteFile("/tmp/halcode_app/model.txt", Desk.mp)
+                                Desk_LogPush(Desk.mp)
+                            }
+                            Desk.h2 = Add(Desk.h2, 1)
+                        }
+                        Desk.i = Add(Desk.i, 1)
+                    }
+                }
+            }
+        }
+        IfCondition EqualTo(idx, Desk.wincfg) ThenBlock: {
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 8), Add(AppDesk.CY(idx), 28), 140, 28), 1) ThenBlock: {
+                Desk.auto = Subtract(1, Desk.auto)
+            }
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 156), Add(AppDesk.CY(idx), 28), 140, 28), 1) ThenBlock: {
+                Desk.tcomp = Subtract(1, Desk.tcomp)
+            }
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 8), Add(AppDesk.CY(idx), 64), 288, 28), 1) ThenBlock: {
+                Desk.reason = Add(Desk.reason, 1)
+                IfCondition GreaterThan(Desk.reason, 3) ThenBlock: { Desk.reason = 0 }
+            }
+        }
+        IfCondition EqualTo(idx, Desk.winses) ThenBlock: {
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 8), Add(AppDesk.CY(idx), 22), 100, 28), 1) ThenBlock: {
+                Desk_DoNew()
+            }
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 116), Add(AppDesk.CY(idx), 22), 110, 28), 1) ThenBlock: {
+                Desk_DoResume()
+            }
+            IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 234), Add(AppDesk.CY(idx), 22), 90, 28), 1) ThenBlock: {
+                AppDesk.Raise(Desk.chat)
+                Desk.infocus = 1
+            }
+            Desk.w = Subtract(Add(AppDesk.CX(idx), AppDesk.CW(idx)), Add(Desk.sbw, 4))
+            IfCondition And(GreaterEqual(Desk.mx, Desk.w), GreaterEqual(Desk.my, Add(AppDesk.CY(idx), 58))) ThenBlock: {
+                Desk.sesoff = Desk_HitVScroll(Add(AppDesk.CY(idx), 58), Subtract(AppDesk.CH(idx), 66), Desk_SesRows(), Desk.sesn)
+                Desk.bar = 9
+                ReturnValue(0)
+            }
+            Desk.i = 0
+            WhileLoop LessThan(Desk.i, Desk_SesRows()) {
+                Desk.sx = Add(Desk.sesoff, Desk.i)
+                IfCondition LessThan(Desk.sx, Desk.sesn) ThenBlock: {
+                    Desk.y = Add(Add(AppDesk.CY(idx), 58), Multiply(Desk.i, 30))
+                    IfCondition EqualTo(Desk_HitBtn(Add(AppDesk.CX(idx), 8), Desk.y, Subtract(AppDesk.CW(idx), Add(20, Desk.sbw)), 26), 1) ThenBlock: {
+                        Desk_WriteFile("/tmp/halcode_app/session.txt", Add(Desk.sesids, Multiply(Desk.sx, 81)))
+                        Desk.chose = 1
+                        Desk.sesact = 1
+                        Desk_LogPush(Add(Desk.sesids, Multiply(Desk.sx, 81)))
+                        AppDesk.Raise(Desk.chat)
+                        Desk.infocus = 1
+                    }
+                }
+                Desk.i = Add(Desk.i, 1)
+            }
+        }
+    }
+}
+
+Function.Desk_ProvLabel {
+    Input: prv: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(StringCompare(prv, "xai"), 0) ThenBlock: {
+            ReturnValue("xAI Grok")
+        }
+        ReturnValue(prv)
+    }
+}
+
+Function.Desk_SpecName {
+    Input: spec: Address
+    Output: Integer
+    Body: {
+        Desk.n = 0
+        WhileLoop LessThan(Desk.n, 80) {
+            Desk.c = GetByte(spec, Desk.n)
+            IfCondition EqualTo(Desk.c, 0) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(Desk.c, 58) ThenBlock: { ReturnValue(Add(Desk.n, 1)) }
+            Desk.n = Add(Desk.n, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Desk_SpecProv {
+    Input: spec: Address
+    Input: prv: Address
+    Output: Integer
+    Body: {
+        Desk.n = 0
+        WhileLoop LessThan(Desk.n, 16) {
+            Desk.c = GetByte(prv, Desk.n)
+            IfCondition EqualTo(Desk.c, 0) ThenBlock: {
+                IfCondition EqualTo(GetByte(spec, Desk.n), 58) ThenBlock: { ReturnValue(1) }
+                ReturnValue(0)
+            }
+            IfCondition NotEqual(GetByte(spec, Desk.n), Desk.c) ThenBlock: { ReturnValue(0) }
+            Desk.n = Add(Desk.n, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Desk_FillProvs {
+    Body: {
+        IfCondition EqualTo(Desk.kmode, 1) ThenBlock: { Desk_KeyWipe() }
+        Desk.nprv = 0
+        Desk.curprv = -1
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, Desk.nmod) {
+            Desk.mp = Dereference(Add(Desk.modptr, Multiply(Desk.i, 8)))
+            Desk.n = 0
+            WhileLoop And(LessThan(Desk.n, 15), And(NotEqual(GetByte(Desk.mp, Desk.n), 0), NotEqual(GetByte(Desk.mp, Desk.n), 58))) {
+                SetByte(Desk.line, Desk.n, GetByte(Desk.mp, Desk.n))
+                Desk.n = Add(Desk.n, 1)
+            }
+            SetByte(Desk.line, Desk.n, 0)
+            Desk.h2 = 0
+            Desk.x = 0
+            WhileLoop LessThan(Desk.x, Desk.nprv) {
+                Desk.n = 0
+                Desk.c = 1
+                WhileLoop LessThan(Desk.n, 16) {
+                    IfCondition NotEqual(GetByte(Desk.line, Desk.n), GetByte(Add(Desk.prvbase, Multiply(Desk.x, 16)), Desk.n)) ThenBlock: {
+                        Desk.c = 0
+                        Desk.n = 16
+                    }
+                    ElseBlock: {
+                        IfCondition EqualTo(GetByte(Desk.line, Desk.n), 0) ThenBlock: { Desk.n = 16 }
+                        ElseBlock: { Desk.n = Add(Desk.n, 1) }
+                    }
+                }
+                IfCondition EqualTo(Desk.c, 1) ThenBlock: { Desk.h2 = 1 }
+                Desk.x = Add(Desk.x, 1)
+            }
+            IfCondition And(EqualTo(Desk.h2, 0), LessThan(Desk.nprv, 40)) ThenBlock: {
+                Desk.n = 0
+                WhileLoop LessThan(Desk.n, 16) {
+                    SetByte(Add(Desk.prvbase, Multiply(Desk.nprv, 16)), Desk.n, GetByte(Desk.line, Desk.n))
+                    Desk.n = Add(Desk.n, 1)
+                }
+                Desk.nprv = Add(Desk.nprv, 1)
+            }
+            Desk.i = Add(Desk.i, 1)
+        }
+    }
+}
+
+Function.Desk_Stamp {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Desk.rbuf, 0) ThenBlock: { Desk.rbuf = Allocate(8192) }
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/picker.stamp", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.rbuf, 31, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(Desk.n, 31) ThenBlock: { Desk.n = 31 }
+        SetByte(Desk.rbuf, Desk.n, 0)
+        ReturnValue(Desk_Atoi(Desk.rbuf))
+    }
+}
+
+Function.Desk_ReadPicker {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        Desk.fd = SystemCall(2, path, 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.pbuf, 0) ThenBlock: { Desk.pbuf = Allocate(262144) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.pbuf, 200000, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(Desk.n, 200000) ThenBlock: { Desk.n = 199999 }
+        SetByte(Desk.pbuf, Desk.n, 0)
+        Desk.pend = Desk.n
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_LoadPicker {
+    Output: Integer
+    Body: {
+        Desk.nmod = 0
+        IfCondition EqualTo(Desk_ReadPicker("/tmp/halcode_app/picker.txt"), 0) ThenBlock: {
+            IfCondition EqualTo(Desk_ReadPicker("providers/picker.txt"), 0) ThenBlock: { ReturnValue(0) }
+        }
+        Desk.modptr = Allocate(8192)
+        Desk.poff = 0
+        WhileLoop And(LessThan(Desk.poff, Desk.pend), LessThan(Desk.nmod, 1024)) {
+            Desk.sx = Desk.poff
+            Desk.i = 0
+            Desk.h2 = 0
+            WhileLoop And(LessThan(Desk.poff, Desk.pend), NotEqual(GetByte(Desk.pbuf, Desk.poff), 10)) {
+                IfCondition EqualTo(GetByte(Desk.pbuf, Desk.poff), 58) ThenBlock: { Desk.h2 = 1 }
+                Desk.i = Add(Desk.i, 1)
+                Desk.poff = Add(Desk.poff, 1)
+            }
+            IfCondition EqualTo(GetByte(Desk.pbuf, Desk.poff), 10) ThenBlock: { Desk.poff = Add(Desk.poff, 1) }
+            IfCondition GreaterThan(Desk.i, 0) ThenBlock: {
+                IfCondition NotEqual(GetByte(Desk.pbuf, Desk.sx), 35) ThenBlock: {
+                    IfCondition EqualTo(Desk.h2, 1) ThenBlock: {
+                        Desk.mp = Allocate(160)
+                        Desk.x = 0
+                        WhileLoop And(LessThan(Desk.x, Desk.i), LessThan(Desk.x, 158)) {
+                            SetByte(Desk.mp, Desk.x, GetByte(Desk.pbuf, Add(Desk.sx, Desk.x)))
+                            Desk.x = Add(Desk.x, 1)
+                        }
+                        SetByte(Desk.mp, Desk.x, 0)
+                        StoreValue(Add(Desk.modptr, Multiply(Desk.nmod, 8)), Desk.mp)
+                        Desk.nmod = Add(Desk.nmod, 1)
+                    }
+                }
+            }
+        }
+        ReturnValue(Desk.nmod)
+    }
+}
+
+Function.Desk_FillModels {
+    Body: {
+        Desk.pgen = Desk_Stamp()
+        IfCondition EqualTo(Desk_LoadPicker(), 0) ThenBlock: {
+            Desk.modptr = Allocate(32)
+            StoreValue(Desk.modptr, "deepseek:deepseek-v4-pro")
+            StoreValue(Add(Desk.modptr, 8), "deepseek:deepseek-flash")
+            Desk.nmod = 2
+            PrintMessage("[desk] models fallback\n")
+        }
+        ElseBlock: {
+            PrintMessage("[desk] models picker ")
+            PrintNumber(Desk.nmod)
+            PrintMessage("\n")
+        }
+        Desk.curmod = -1
+        Desk.prvoff = 0
+        Desk.modoff = 0
+        Desk_FillProvs()
+    }
+}
+
+Function.Desk_PollPicker {
+    Body: {
+        Desk.w = Desk_Stamp()
+        IfCondition EqualTo(Desk.w, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Desk.w, Desk.pgen) ThenBlock: { ReturnValue(0) }
+        Desk_FillModels()
+        Desk.dirty = 1
+        Desk_LogPush("Models updated")
+        ReturnValue(1)
+    }
+}
+
+Function.Desk_LayoutWins {
+    Body: {
+        Desk.n = Divide(FB.width, 20)
+        IfCondition LessThan(Desk.n, 16) ThenBlock: { Desk.n = 16 }
+        Desk.i = 36
+        Desk.w = Subtract(FB.width, Multiply(Desk.n, 2))
+        Desk.h2 = Subtract(FB.height, Add(Desk.i, 32))
+        IfCondition LessThan(Desk.w, 400) ThenBlock: { Desk.w = 400 }
+        IfCondition LessThan(Desk.h2, 300) ThenBlock: { Desk.h2 = 300 }
+        Desk.bx = Divide(Multiply(Desk.w, 52), 100)
+        Desk.bw = Subtract(Subtract(Desk.w, Desk.bx), 12)
+        Desk.by = Divide(Multiply(Desk.h2, 58), 100)
+        IfCondition GreaterEqual(Desk.chat, 0) ThenBlock: {
+            AppDesk.Set(Desk.chat, AppDeskWin.X, Desk.n)
+            AppDesk.Set(Desk.chat, AppDeskWin.Y, Desk.i)
+            AppDesk.Set(Desk.chat, AppDeskWin.W, Desk.bx)
+            AppDesk.Set(Desk.chat, AppDeskWin.H, Desk.by)
+        }
+        IfCondition GreaterEqual(Desk.winthk, 0) ThenBlock: {
+            AppDesk.Set(Desk.winthk, AppDeskWin.X, Desk.n)
+            AppDesk.Set(Desk.winthk, AppDeskWin.Y, Add(Add(Desk.i, Desk.by), 12))
+            AppDesk.Set(Desk.winthk, AppDeskWin.W, Desk.bx)
+            AppDesk.Set(Desk.winthk, AppDeskWin.H, Subtract(Subtract(Desk.h2, Desk.by), 12))
+        }
+        Desk.x = Add(Desk.n, Add(Desk.bx, 12))
+        Desk.by = Divide(Desk.h2, 3)
+        IfCondition GreaterEqual(Desk.winmod, 0) ThenBlock: {
+            AppDesk.Set(Desk.winmod, AppDeskWin.X, Desk.x)
+            AppDesk.Set(Desk.winmod, AppDeskWin.Y, Desk.i)
+            AppDesk.Set(Desk.winmod, AppDeskWin.W, Desk.bw)
+            AppDesk.Set(Desk.winmod, AppDeskWin.H, Desk.by)
+        }
+        IfCondition GreaterEqual(Desk.wincfg, 0) ThenBlock: {
+            AppDesk.Set(Desk.wincfg, AppDeskWin.X, Desk.x)
+            AppDesk.Set(Desk.wincfg, AppDeskWin.Y, Add(Add(Desk.i, Desk.by), 12))
+            AppDesk.Set(Desk.wincfg, AppDeskWin.W, Desk.bw)
+            AppDesk.Set(Desk.wincfg, AppDeskWin.H, Desk.by)
+        }
+        IfCondition GreaterEqual(Desk.winses, 0) ThenBlock: {
+            AppDesk.Set(Desk.winses, AppDeskWin.X, Desk.x)
+            AppDesk.Set(Desk.winses, AppDeskWin.Y, Add(Add(Desk.i, Multiply(Desk.by, 2)), 24))
+            AppDesk.Set(Desk.winses, AppDeskWin.W, Desk.bw)
+            AppDesk.Set(Desk.winses, AppDeskWin.H, Subtract(Subtract(Desk.h2, Multiply(Desk.by, 2)), 24))
+        }
+    }
+}
+
+Function.Desk_OpenWins {
+    Body: {
+        PrintMessage("[desk] OpenWins init\n")
+        AppDesk.Init()
+        PrintMessage("[desk] OpenWins models\n")
+        Desk_FillModels()
+        Desk.chat = AppDesk.Open(1, "Chat", 0)
+        AppDesk.Set(Desk.chat, AppDeskWin.KIND, 1)
+        Desk.winthk = AppDesk.Open(7, "Think", 0)
+        AppDesk.Set(Desk.winthk, AppDeskWin.KIND, 1)
+        Desk.winmod = AppDesk.Open(5, "Models", 0)
+        AppDesk.Set(Desk.winmod, AppDeskWin.KIND, 1)
+        Desk.wincfg = AppDesk.Open(4, "Config", 0)
+        AppDesk.Set(Desk.wincfg, AppDeskWin.KIND, 1)
+        Desk.winses = AppDesk.Open(6, "Sessions", 0)
+        AppDesk.Set(Desk.winses, AppDeskWin.KIND, 1)
+        Desk_LayoutWins()
+        AppDesk.Raise(Desk.chat)
+        Desk.infocus = 1
+        Desk_LogPush("Chat / Model / Config / Sessions")
+        PrintMessage("[desk] OpenWins done\n")
+    }
+}
+
+Function.Desk_PollSize {
+    Body: {
+        Desk.fd = SystemCall(2, "/tmp/halcode_app/size.txt", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.n = SystemCall(0, Desk.fd, Desk.rbuf, 63, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        SetByte(Desk.rbuf, Desk.n, 0)
+        nw = Desk_Atoi(Desk.rbuf)
+        nh = 0
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, 60) {
+            Desk.c = GetByte(Desk.rbuf, Desk.i)
+            IfCondition EqualTo(Desk.c, 0) ThenBlock: { Desk.i = 60 }
+            ElseBlock: {
+                IfCondition EqualTo(Desk.c, 32) ThenBlock: {
+                    nh = Desk_Atoi(Add(Desk.rbuf, Add(Desk.i, 1)))
+                    Desk.i = 60
+                }
+                ElseBlock: { Desk.i = Add(Desk.i, 1) }
+            }
+        }
+        IfCondition Or(LessThan(nw, 640), LessThan(nh, 400)) ThenBlock: { ReturnValue(0) }
+        IfCondition And(EqualTo(nw, FB.width), EqualTo(nh, FB.height)) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(FB_Resize(nw, nh), 0) ThenBlock: { ReturnValue(0) }
+        UIScale_Init(FB.width, FB.height)
+        Desk_LayoutWins()
+        IfCondition EqualTo(Desk.fused, 1) ThenBlock: {
+            Desk.fsz = UIScale.font_body
+            IfCondition LessThan(Desk.fsz, 14) ThenBlock: { Desk.fsz = 14 }
+            IfCondition GreaterThan(Desk.fsz, 28) ThenBlock: { Desk.fsz = 28 }
+            VFont_UseSize(Desk.fsz)
+            Desk.warmi = 0
+            Desk.warmn = FontState.glyph_count
+            Desk.fused = 0
+        }
+        Desk.dirty = 1
+        PrintMessage("[desk] resize ")
+        PrintNumber(FB.width)
+        PrintMessage("x")
+        PrintNumber(FB.height)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+SubRoutine.Main {
+    IfCondition EqualTo(FB_InitHeadless(1100, 720), 0) ThenBlock: {
+        PrintMessage("FB_InitHeadless failed\n")
+        Desk.run = 0
+    }
+    ElseBlock: {
+        PrintMessage("[desk] Main after FB\n")
+        UIScale_Init(FB.width, FB.height)
+        PrintMessage("[desk] UIScale done\n")
+        FB_FontInit()
+        PrintMessage("[desk] FB_FontInit done\n")
+        Desk_EnsureIpc()
+        Desk_LoadQuotes()
+        PrintMessage("[desk] EnsureIpc done\n")
+        InputBar.Init(1048576)
+        PrintMessage("[desk] InputBar done\n")
+        Desk_OpenWins()
+        PrintMessage("[desk] Draw first\n")
+        Desk.dirty = 1
+        Desk_Draw()
+        PrintMessage("[desk] Draw first done\n")
+        Desk_Present()
+        PrintMessage("[desk] Present first done\n")
+        Desk.dirty = 0
+        PrintMessage("[desk] loop\n")
+        Desk_WriteFile("/tmp/halcode_app/session.txt", "new")
+        WhileLoop EqualTo(Desk.run, 1) {
+            IfCondition EqualTo(Desk_PollCmd(), 1) ThenBlock: {
+                Desk.run = 0
+            }
+            IfCondition Or(NotEqual(Desk.fused, 0), EqualTo(Desk.warmn, 0)) ThenBlock: {
+                Desk_PollSize()
+            }
+            Desk_PollPtr()
+            Desk_PollKeys()
+            Desk_PollReply()
+            Desk_PollThink()
+            Desk_PollPickup()
+            Desk_PollPicker()
+            Desk_PollPaste()
+            Desk_PollKeyResult()
+            Desk_PollWait()
+            Desk_WarmTick()
+            IfCondition EqualTo(Desk.dirty, 1) ThenBlock: {
+                Desk_Draw()
+                Desk_Present()
+                Desk.dirty = 0
+            }
+            Desk_Sleep(16)
+        }
+        PrintMessage("[desk] Main exit\n")
+    }
+}
+RunTask(Main)

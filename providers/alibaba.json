@@ -1,0 +1,177 @@
+{
+  "name": "Alibaba",
+  "backend": "openai",
+  "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "DASHSCOPE_API_KEY",
+  "key_hint": "alibaba",
+  "tier": 2,
+  "models": [
+    {
+      "id": "qwen3.8-omni-flash",
+      "display": "Qwen3.8 Omni Flash"
+    },
+    {
+      "id": "qwen3.8-flash",
+      "display": "Qwen3.8 Flash"
+    },
+    {
+      "id": "qwen3.8-max",
+      "display": "Qwen3.8 Max"
+    },
+    {
+      "id": "deepseek-v4-flash-0731",
+      "display": "DeepSeek V4 Flash 0731"
+    },
+    {
+      "id": "kimi-k3",
+      "display": "Kimi K3"
+    },
+    {
+      "id": "qwen3.7-flash",
+      "display": "Qwen3.7 Flash"
+    },
+    {
+      "id": "glm-5.2",
+      "display": "GLM-5.2"
+    },
+    {
+      "id": "qwen3.7-plus",
+      "display": "Qwen3.7 Plus"
+    },
+    {
+      "id": "qwen3.7-max",
+      "display": "Qwen3.7 Max"
+    },
+    {
+      "id": "qwen3.6-flash",
+      "display": "Qwen3.6 Flash"
+    },
+    {
+      "id": "qwen3.6-27b",
+      "display": "Qwen3.6 27B"
+    },
+    {
+      "id": "qwen3.6-max-preview",
+      "display": "Qwen3.6 Max Preview"
+    },
+    {
+      "id": "qwen3.6-35b-a3b",
+      "display": "Qwen3.6 35B-A3B"
+    },
+    {
+      "id": "qwen3.6-plus",
+      "display": "Qwen3.6 Plus"
+    },
+    {
+      "id": "qwen3.5-flash",
+      "display": "Qwen3.5 Flash"
+    },
+    {
+      "id": "qwen3.5-27b",
+      "display": "Qwen3.5 27B"
+    },
+    {
+      "id": "qwen3.5-122b-a10b",
+      "display": "Qwen3.5 122B-A10B"
+    },
+    {
+      "id": "qwen3.5-35b-a3b",
+      "display": "Qwen3.5 35B-A3B"
+    },
+    {
+      "id": "qwen3.5-plus",
+      "display": "Qwen3.5 Plus"
+    },
+    {
+      "id": "qwen3.5-397b-a17b",
+      "display": "Qwen3.5 397B-A17B"
+    },
+    {
+      "id": "qwen3-vl-plus",
+      "display": "Qwen3-VL Plus"
+    },
+    {
+      "id": "qwen3-max",
+      "display": "Qwen3 Max"
+    },
+    {
+      "id": "qwen3-omni-flash",
+      "display": "Qwen3-Omni Flash"
+    },
+    {
+      "id": "qwen3-asr-flash",
+      "display": "Qwen3-ASR Flash"
+    },
+    {
+      "id": "qwen-flash",
+      "display": "Qwen Flash"
+    },
+    {
+      "id": "qwen3-coder-flash",
+      "display": "Qwen3 Coder Flash"
+    },
+    {
+      "id": "qwen3-coder-plus",
+      "display": "Qwen3 Coder Plus"
+    },
+    {
+      "id": "qvq-max",
+      "display": "QVQ Max"
+    },
+    {
+      "id": "qwq-plus",
+      "display": "QwQ Plus"
+    },
+    {
+      "id": "qwen-omni-turbo",
+      "display": "Qwen-Omni Turbo"
+    },
+    {
+      "id": "qwen-turbo",
+      "display": "Qwen Turbo"
+    },
+    {
+      "id": "qwen-vl-ocr",
+      "display": "Qwen-VL OCR"
+    },
+    {
+      "id": "qwen-vl-max",
+      "display": "Qwen-VL Max"
+    },
+    {
+      "id": "qwen-max",
+      "display": "Qwen Max"
+    },
+    {
+      "id": "qwen-plus",
+      "display": "Qwen Plus"
+    },
+    {
+      "id": "qwen-vl-plus",
+      "display": "Qwen-VL Plus"
+    },
+    {
+      "id": "qwen2-5-32b-instruct",
+      "display": "Qwen2.5 32B Instruct"
+    },
+    {
+      "id": "qwen2-5-vl-72b-instruct",
+      "display": "Qwen2.5-VL 72B Instruct"
+    },
+    {
+      "id": "qwen3-next-80b-a3b-thinking",
+      "display": "Qwen3-Next 80B-A3B (Thinking)"
+    },
+    {
+      "id": "qwen-plus-character-ja",
+      "display": "Qwen Plus Character (Japanese)"
+    }
+  ],
+  "default_model": "qwen3.8-max",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no DASHSCOPE_API_KEY set \u2014 models.dev catalog"
+}

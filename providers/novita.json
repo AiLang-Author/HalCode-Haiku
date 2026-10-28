@@ -1,0 +1,177 @@
+{
+  "name": "Novita",
+  "backend": "openai",
+  "base_url": "https://api.novita.ai/openai",
+  "api_path": "/chat/completions",
+  "models_endpoint": "/models",
+  "auth": "bearer",
+  "key_env": "NOVITA_API_KEY",
+  "key_hint": "novita",
+  "tier": 2,
+  "models": [
+    {
+      "id": "inclusionai/ling-3.1-flash",
+      "display": "Ling 3.1 Flash"
+    },
+    {
+      "id": "xiaomimimo/mimo-v2.6-pro",
+      "display": "MiMo-V2.6-Pro"
+    },
+    {
+      "id": "xiaomimimo/mimo-v2.6-flash",
+      "display": "MiMo-V2.6-Flash"
+    },
+    {
+      "id": "deepseek/deepseek-v4.1-flash",
+      "display": "DeepSeek V4.1 Flash"
+    },
+    {
+      "id": "inclusionai/ling-3.0-flash-vl",
+      "display": "Ling 3.0 Flash VL"
+    },
+    {
+      "id": "inclusionai/ling-3.0-flash-sante",
+      "display": "Ling 3.0 Flash Sante"
+    },
+    {
+      "id": "tencent/hy4-preview",
+      "display": "Hy4 preview"
+    },
+    {
+      "id": "inclusionai/ling-3.0-flash-fin",
+      "display": "Ling 3.0 Flash Fin"
+    },
+    {
+      "id": "zai-org/glm-5.3-flash",
+      "display": "GLM-5.3-Flash"
+    },
+    {
+      "id": "qwen/qwen3.8-flash",
+      "display": "Qwen3.8 Flash"
+    },
+    {
+      "id": "apodex/apodex-1.1-mini",
+      "display": "Apodex 1.1 Mini"
+    },
+    {
+      "id": "zai-org/glm-5.3",
+      "display": "GLM-5.3"
+    },
+    {
+      "id": "qwen/qwen3.8-27b",
+      "display": "Qwen3.8 27B"
+    },
+    {
+      "id": "qwen/qwen3.8-2.4t-a95b",
+      "display": "Qwen3.8 2.4T A95B"
+    },
+    {
+      "id": "qwen/qwen3.8-max",
+      "display": "Qwen3.8 Max"
+    },
+    {
+      "id": "deepseek/deepseek-v4-flash-0731",
+      "display": "DeepSeek V4 Flash 0731"
+    },
+    {
+      "id": "inclusionai/ling-3.0-flash",
+      "display": "Ling 3.0 Flash"
+    },
+    {
+      "id": "mindai/macaron-v1-tall",
+      "display": "Macaron V1 Tall"
+    },
+    {
+      "id": "mindai/macaron-v1-venti",
+      "display": "Macaron V1 Venti"
+    },
+    {
+      "id": "moonshotai/kimi-k3",
+      "display": "Kimi K3"
+    },
+    {
+      "id": "tencent/hy3",
+      "display": "Hy3"
+    },
+    {
+      "id": "zai-org/glm-5.2",
+      "display": "GLM-5.2"
+    },
+    {
+      "id": "moonshotai/kimi-k2.7-code",
+      "display": "Kimi K2.7 Code"
+    },
+    {
+      "id": "minimax/minimax-m3",
+      "display": "MiniMax-M3"
+    },
+    {
+      "id": "stepfun/step-3.7-flash",
+      "display": "Step 3.7 Flash"
+    },
+    {
+      "id": "qwen/qwen3.7-max",
+      "display": "Qwen3.7 Max"
+    },
+    {
+      "id": "baidu/cobuddy",
+      "display": "CoBuddy"
+    },
+    {
+      "id": "deepseek/deepseek-v4-pro",
+      "display": "DeepSeek V4 Pro"
+    },
+    {
+      "id": "xiaomimimo/mimo-v2.5",
+      "display": "MiMo-V2.5"
+    },
+    {
+      "id": "xiaomimimo/mimo-v2.5-pro",
+      "display": "MiMo-V2.5-Pro"
+    },
+    {
+      "id": "qwen/qwen3.6-27b",
+      "display": "Qwen3.6 27B"
+    },
+    {
+      "id": "moonshotai/kimi-k2.6",
+      "display": "Kimi K2.6"
+    },
+    {
+      "id": "qwen/qwen3.6-35b-a3b",
+      "display": "Qwen3.6 35B-A3B"
+    },
+    {
+      "id": "zai-org/glm-5.1",
+      "display": "GLM-5.1"
+    },
+    {
+      "id": "google/gemma-4-31b-it",
+      "display": "Gemma 4 31B IT"
+    },
+    {
+      "id": "google/gemma-4-26b-a4b-it",
+      "display": "Gemma 4 26B A4B IT"
+    },
+    {
+      "id": "minimax/minimax-m2.7",
+      "display": "MiniMax-M2.7"
+    },
+    {
+      "id": "minimax/minimax-m2.7-highspeed",
+      "display": "MiniMax-M2.7-highspeed"
+    },
+    {
+      "id": "qwen/qwen3.5-27b",
+      "display": "Qwen3.5 27B"
+    },
+    {
+      "id": "qwen/qwen3.5-122b-a10b",
+      "display": "Qwen3.5 122B-A10B"
+    }
+  ],
+  "default_model": "xiaomimimo/mimo-v2.6-pro",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "no NOVITA_API_KEY set \u2014 models.dev catalog"
+}

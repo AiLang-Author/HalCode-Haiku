@@ -1,0 +1,637 @@
+// cc_vision_ipc.ailang — HalCode9000 Vision & Multimodal Image Tool, IPC service.
+//
+// Inspects local image files or web URLs, parses binary magic bytes to extract
+// format and dimensions (PNG, JPEG, WEBP, GIF, SVG, BMP), Base64 encodes the
+// image payload into a Data URI, and produces structured inspection cards for
+// vision-capable host models.
+//
+// Socket:   @halcode/Vision
+// Schema:   Vision(path, prompt, detail)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+LibraryImport.HTTP
+
+FixedPool.CCVisSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+    "SYS_EXIT":      Initialize=60
+}
+
+FixedPool.CCVisConst {
+    "SOCK_PATH":     Initialize=0, CanChange=True
+    "SOCK_DIR":      Initialize=0, CanChange=True
+    "MAX_FILE_SZ":   Initialize=5242880  // 5MB max image read
+    "BACKLOG":       Initialize=8
+}
+
+FixedPool.CCVisState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+}
+
+FixedPool.CCVisMailbox {
+    "buf":           Initialize=0, CanChange=True
+    "b64_buf":       Initialize=0, CanChange=True
+    "out_buf":       Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// BASE64 ENCODER TABLE & HELPER
+// =============================================================================
+Function.CCVis_Base64Encode {
+    Input: src_buf: Address
+    Input: src_len: Integer
+    Input: out_buf: Address
+    Output: Integer
+    Body: {
+        b64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        i = 0
+        out_idx = 0
+        WhileLoop LessThan(i, src_len) {
+            b0 = GetByte(src_buf, i)
+            b1 = 0
+            b2 = 0
+            has_b1 = 0
+            has_b2 = 0
+
+            IfCondition LessThan(Add(i, 1), src_len) ThenBlock: {
+                b1 = GetByte(src_buf, Add(i, 1))
+                has_b1 = 1
+            }
+            IfCondition LessThan(Add(i, 2), src_len) ThenBlock: {
+                b2 = GetByte(src_buf, Add(i, 2))
+                has_b2 = 1
+            }
+
+            idx0 = ShiftRight(b0, 2)
+            idx1 = Add(ShiftLeft(BitwiseAnd(b0, 3), 4), ShiftRight(b1, 4))
+            idx2 = Add(ShiftLeft(BitwiseAnd(b1, 15), 2), ShiftRight(b2, 6))
+            idx3 = BitwiseAnd(b2, 63)
+
+            SetByte(out_buf, out_idx, GetByte(b64_table, idx0))
+            out_idx = Add(out_idx, 1)
+
+            SetByte(out_buf, out_idx, GetByte(b64_table, idx1))
+            out_idx = Add(out_idx, 1)
+
+            IfCondition EqualTo(has_b1, 1) ThenBlock: {
+                SetByte(out_buf, out_idx, GetByte(b64_table, idx2))
+                out_idx = Add(out_idx, 1)
+            } ElseBlock: {
+                SetByte(out_buf, out_idx, 61) // '='
+                out_idx = Add(out_idx, 1)
+            }
+
+            IfCondition EqualTo(has_b2, 1) ThenBlock: {
+                SetByte(out_buf, out_idx, GetByte(b64_table, idx3))
+                out_idx = Add(out_idx, 1)
+            } ElseBlock: {
+                SetByte(out_buf, out_idx, 61) // '='
+                out_idx = Add(out_idx, 1)
+            }
+
+            i = Add(i, 3)
+        }
+        SetByte(out_buf, out_idx, 0)
+        ReturnValue(out_idx)
+    }
+}
+
+// =============================================================================
+// MAGIC BYTE & DIMENSION EXTRACTION
+// =============================================================================
+Function.CCVis_DetectMime {
+    Input: buf: Address
+    Input: len: Integer
+    Output: Address
+    Body: {
+        IfCondition LessThan(len, 4) ThenBlock: { ReturnValue("invalid") }
+
+        b0 = GetByte(buf, 0)
+        b1 = GetByte(buf, 1)
+        b2 = GetByte(buf, 2)
+        b3 = GetByte(buf, 3)
+
+        // PNG: 89 50 4E 47
+        IfCondition And(EqualTo(b0, 137), EqualTo(b1, 80)) ThenBlock: {
+            IfCondition And(EqualTo(b2, 78), EqualTo(b3, 71)) ThenBlock: {
+                ReturnValue("image/png")
+            }
+        }
+
+        // JPEG: FF D8 FF
+        IfCondition And(EqualTo(b0, 255), EqualTo(b1, 216)) ThenBlock: {
+            IfCondition EqualTo(b2, 255) ThenBlock: {
+                ReturnValue("image/jpeg")
+            }
+        }
+
+        // GIF: 47 49 46 ('G' 'I' 'F')
+        IfCondition And(EqualTo(b0, 71), EqualTo(b1, 73)) ThenBlock: {
+            IfCondition EqualTo(b2, 70) ThenBlock: {
+                ReturnValue("image/gif")
+            }
+        }
+
+        // WEBP: RIFF ... WEBP
+        IfCondition And(EqualTo(b0, 82), EqualTo(b1, 73)) ThenBlock: {
+            IfCondition And(EqualTo(b2, 70), EqualTo(b3, 70)) ThenBlock: {
+                IfCondition GreaterEqual(len, 12) ThenBlock: {
+                    IfCondition And(EqualTo(GetByte(buf, 8), 87), EqualTo(GetByte(buf, 9), 69)) ThenBlock: {
+                        IfCondition And(EqualTo(GetByte(buf, 10), 66), EqualTo(GetByte(buf, 11), 80)) ThenBlock: {
+                            ReturnValue("image/webp")
+                        }
+                    }
+                }
+            }
+        }
+
+        // BMP: 42 4D ('B' 'M')
+        IfCondition And(EqualTo(b0, 66), EqualTo(b1, 77)) ThenBlock: {
+            ReturnValue("image/bmp")
+        }
+
+        // SVG: '<svg' or '<?xml'
+        IfCondition EqualTo(b0, 60) ThenBlock: { // '<'
+            ReturnValue("image/svg+xml")
+        }
+
+        ReturnValue("invalid")
+    }
+}
+
+Function.CCVis_IsSOFMarker {
+    Input: marker: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(marker, 192) ThenBlock: { ReturnValue(1) } // SOF0
+        IfCondition EqualTo(marker, 193) ThenBlock: { ReturnValue(1) } // SOF1
+        IfCondition EqualTo(marker, 194) ThenBlock: { ReturnValue(1) } // SOF2
+        IfCondition EqualTo(marker, 195) ThenBlock: { ReturnValue(1) } // SOF3
+        IfCondition EqualTo(marker, 197) ThenBlock: { ReturnValue(1) } // SOF5
+        IfCondition EqualTo(marker, 198) ThenBlock: { ReturnValue(1) } // SOF6
+        IfCondition EqualTo(marker, 199) ThenBlock: { ReturnValue(1) } // SOF7
+        IfCondition EqualTo(marker, 201) ThenBlock: { ReturnValue(1) } // SOF9
+        IfCondition EqualTo(marker, 202) ThenBlock: { ReturnValue(1) } // SOF10
+        IfCondition EqualTo(marker, 203) ThenBlock: { ReturnValue(1) } // SOF11
+        IfCondition EqualTo(marker, 205) ThenBlock: { ReturnValue(1) } // SOF13
+        IfCondition EqualTo(marker, 206) ThenBlock: { ReturnValue(1) } // SOF14
+        IfCondition EqualTo(marker, 207) ThenBlock: { ReturnValue(1) } // SOF15
+        ReturnValue(0)
+    }
+}
+
+// Parse an integer-valued SVG/XML attribute (e.g. width="120" or height='90').
+// Returns 0 when the attribute is absent or non-numeric.
+Function.CCVis_SvgAttrInt {
+    Input: buf: Address
+    Input: attr: Address
+    Output: Integer
+    Body: {
+        alen = StringLength(attr)
+        need = Add(alen, 3)
+        needle = Allocate(need)
+        MemoryCopy(needle, attr, alen)
+        SetByte(needle, alen, 61)         // '='
+        SetByte(needle, Add(alen, 1), 34) // '"'
+        SetByte(needle, Add(alen, 2), 0)
+
+        idx = StringIndexOf(buf, needle)
+        Deallocate(needle, need)
+
+        // Single-quoted variant: attr='...'
+        IfCondition LessThan(idx, 0) ThenBlock: {
+            needle2 = Allocate(need)
+            MemoryCopy(needle2, attr, alen)
+            SetByte(needle2, alen, 61)
+            SetByte(needle2, Add(alen, 1), 39) // '\''
+            SetByte(needle2, Add(alen, 2), 0)
+            idx = StringIndexOf(buf, needle2)
+            Deallocate(needle2, need)
+        }
+
+        IfCondition LessThan(idx, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(StringToInt(Add(buf, Add(idx, Add(alen, 2)))))
+    }
+}
+
+// Return the nth (1-indexed) number in a list of numbers separated by
+// whitespace, commas, quotes, or '='. Used to read viewBox="minx miny w h".
+Function.CCVis_SvgNthNumber {
+    Input: p: Address
+    Input: nth: Integer
+    Output: Integer
+    Body: {
+        count = 0
+        WhileLoop 1 {
+            // Skip separators (space, tab, LF, CR, comma, '=', quote).
+            WhileLoop 1 {
+                c = GetByte(p, 0)
+                IfCondition EqualTo(c, 0) ThenBlock: { ReturnValue(0) }
+                is_sep = Or(Or(Or(EqualTo(c, 32), EqualTo(c, 9)), Or(EqualTo(c, 10), EqualTo(c, 13))), Or(Or(EqualTo(c, 44), EqualTo(c, 61)), Or(EqualTo(c, 34), EqualTo(c, 39))))
+                IfCondition EqualTo(is_sep, 0) ThenBlock: { BreakLoop }
+                p = Add(p, 1)
+            }
+            count = Add(count, 1)
+            IfCondition EqualTo(count, nth) ThenBlock: {
+                ReturnValue(StringToInt(p))
+            }
+            // Skip number chars (digits, sign, decimal point).
+            WhileLoop 1 {
+                c = GetByte(p, 0)
+                IfCondition EqualTo(c, 0) ThenBlock: { ReturnValue(0) }
+                is_num = Or(Or(And(GreaterEqual(c, 48), LessEqual(c, 57)), EqualTo(c, 45)), Or(EqualTo(c, 43), EqualTo(c, 46)))
+                IfCondition EqualTo(is_num, 0) ThenBlock: { BreakLoop }
+                p = Add(p, 1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.CCVis_ExtractDimensions {
+    Input: buf: Address
+    Input: len: Integer
+    Input: mime: Address
+    Output: Address
+    Body: {
+        w = 0
+        h = 0
+
+        // PNG: Width @ 16 (BE), Height @ 20 (BE)
+        IfCondition EqualTo(StringCompare(mime, "image/png"), 0) ThenBlock: {
+            IfCondition GreaterEqual(len, 24) ThenBlock: {
+                w = Add(ShiftLeft(GetByte(buf, 16), 24), Add(ShiftLeft(GetByte(buf, 17), 16), Add(ShiftLeft(GetByte(buf, 18), 8), GetByte(buf, 19))))
+                h = Add(ShiftLeft(GetByte(buf, 20), 24), Add(ShiftLeft(GetByte(buf, 21), 16), Add(ShiftLeft(GetByte(buf, 22), 8), GetByte(buf, 23))))
+            }
+        }
+
+        // GIF: Width @ 6 (LE), Height @ 8 (LE)
+        IfCondition EqualTo(StringCompare(mime, "image/gif"), 0) ThenBlock: {
+            IfCondition GreaterEqual(len, 10) ThenBlock: {
+                w = Add(GetByte(buf, 6), ShiftLeft(GetByte(buf, 7), 8))
+                h = Add(GetByte(buf, 8), ShiftLeft(GetByte(buf, 9), 8))
+            }
+        }
+
+        // BMP: Width @ 18 (LE 32-bit), Height @ 22 (LE 32-bit)
+        IfCondition EqualTo(StringCompare(mime, "image/bmp"), 0) ThenBlock: {
+            IfCondition GreaterEqual(len, 26) ThenBlock: {
+                w = Add(GetByte(buf, 18), Add(ShiftLeft(GetByte(buf, 19), 8), Add(ShiftLeft(GetByte(buf, 20), 16), ShiftLeft(GetByte(buf, 21), 24))))
+                h = Add(GetByte(buf, 22), Add(ShiftLeft(GetByte(buf, 23), 8), Add(ShiftLeft(GetByte(buf, 24), 16), ShiftLeft(GetByte(buf, 25), 24))))
+            }
+        }
+
+        // JPEG: Scan for SOF markers
+        IfCondition EqualTo(StringCompare(mime, "image/jpeg"), 0) ThenBlock: {
+            idx = 2
+            max_scan = Subtract(len, 9)
+            WhileLoop LessThan(idx, max_scan) {
+                b_curr = GetByte(buf, idx)
+                IfCondition EqualTo(b_curr, 255) ThenBlock: {
+                    marker = GetByte(buf, Add(idx, 1))
+                    IfCondition EqualTo(CCVis_IsSOFMarker(marker), 1) ThenBlock: {
+                        h = Add(ShiftLeft(GetByte(buf, Add(idx, 5)), 8), GetByte(buf, Add(idx, 6)))
+                        w = Add(ShiftLeft(GetByte(buf, Add(idx, 7)), 8), GetByte(buf, Add(idx, 8)))
+                        BreakLoop
+                    } ElseBlock: {
+                        IfCondition And(NotEqual(marker, 0), NotEqual(marker, 255)) ThenBlock: {
+                            seg_len = Add(ShiftLeft(GetByte(buf, Add(idx, 2)), 8), GetByte(buf, Add(idx, 3)))
+                            IfCondition GreaterThan(seg_len, 2) ThenBlock: {
+                                idx = Add(idx, Add(seg_len, 1))
+                            }
+                        }
+                    }
+                }
+                idx = Add(idx, 1)
+            }
+        }
+
+        // WEBP: VP8, VP8L, VP8X
+        IfCondition EqualTo(StringCompare(mime, "image/webp"), 0) ThenBlock: {
+            IfCondition GreaterEqual(len, 30) ThenBlock: {
+                c0 = GetByte(buf, 12) c1 = GetByte(buf, 13) c2 = GetByte(buf, 14) c3 = GetByte(buf, 15)
+                // VP8X (Extended)
+                IfCondition And(EqualTo(c0, 86), EqualTo(c1, 80)) ThenBlock: {
+                    IfCondition And(EqualTo(c2, 56), EqualTo(c3, 88)) ThenBlock: {
+                        w = Add(1, Add(GetByte(buf, 24), Add(ShiftLeft(GetByte(buf, 25), 8), ShiftLeft(GetByte(buf, 26), 16))))
+                        h = Add(1, Add(GetByte(buf, 27), Add(ShiftLeft(GetByte(buf, 28), 8), ShiftLeft(GetByte(buf, 29), 16))))
+                    }
+                }
+                // VP8L (Lossless)
+                IfCondition And(EqualTo(c0, 86), EqualTo(c1, 80)) ThenBlock: {
+                    IfCondition And(EqualTo(c2, 56), EqualTo(c3, 76)) ThenBlock: {
+                        b21 = GetByte(buf, 21) b22 = GetByte(buf, 22) b23 = GetByte(buf, 23) b24 = GetByte(buf, 24)
+                        w = Add(1, BitwiseAnd(Add(b21, ShiftLeft(b22, 8)), 16383))
+                        h = Add(1, BitwiseAnd(ShiftRight(Add(b22, Add(ShiftLeft(b23, 8), ShiftLeft(b24, 16))), 6), 16383))
+                    }
+                }
+                // VP8 (Lossy)
+                IfCondition And(EqualTo(c0, 86), EqualTo(c1, 80)) ThenBlock: {
+                    IfCondition And(EqualTo(c2, 56), EqualTo(c3, 32)) ThenBlock: {
+                        w = BitwiseAnd(Add(GetByte(buf, 26), ShiftLeft(GetByte(buf, 27), 8)), 16383)
+                        h = BitwiseAnd(Add(GetByte(buf, 28), ShiftLeft(GetByte(buf, 29), 8)), 16383)
+                    }
+                }
+            }
+        }
+
+        // SVG: text-based; parse width/height attributes, then viewBox fallback.
+        IfCondition EqualTo(StringCompare(mime, "image/svg+xml"), 0) ThenBlock: {
+            w = CCVis_SvgAttrInt(buf, "width")
+            h = CCVis_SvgAttrInt(buf, "height")
+            IfCondition Or(EqualTo(w, 0), EqualTo(h, 0)) ThenBlock: {
+                vb_idx = StringIndexOf(buf, "viewBox")
+                IfCondition GreaterEqual(vb_idx, 0) ThenBlock: {
+                    p = Add(buf, Add(vb_idx, 7))
+                    w = CCVis_SvgNthNumber(p, 3)
+                    h = CCVis_SvgNthNumber(p, 4)
+                }
+            }
+        }
+
+        IfCondition And(EqualTo(w, 0), EqualTo(h, 0)) ThenBlock: {
+            ReturnValue("auto-detected")
+        }
+
+        res = StringConcat(NumberToString(w), "x")
+        res = StringConcat(res, NumberToString(h))
+        ReturnValue(res)
+    }
+}
+
+// =============================================================================
+// SCHEMA
+// =============================================================================
+Function.CCVis_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Vision", "Inspect an image file or URL, extract metadata, and Base64 encode for vision analysis")
+        UtilArgs_AddField(s, "path", "string", 1, "Absolute local file path or HTTP/HTTPS image URL", "path")
+        UtilArgs_AddField(s, "prompt", "string", 0, "Optional focus question or extraction prompt", "prompt")
+        UtilArgs_AddField(s, "detail", "string", 0, "Inspection detail level: high (default, 512-char preview), full (full Data URI), or metadata (no Base64)", "detail")
+        UtilArgs_SetDefault(s, "detail", "high")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// CORE DO VISION
+// =============================================================================
+Function.CCVis_Do {
+    Input: args: Address
+    Input: out_truncated_ptr: Address
+    Output: Address
+    Body: {
+        StoreValue(out_truncated_ptr, 0, "dword")
+        was_truncated = 0
+
+        path = UtilArgs_GetString(args, "path")
+        prompt = UtilArgs_GetString(args, "prompt")
+        detail = UtilArgs_GetString(args, "detail")
+
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(prompt, 0) ThenBlock: { prompt = "Analyze image" }
+        IfCondition EqualTo(detail, 0) ThenBlock: { detail = "high" }
+
+        bytes_read = 0
+
+        // Check if Web URL (http:// or https://)
+        is_url = 0
+        IfCondition GreaterThan(StringLength(path), 7) ThenBlock: {
+            pfx7 = Allocate(8)
+            i = 0
+            WhileLoop LessThan(i, 7) { SetByte(pfx7, i, GetByte(path, i)) i = Add(i, 1) }
+            SetByte(pfx7, 7, 0)
+            IfCondition EqualTo(StringCompare(pfx7, "http://"), 0) ThenBlock: {
+                is_url = 1
+            }
+            Deallocate(pfx7, 8)
+        }
+        IfCondition GreaterThan(StringLength(path), 8) ThenBlock: {
+            pfx8 = Allocate(9)
+            i = 0
+            WhileLoop LessThan(i, 8) { SetByte(pfx8, i, GetByte(path, i)) i = Add(i, 1) }
+            SetByte(pfx8, 8, 0)
+            IfCondition EqualTo(StringCompare(pfx8, "https://"), 0) ThenBlock: {
+                is_url = 1
+            }
+            Deallocate(pfx8, 9)
+        }
+
+        IfCondition EqualTo(is_url, 1) ThenBlock: {
+            handle = HTTP.GetStream(path, "User-Agent: Mozilla/5.0\n", 5000, 30000)
+            IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(0) }
+            fd = Dereference(Add(handle, 4), "dword")
+            WhileLoop 1 {
+                rem = Subtract(CCVisConst.MAX_FILE_SZ, bytes_read)
+                IfCondition LessEqual(rem, 0) ThenBlock: {
+                    was_truncated = 1
+                    BreakLoop
+                }
+                chunk = Add(CCVisMailbox.buf, bytes_read)
+                n = SystemCall(CCVisSys.SYS_READ, fd, chunk, rem, 0, 0)
+                IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+                bytes_read = Add(bytes_read, n)
+            }
+            HTTP.CloseStream(handle)
+        } ElseBlock: {
+            fd = SystemCall(CCVisSys.SYS_OPEN, path, 0, 0, 0, 0)
+            IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+            n = SystemCall(CCVisSys.SYS_READ, fd, CCVisMailbox.buf, CCVisConst.MAX_FILE_SZ, 0, 0)
+            IfCondition EqualTo(n, CCVisConst.MAX_FILE_SZ) ThenBlock: {
+                probe = SystemCall(CCVisSys.SYS_READ, fd, CCVisMailbox.out_buf, 1, 0, 0)
+                IfCondition GreaterThan(probe, 0) ThenBlock: { was_truncated = 1 }
+            }
+            SystemCall(CCVisSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            IfCondition GreaterThan(n, 0) ThenBlock: { bytes_read = n }
+        }
+
+        IfCondition LessEqual(bytes_read, 0) ThenBlock: { ReturnValue(0) }
+
+        // Null-terminate so text formats (SVG) are safe for string ops.
+        SetByte(CCVisMailbox.buf, bytes_read, 0)
+
+        mime = CCVis_DetectMime(CCVisMailbox.buf, bytes_read)
+        IfCondition EqualTo(StringCompare(mime, "invalid"), 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        dims = CCVis_ExtractDimensions(CCVisMailbox.buf, bytes_read, mime)
+
+        // Detail handling:
+        // "metadata" -> header metadata only, no base64
+        // "high" (default) -> header metadata + 512-char Data URI preview (fits inline, <1.5KB)
+        // "full" -> header metadata + full un-truncated Base64 Data URI
+        
+        is_full = 0
+        is_meta_only = 0
+        IfCondition EqualTo(StringCompare(detail, "full"), 0) ThenBlock: { is_full = 1 }
+        IfCondition EqualTo(StringCompare(detail, "raw"), 0) ThenBlock: { is_full = 1 }
+        IfCondition EqualTo(StringCompare(detail, "metadata"), 0) ThenBlock: { is_meta_only = 1 }
+        IfCondition EqualTo(StringCompare(detail, "summary"), 0) ThenBlock: { is_meta_only = 1 }
+
+        // Encode Base64 only when the caller actually wants image data.
+        b64_len = 0
+        IfCondition EqualTo(is_meta_only, 0) ThenBlock: {
+            b64_len = CCVis_Base64Encode(CCVisMailbox.buf, bytes_read, CCVisMailbox.b64_buf)
+        }
+
+        res = StringConcat("[VISION INSPECTION RESULT]\nSource: ", path)
+        res = StringConcat(res, "\nFormat: ")
+        res = StringConcat(res, mime)
+        res = StringConcat(res, "\nDimensions: ")
+        res = StringConcat(res, dims)
+        res = StringConcat(res, "\nFile Size: ")
+        res = StringConcat(res, NumberToString(bytes_read))
+        IfCondition EqualTo(is_meta_only, 1) ThenBlock: {
+            res = StringConcat(res, " bytes\nBase64 Payload: omitted (metadata-only)\nDetail Level: ")
+        } ElseBlock: {
+            res = StringConcat(res, " bytes\nBase64 Payload: ")
+            res = StringConcat(res, NumberToString(b64_len))
+            res = StringConcat(res, " bytes\nDetail Level: ")
+        }
+        res = StringConcat(res, detail)
+        res = StringConcat(res, "\nPrompt Goal: ")
+        res = StringConcat(res, prompt)
+
+        IfCondition EqualTo(is_meta_only, 0) ThenBlock: {
+            res = StringConcat(res, "\nData URI: data:")
+            res = StringConcat(res, mime)
+            res = StringConcat(res, ";base64,")
+            IfCondition EqualTo(is_full, 1) ThenBlock: {
+                res = StringConcat(res, CCVisMailbox.b64_buf)
+            } ElseBlock: {
+                prev_len = b64_len
+                IfCondition GreaterThan(prev_len, 512) ThenBlock: { prev_len = 512 }
+                b64_prev = Allocate(520)
+                MemoryCopy(b64_prev, CCVisMailbox.b64_buf, prev_len)
+                SetByte(b64_prev, prev_len, 0)
+                res = StringConcat(res, b64_prev)
+                Deallocate(b64_prev, 520)
+                IfCondition GreaterThan(b64_len, 512) ThenBlock: {
+                    res = StringConcat(res, "...")
+                }
+            }
+        }
+
+        IfCondition EqualTo(was_truncated, 1) ThenBlock: {
+            res = StringConcat(res, "\nWARNING: Image exceeds the 5MB read limit and was truncated. Dimensions and encoding reflect only the first 5MB.\n")
+        }
+
+        res = StringConcat(res, "\nStatus: Image verified and Base64 payload prepared for vision model analysis.\n")
+
+        StoreValue(out_truncated_ptr, was_truncated, "dword")
+        ReturnValue(res)
+    }
+}
+
+// =============================================================================
+// MAIN SERVICE LOOP
+// =============================================================================
+SubRoutine.Main {
+    CCVisConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    CCVisConst.SOCK_PATH = "@halcode/Vision"
+
+    CCVisMailbox.buf = Allocate(Add(CCVisConst.MAX_FILE_SZ, 1))
+    CCVisMailbox.b64_buf = Allocate(Multiply(CCVisConst.MAX_FILE_SZ, 2))
+    CCVisMailbox.out_buf = Allocate(65536)
+
+    schema = CCVis_BuildSchema()
+    CCVisState.schema = schema
+
+    SystemCall(CCVisSys.SYS_MKDIR, CCVisConst.SOCK_DIR, 493, 0, 0, 0)
+    SystemCall(CCVisSys.SYS_UNLINK, CCVisConst.SOCK_PATH, 0, 0, 0, 0)
+
+    listen_fd = Socket.Create(1, 1) // AF_UNIX=1, SOCK_STREAM=1
+    IfCondition LessThan(listen_fd, 0) ThenBlock: { SystemCall(1, 1, "Failed socket\n", 14, 0, 0) SystemCall(60, 1, 0, 0, 0, 0) }
+
+    res = Socket.BindUnix(listen_fd, CCVisConst.SOCK_PATH)
+    IfCondition LessThan(res, 0) ThenBlock: { SystemCall(1, 1, "Failed bind\n", 12, 0, 0) SystemCall(60, 1, 0, 0, 0, 0) }
+
+    Socket.Listen(listen_fd, CCVisConst.BACKLOG)
+    CCVisState.listen_fd = listen_fd
+
+    WhileLoop EqualTo(CCVisState.running, 1) {
+        client_fd = Socket.Accept(listen_fd)
+        IfCondition LessThan(client_fd, 0) ThenBlock: { ContinueLoop }
+
+        req_str = Socket.RecvMsg(client_fd)
+        IfCondition Or(EqualTo(req_str, 0), EqualTo(StringLength(req_str), 0)) ThenBlock: {
+            Socket.Close(client_fd)
+            ContinueLoop
+        }
+
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            err_resp = JSON.NewObject()
+            JSON.SetString(err_resp, "method", "result")
+            JSON.SetBool(err_resp, "ok", 0)
+            JSON.SetString(err_resp, "error", "invalid JSON request")
+            Socket.SendMsg(client_fd, JSON.SerializeObject(err_resp))
+            Socket.Close(client_fd)
+            ContinueLoop
+        }
+
+        obj = JSON.AsObject(parsed)
+        meth = JSON.GetString(obj, "method")
+        req_id = JSON.GetString(obj, "id")
+        IfCondition EqualTo(req_id, 0) ThenBlock: { req_id = "" }
+
+        IfCondition EqualTo(StringCompare(meth, "schema"), 0) ThenBlock: {
+            schema_str = UtilArgs_ExportToolSchema(CCVisState.schema)
+            parsed_schema = ParseJSON(schema_str)
+            schema_obj = JSON.AsObject(parsed_schema)
+            sresp = JSON.NewObject()
+            JSON.SetString(sresp, "method", "schema_response")
+            IfCondition NotEqual(schema_obj, 0) ThenBlock: {
+                JSON.SetObject(sresp, "schema", schema_obj)
+            }
+            Socket.SendMsg(client_fd, JSON.SerializeObject(sresp))
+            JSON.Free(parsed_schema)
+            Socket.Close(client_fd)
+            ContinueLoop
+        }
+
+        IfCondition EqualTo(StringCompare(meth, "call"), 0) ThenBlock: {
+            args = JSON.GetObject(obj, "args")
+            trunc = Allocate(4)
+            output_str = CCVis_Do(args, trunc, CCVisMailbox.out_buf)
+            is_trunc = Dereference(trunc, "dword")
+            Deallocate(trunc, 4)
+
+            resp = JSON.NewObject()
+            JSON.SetString(resp, "method", "result")
+            JSON.SetString(resp, "id", req_id)
+
+            IfCondition NotEqual(output_str, 0) ThenBlock: {
+                JSON.SetBool(resp, "ok", 1)
+                JSON.SetString(resp, "content", output_str)
+                JSON.SetBool(resp, "truncated", is_trunc)
+            } ElseBlock: {
+                JSON.SetBool(resp, "ok", 0)
+                JSON.SetString(resp, "error", "Failed to process image path or URL")
+            }
+
+            Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+            Socket.Close(client_fd)
+            ContinueLoop
+        }
+
+        Socket.Close(client_fd)
+    }
+    SystemCall(CCVisSys.SYS_EXIT, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

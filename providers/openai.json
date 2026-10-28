@@ -1,0 +1,149 @@
+{
+  "name": "OpenAI",
+  "backend": "openai",
+  "base_url": "https://api.openai.com",
+  "api_path": "/v1/chat/completions",
+  "models_endpoint": "/v1/models",
+  "auth": "bearer",
+  "key_env": "OPENAI_API_KEY",
+  "key_hint": "openai",
+  "tier": 1,
+  "models": [
+    {
+      "id": "gpt-6.1-sol",
+      "display": "GPT-6.1 Sol"
+    },
+    {
+      "id": "gpt-6-luna",
+      "display": "GPT-6 Luna"
+    },
+    {
+      "id": "gpt-6-sol",
+      "display": "GPT-6 Sol"
+    },
+    {
+      "id": "gpt-6-astra",
+      "display": "GPT-6 Astra"
+    },
+    {
+      "id": "gpt-daybreak-blue-latest",
+      "display": "Daybreak Blue"
+    },
+    {
+      "id": "gpt-daybreak-red-latest",
+      "display": "Daybreak Red"
+    },
+    {
+      "id": "gpt-5.6",
+      "display": "GPT-5.6"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "display": "GPT-5.6 Luna"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "display": "GPT-5.6 Terra"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "display": "GPT-5.6 Sol"
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "display": "GPT-5.5 Pro"
+    },
+    {
+      "id": "gpt-5.5",
+      "display": "GPT-5.5"
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "display": "GPT-5.4 nano"
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "display": "GPT-5.4 mini"
+    },
+    {
+      "id": "gpt-5.4",
+      "display": "GPT-5.4"
+    },
+    {
+      "id": "gpt-5.4-pro",
+      "display": "GPT-5.4 Pro"
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "display": "GPT-5.3 Codex"
+    },
+    {
+      "id": "gpt-5.3-codex-spark",
+      "display": "GPT-5.3 Codex Spark"
+    },
+    {
+      "id": "gpt-5.2-pro",
+      "display": "GPT-5.2 Pro"
+    },
+    {
+      "id": "gpt-5.2",
+      "display": "GPT-5.2"
+    },
+    {
+      "id": "gpt-5.1",
+      "display": "GPT-5.1"
+    },
+    {
+      "id": "gpt-5-pro",
+      "display": "GPT-5 Pro"
+    },
+    {
+      "id": "gpt-5-mini",
+      "display": "GPT-5 Mini"
+    },
+    {
+      "id": "gpt-5-nano",
+      "display": "GPT-5 Nano"
+    },
+    {
+      "id": "gpt-5",
+      "display": "GPT-5"
+    },
+    {
+      "id": "o3-pro",
+      "display": "o3-pro"
+    },
+    {
+      "id": "o3",
+      "display": "o3"
+    },
+    {
+      "id": "gpt-4.1",
+      "display": "GPT-4.1"
+    },
+    {
+      "id": "gpt-4.1-mini",
+      "display": "GPT-4.1 mini"
+    },
+    {
+      "id": "gpt-4o-2024-11-20",
+      "display": "GPT-4o (2024-11-20)"
+    },
+    {
+      "id": "gpt-4o-2024-08-06",
+      "display": "GPT-4o (2024-08-06)"
+    },
+    {
+      "id": "gpt-4o-mini",
+      "display": "GPT-4o mini"
+    },
+    {
+      "id": "gpt-4o",
+      "display": "GPT-4o"
+    }
+  ],
+  "default_model": "gpt-6.1-sol",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:55Z",
+  "note": "no OPENAI_API_KEY set \u2014 models.dev catalog"
+}
