@@ -58,10 +58,13 @@ if [[ -z "$AILANG" ]]; then
     exit 1
 fi
 
-# The AILang tree root is where local imports (Applications.<App>.*,
-# Packager.Packager.*) resolve. Derive it from the compiler's real location.
+# The AILang tree root is where the main binary's imports
+# (Applications.<App>.*, Packager.Packager.*) resolve.
 AILANG_ROOT="$(cd "$(dirname "$(readlink -f "$AILANG")")" && pwd)"
-cd "$AILANG_ROOT"
+
+# cc_tools use Import.Platform.IPC which resolves from the project root,
+# while LibraryImport.* (Arena, JSON, etc.) resolves via AILANG_LIB_PATH.
+export AILANG_LIB_PATH="$AILANG_ROOT/Librarys"
 
 # Tool list: bare names, expanded both for source and binary
 TOOLS=(read head ls write bash webfetch edit find grep git)
@@ -127,15 +130,15 @@ build_one() {
     local src="$1"
     local out="$2"
     local label="$3"
+    local cwd="${4:-$ROOT}"
     local logf="/tmp/build_${label}.log"
 
-    if $AILANG "$src" "$out" >"$logf" 2>&1; then
+    if (cd "$cwd" && $AILANG "$src" "$out") >"$logf" 2>&1; then
         log "  [ok]  $label"
         return 0
     fi
 
     echo "  [FAIL] $label  (see $logf)" >&2
-    # Surface the first real error line; AILang produces a lot of progress noise.
     grep -iE "ERROR|Unknown|FATAL|Failed" "$logf" \
         | grep -vE "^\[POOL|^\[LOAD|^\[STORE|JParse\.error|XERROR|^\[FUNCDEF|OPT-TRY|ARITH |^\[IO\]|^\[FILE\]" \
         | head -3 >&2 || true
@@ -196,7 +199,7 @@ build_app() {
 
     if [[ $BUILD_MAIN -eq 1 ]]; then
         log "Building ${main_bin}..."
-        build_one "$main_src" "/tmp/${main_bin}" "${main_bin%.x}"
+        build_one "$main_src" "/tmp/${main_bin}" "${main_bin%.x}" "$AILANG_ROOT"
     fi
 
     if [[ $COPY -eq 1 ]]; then

@@ -1,0 +1,57 @@
+// Two overlapping children. The first child's stdout must reach EOF
+// while the second child is still alive. A leaked write end hangs the read.
+LibraryImport.Arena
+Import.Platform.Proc
+
+SubRoutine.Main {
+    pf = Allocate(8)
+    pr = SystemCall(22, pf, 0, 0, 0, 0)
+    IfCondition LessThan(pr, 0) ThenBlock: { ProcessExit(1) }
+    rd = Dereference(pf, "dword")
+    wr = Dereference(Add(pf, 4), "dword")
+    Deallocate(pf, 8)
+    PlatformProc_Cloexec(rd)
+
+    argv = Allocate(32)
+    StoreValue(argv, "/bin/sh")
+    StoreValue(Add(argv, 8), "-c")
+    StoreValue(Add(argv, 16), "echo ONE")
+    StoreValue(Add(argv, 24), 0)
+    pid1 = PlatformProc_SpawnStdio("/bin/sh", argv, 0, -1, wr, -1)
+    IfCondition LessThan(pid1, 1) ThenBlock: { ProcessExit(2) }
+
+    nullfd = SystemCall(2, "/dev/null", 1, 0, 0, 0)
+    IfCondition LessThan(nullfd, 0) ThenBlock: { ProcessExit(3) }
+    StoreValue(argv, "/bin/sleep")
+    StoreValue(Add(argv, 8), "30")
+    StoreValue(Add(argv, 16), 0)
+    pid2 = PlatformProc_SpawnStdio("/bin/sleep", argv, 0, -1, nullfd, -1)
+    IfCondition LessThan(pid2, 1) ThenBlock: { ProcessExit(4) }
+    alive = PlatformProc_Exists(pid2)
+    IfCondition NotEqual(alive, 1) ThenBlock: { ProcessExit(5) }
+    st = Allocate(8)
+    StoreValue(st, 0)
+    PlatformProc_Wait(pid1, st, 0)
+
+    pfd = Allocate(8)
+    StoreValue(pfd, rd, "dword")
+    StoreValue(Add(pfd, 4), 1, "dword")
+    wait = SystemCall(7, pfd, 1, 2000, 0, 0)
+    IfCondition LessEqual(wait, 0) ThenBlock: { ProcessExit(6) }
+    buf = Allocate(16)
+    MemorySet(buf, 0, 16)
+    n = SystemCall(0, rd, buf, 8, 0, 0)
+    IfCondition LessThan(n, 3) ThenBlock: { ProcessExit(7) }
+    IfCondition NotEqual(GetByte(buf, 0), 79) ThenBlock: { ProcessExit(8) }
+    wait2 = SystemCall(7, pfd, 1, 2000, 0, 0)
+    IfCondition LessEqual(wait2, 0) ThenBlock: { ProcessExit(9) }
+    n2 = SystemCall(0, rd, buf, 8, 0, 0)
+    IfCondition NotEqual(n2, 0) ThenBlock: { ProcessExit(10) }
+
+    PlatformProc_Kill(pid2, 9)
+    PlatformProc_Wait(pid2, st, 0)
+    PrintMessage("STDIO_OK\n")
+    ProcessExit(0)
+}
+
+RunTask(Main)

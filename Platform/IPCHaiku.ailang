@@ -1,0 +1,225 @@
+// Haiku IPC platform. One named port is one message stream.
+// Listen creates it, Connect finds it, Send and Recv are one
+// write_port and one read_port. Recv waits at most five seconds.
+//
+// SendMsg and RecvMsg are request/reply. A port is one queue, so the
+// client writes the server port with an 8-byte reply-port id in front
+// of the JSON, and the server writes the bare JSON back to that reply
+// port. Low-level Send and Recv stay single-direction for the echo test.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+FixedPool.PlatformIPCState {
+    "listen": Initialize=0, CanChange=True
+    "peer":   Initialize=0, CanChange=True
+    "reply":  Initialize=0, CanChange=True
+}
+
+Function.PlatformIPC_Listen {
+    Input: name: Address
+    Input: capacity: Integer
+    Output: Integer
+    Body: {
+        id = HaikuSyscall(222, capacity, name)
+        id = HaikuRT_R32(id)
+        IfCondition GreaterThan(id, 0) ThenBlock: {
+            PlatformIPCState.listen = id
+        }
+        ReturnValue(id)
+    }
+}
+
+// A port has no separate accepted connection. The listen id is the stream.
+Function.PlatformIPC_Accept {
+    Input: id: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(id)
+    }
+}
+
+Function.PlatformIPC_Connect {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        id = HaikuSyscall(225, name)
+        id = HaikuRT_R32(id)
+        ReturnValue(id)
+    }
+}
+
+// code is the port message code. len bytes are copied from buf.
+Function.PlatformIPC_Send {
+    Input: id: Integer
+    Input: code: Integer
+    Input: buf: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        r = HaikuSyscall(232, id, code, buf, len, 0, 0)
+        r = HaikuRT_R32(r)
+        ReturnValue(r)
+    }
+}
+
+// On success, returns the byte count and stores the message code.
+Function.PlatformIPC_Recv {
+    Input: id: Integer
+    Input: codep: Address
+    Input: buf: Address
+    Input: cap: Integer
+    Output: Integer
+    Body: {
+        n = HaikuSyscall(230, id, codep, buf, cap, 8, 5000000)
+        n = HaikuRT_R32(n)
+        ReturnValue(n)
+    }
+}
+
+// The listen port belongs to the server. A client handle is the server
+// port id, so closing it must drop only the client's reply port.
+Function.PlatformIPC_Close {
+    Input: id: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(id, 1) ThenBlock: { ReturnValue(-1) }
+        IfCondition And(GreaterThan(PlatformIPCState.listen, 0), EqualTo(id, PlatformIPCState.listen)) ThenBlock: {
+            r = HaikuSyscall(224, id)
+            r = HaikuRT_R32(r)
+            PlatformIPCState.listen = 0
+            ReturnValue(r)
+        }
+        IfCondition GreaterThan(PlatformIPCState.reply, 0) ThenBlock: {
+            r = HaikuSyscall(224, PlatformIPCState.reply)
+            r = HaikuRT_R32(r)
+            PlatformIPCState.reply = 0
+            ReturnValue(r)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.PlatformIPC_SetRecvTimeout {
+    Input: id: Integer
+    Input: ms: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(0)
+    }
+}
+
+// Make a private reply port. A leftover name from a dead team is removed
+// once and the create is tried again.
+Function.PlatformIPC_ReplyPort {
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(PlatformIPCState.reply, 0) ThenBlock: {
+            ReturnValue(PlatformIPCState.reply)
+        }
+        reply = HaikuSyscall(222, 4, "hc.ReadRep")
+        reply = HaikuRT_R32(reply)
+        IfCondition LessThan(reply, 1) ThenBlock: {
+            old = HaikuSyscall(225, "hc.ReadRep")
+            old = HaikuRT_R32(old)
+            IfCondition GreaterThan(old, 0) ThenBlock: {
+                dummy = HaikuSyscall(224, old)
+                dummy = HaikuRT_R32(dummy)
+            }
+            reply = HaikuSyscall(222, 4, "hc.ReadRep")
+            reply = HaikuRT_R32(reply)
+        }
+        PlatformIPCState.reply = reply
+        ReturnValue(reply)
+    }
+}
+
+// Copy len bytes from src into a new NUL-terminated string.
+Function.PlatformIPC_Take {
+    Input: src: Address
+    Input: len: Integer
+    Output: Address
+    Body: {
+        IfCondition LessThan(len, 1) ThenBlock: { ReturnValue(0) }
+        out = Allocate(Add(len, 1))
+        i = 0
+        WhileLoop LessThan(i, len) {
+            b = GetByte(src, i)
+            SetByte(out, i, b)
+            i = Add(i, 1)
+        }
+        SetByte(out, len, 0)
+        ReturnValue(out)
+    }
+}
+
+// Server writes bare JSON to the reply port carried in the last request.
+// Client writes the server port: 8-byte reply id, then the JSON.
+Function.PlatformIPC_SendMsg {
+    Input: id: Integer
+    Input: msg: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(msg, 0) ThenBlock: { ReturnValue(-1) }
+        len = StringLength(msg)
+        IfCondition EqualTo(id, PlatformIPCState.listen) ThenBlock: {
+            IfCondition LessThan(PlatformIPCState.reply, 1) ThenBlock: { ReturnValue(-1) }
+            r = PlatformIPC_Send(PlatformIPCState.reply, 1, msg, len)
+            ReturnValue(r)
+        }
+        reply = PlatformIPC_ReplyPort()
+        IfCondition LessThan(reply, 1) ThenBlock: { ReturnValue(-1) }
+        need = Add(len, 8)
+        IfCondition GreaterThan(need, 8192) ThenBlock: { ReturnValue(-1) }
+        raw = Allocate(8192)
+        StoreValue(raw, reply)
+        srcp = Add(raw, 8)
+        i = 0
+        WhileLoop LessThan(i, len) {
+            b = GetByte(msg, i)
+            SetByte(srcp, i, b)
+            i = Add(i, 1)
+        }
+        PlatformIPCState.peer = id
+        r = PlatformIPC_Send(id, 1, raw, need)
+        Deallocate(raw, 8192)
+        ReturnValue(r)
+    }
+}
+
+// Server reads the listen port and strips the reply-port prefix.
+// Client reads the bare JSON from its reply port.
+Function.PlatformIPC_RecvMsg {
+    Input: id: Integer
+    Output: Address
+    Body: {
+        raw = Allocate(8192)
+        codep = Allocate(8)
+        StoreValue(codep, 0)
+        port = id
+        IfCondition NotEqual(id, PlatformIPCState.listen) ThenBlock: {
+            port = PlatformIPCState.reply
+        }
+        n = PlatformIPC_Recv(port, codep, raw, 8191)
+        Deallocate(codep, 8)
+        IfCondition LessThan(n, 1) ThenBlock: {
+            Deallocate(raw, 8192)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(id, PlatformIPCState.listen) ThenBlock: {
+            IfCondition LessThan(n, 9) ThenBlock: {
+                Deallocate(raw, 8192)
+                ReturnValue(0)
+            }
+            reply = Dereference(raw)
+            PlatformIPCState.reply = reply
+            body = Subtract(n, 8)
+            srcp = Add(raw, 8)
+            out = PlatformIPC_Take(srcp, body)
+            Deallocate(raw, 8192)
+            ReturnValue(out)
+        }
+        out = PlatformIPC_Take(raw, n)
+        Deallocate(raw, 8192)
+        ReturnValue(out)
+    }
+}

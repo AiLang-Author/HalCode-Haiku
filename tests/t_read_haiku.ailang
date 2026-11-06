@@ -1,0 +1,122 @@
+// Native Read tool: load_image it, then schema plus one read over a port.
+// Exit 2 if the port name is already open. Do not delete that port.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.JSON
+Import.Platform.ProcHaiku
+Import.Platform.IPCHaiku
+
+SubRoutine.Main {
+    existing = PlatformIPC_Connect("@halcode/Read")
+    IfCondition GreaterThan(existing, 0) ThenBlock: { ProcessExit(2) }
+
+    argv = Allocate(32)
+    StoreValue(argv, "/boot/home/cc_read_haiku")
+    StoreValue(Add(argv, 8), 0)
+    envp = Allocate(8)
+    StoreValue(envp, 0)
+    pid = PlatformProc_SpawnWorker("/boot/home/cc_read_haiku", argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(1) }
+
+    ts = Allocate(16)
+    StoreValue(ts, 0)
+    StoreValue(Add(ts, 8), 50000000)
+    fd = 0
+    ok = 0
+    tries = 0
+    WhileLoop LessThan(tries, 40) {
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            fd = PlatformIPC_Connect("@halcode/Read")
+            IfCondition GreaterThan(fd, 0) ThenBlock: { ok = 1 }
+            IfCondition LessEqual(fd, 0) ThenBlock: {
+                SystemCall(35, ts, 0, 0, 0, 0)
+            }
+        }
+        tries = Add(tries, 1)
+    }
+    grp = Subtract(0, pid)
+    IfCondition EqualTo(ok, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(3)
+    }
+
+    req = JSON.NewObject()
+    JSON.SetString(req, "method", "schema")
+    s = JSON.SerializeObject(req)
+    PlatformIPC_SendMsg(fd, s)
+    resp = PlatformIPC_RecvMsg(fd)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(4)
+    }
+    parsed = ParseJSON(resp)
+    IfCondition EqualTo(parsed, 0) ThenBlock: {
+        PrintMessage(resp)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+    obj = JSON.AsObject(parsed)
+    method = JSON.GetString(obj, "method")
+    IfCondition EqualTo(method, 0) ThenBlock: {
+        PrintMessage(resp)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+    cmp = StringCompare(method, "schema_response")
+    IfCondition NotEqual(cmp, 0) ThenBlock: {
+        PrintMessage(resp)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+
+    req2 = JSON.NewObject()
+    JSON.SetString(req2, "method", "call")
+    JSON.SetString(req2, "id", "t1")
+    args = JSON.NewObject()
+    JSON.SetString(args, "path", "/tmp/hc_read_sample.txt")
+    JSON.SetObject(req2, "args", args)
+    s2 = JSON.SerializeObject(req2)
+    PlatformIPC_SendMsg(fd, s2)
+    resp2 = PlatformIPC_RecvMsg(fd)
+    IfCondition EqualTo(resp2, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(6)
+    }
+    parsed2 = ParseJSON(resp2)
+    IfCondition EqualTo(parsed2, 0) ThenBlock: {
+        PrintMessage(resp2)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(6)
+    }
+    obj2 = JSON.AsObject(parsed2)
+    content = JSON.GetString(obj2, "content")
+    IfCondition EqualTo(content, 0) ThenBlock: {
+        PrintMessage(resp2)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(7)
+    }
+    cmp2 = StringCompare(content, "HELLO_READ")
+    IfCondition NotEqual(cmp2, 0) ThenBlock: {
+        PrintMessage(resp2)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(7)
+    }
+
+    PlatformProc_Kill(grp, 15)
+    st = Allocate(8)
+    StoreValue(st, 99)
+    wr = PlatformProc_Wait(pid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(8) }
+    PrintMessage("READ_OK\n")
+    ProcessExit(0)
+}
+
+RunTask(Main)

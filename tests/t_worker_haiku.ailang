@@ -1,0 +1,30 @@
+// Haiku SpawnWorker: load_image, setpgid, kill the process group.
+LibraryImport.Arena
+Import.Platform.ProcHaiku
+
+SubRoutine.Main {
+    argv = Allocate(32)
+    StoreValue(argv, "/bin/sleep")
+    StoreValue(Add(argv, 8), "30")
+    StoreValue(Add(argv, 16), 0)
+    envp = Allocate(8)
+    StoreValue(envp, 0)
+    pid = PlatformProc_SpawnWorker("/bin/sleep", argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(1) }
+    alive = PlatformProc_Exists(pid)
+    IfCondition NotEqual(alive, 1) ThenBlock: { ProcessExit(2) }
+    grp = Subtract(0, pid)
+    r = PlatformProc_Kill(grp, 15)
+    IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(3) }
+    st = Allocate(8)
+    StoreValue(st, 99)
+    wr = PlatformProc_Wait(pid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(4) }
+    wst = Dereference(st)
+    // HaikuRT encodes a signal death in the low 7 bits.
+    kind = BitwiseAnd(wst, 127)
+    IfCondition NotEqual(kind, 15) ThenBlock: { ProcessExit(5) }
+    ProcessExit(0)
+}
+
+RunTask(Main)

@@ -1,0 +1,7 @@
+// Linux build selects the Linux HTTP spawn. A Haiku build replaces
+// this import with Import.Platform.HTTPHaiku. Shared code imports
+// Import.Platform.HTTP and does not branch on the OS.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+Import.Platform.HTTPLinux

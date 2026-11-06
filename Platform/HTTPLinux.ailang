@@ -1,0 +1,36 @@
+// Linux provider requests stay on HTTP_SpawnCurl's fork and exec.
+// The handle, the status record and the stream reader do not change.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+Function.PlatformHTTP_GetStream {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: conn_ms: Integer
+    Input: max_ms: Integer
+    Output: Address
+    Body: {
+        ReturnValue(HTTP.GetStream(url, headers_str, conn_ms, max_ms))
+    }
+}
+
+Function.PlatformHTTP_PostStream {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Input: conn_ms: Integer
+    Input: max_ms: Integer
+    Output: Address
+    Body: {
+        ReturnValue(HTTP.PostStream(url, headers_str, body_str, conn_ms, max_ms))
+    }
+}
+
+// The Linux status record is still the /dev/fd/4 pipe. HTTP.GetStatus
+// reads it. This function is the Haiku hook and does nothing here.
+Function.PlatformHTTP_TakeStatus {
+    Input: handle: Address
+    Body: {
+        ReturnValue(0)
+    }
+}

@@ -1,0 +1,7 @@
+// Linux build selects the fan pool. A Haiku build replaces this import
+// with Import.Platform.FanHaiku. Shared code imports Import.Platform.Fan
+// and does not branch on the OS.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+Import.Platform.FanLinux

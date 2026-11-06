@@ -24,6 +24,8 @@ workspace.code-workspace
 *.a
 *.bak
 *.zip
+# Release tarball from the install task. Not part of the source commit.
+dist/
 __pycache__/
 *.pyc
 nohup.out

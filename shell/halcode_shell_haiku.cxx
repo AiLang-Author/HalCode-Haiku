@@ -37,11 +37,16 @@
 #include <Window.h>
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -50,6 +55,7 @@ enum {
     MSG_COPY = 'copy',
     MSG_PASTE = 'past',
     MSG_ALL = 'sall',
+    MSG_STOP = 'stop',
     MSG_HELP = 'help'
 };
 
@@ -57,6 +63,11 @@ static char g_dir[512];
 static char path_meta[600], path_frame[600], path_gen[600];
 static char path_ptr[600], path_cmd[600], path_keys[600];
 static char path_paste[600], path_copy[600];
+static char path_go[600], path_model[600], path_reply[600], path_prompt[600];
+static char g_root[512], g_runner[512], g_bin[600], g_deskbin[600];
+static pid_t g_desk = -1, g_host = -1, g_agent = -1;
+static time_t g_agent_t0, g_agent_prog, g_agent_term, g_go_wait, g_host_t0;
+static off_t g_prog_n = -1;
 
 static void paths_init(const char *dir) {
     snprintf(g_dir, sizeof g_dir, "%s", dir);
@@ -68,6 +79,10 @@ static void paths_init(const char *dir) {
     snprintf(path_keys, sizeof path_keys, "%s/keys.txt", dir);
     snprintf(path_paste, sizeof path_paste, "%s/paste.txt", dir);
     snprintf(path_copy, sizeof path_copy, "%s/copy.txt", dir);
+    snprintf(path_go, sizeof path_go, "%s/go.txt", dir);
+    snprintf(path_model, sizeof path_model, "%s/model.txt", dir);
+    snprintf(path_reply, sizeof path_reply, "%s/reply.txt", dir);
+    snprintf(path_prompt, sizeof path_prompt, "%s/prompt.txt", dir);
 }
 
 static void write_line(const char *path, const char *s) {
@@ -82,6 +97,407 @@ static void write_line(const char *path, const char *s) {
 }
 
 static void write_cmd(const char *s) { write_line(path_cmd, s); }
+
+static void write_reply(const char *s) {
+    FILE *f = fopen(path_reply, "w");
+    if (!f) return;
+    fputs(s, f);
+    if (s[0] && s[strlen(s) - 1] != '\n') fputc('\n', f);
+    fclose(f);
+}
+
+/* The desk renames reply.txt to reply.seen as soon as it paints.
+ * That happens before waitpid, so a finished turn looks like a
+ * missing reply and used to be overwritten with "hal: empty reply". */
+static int reply_taken_this_turn(void) {
+    struct stat seen;
+    FILE *f;
+    char buf[32];
+    size_t n;
+
+    if (stat("/tmp/halcode_app/reply.seen", &seen) != 0)
+        return 0;
+    if (seen.st_size <= 0 || seen.st_mtime < g_agent_t0)
+        return 0;
+    f = fopen("/tmp/halcode_app/reply.seen", "r");
+    if (!f)
+        return 0;
+    n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    if (strncmp(buf, "hal: empty reply", 16) == 0)
+        return 0;
+    if (strncmp(buf, "hal: agent timed out", 20) == 0)
+        return 0;
+    return 1;
+}
+
+static int pid_alive(pid_t p) {
+    return p > 0 && kill(p, 0) == 0;
+}
+
+static void reap_if_dead(pid_t *p) {
+    int st;
+    if (*p <= 0) return;
+    if (waitpid(*p, &st, WNOHANG) == *p) *p = -1;
+}
+
+static void stop_pid(pid_t *p) {
+    int st;
+    if (*p <= 0) return;
+    kill(*p, SIGTERM);
+    for (int i = 0; i < 20; i++) {
+        if (waitpid(*p, &st, WNOHANG) == *p) {
+            *p = -1;
+            return;
+        }
+        usleep(20000);
+    }
+    kill(*p, SIGKILL);
+    waitpid(*p, &st, 0);
+    *p = -1;
+}
+
+/* keysave.txt is "hint\nkey\n" from the desk API KEY button.
+ * Write ~/.halcode/<hint>_key mode 0600. Never log the key.
+ * The Linux agent reads that file. It does not see this process's env. */
+static int hint_chars_ok(const char *s) {
+    size_t n;
+    if (!s || !s[0]) return 0;
+    n = strlen(s);
+    if (n > 24) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+static int hint_known(const char *hint) {
+    char path[600];
+    static const char *ok[] = {
+        "deepseek", "anthropic", "xai", "gemini", "openai",
+        "openrouter", "groq", NULL
+    };
+    snprintf(path, sizeof path, "%s/providers/%s.json", g_root, hint);
+    if (access(path, R_OK) == 0) return 1;
+    for (int i = 0; ok[i]; i++)
+        if (strcmp(hint, ok[i]) == 0) return 1;
+    return 0;
+}
+
+static void write_key_result(const char *status, const char *hint) {
+    char path[600];
+    FILE *f;
+    snprintf(path, sizeof path, "%s/keyresult.txt", g_dir);
+    f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s %s\n", status, hint && hint[0] ? hint : "hint");
+    fclose(f);
+}
+
+static void poll_keysave(void) {
+    char path[600];
+    char hint[32];
+    char key[256];
+    char dir[512];
+    char file[600];
+    char tmp[640];
+    FILE *f;
+    const char *home;
+    size_t n;
+    int fd;
+
+    snprintf(path, sizeof path, "%s/keysave.txt", g_dir);
+    f = fopen(path, "r");
+    if (!f) return;
+    if (!fgets(hint, sizeof hint, f) || !fgets(key, sizeof key, f)) {
+        fclose(f);
+        unlink(path);
+        write_key_result("fail", "hint");
+        return;
+    }
+    fclose(f);
+    unlink(path);
+    hint[strcspn(hint, "\r\n")] = 0;
+    key[strcspn(key, "\r\n")] = 0;
+    if (!hint_chars_ok(hint) || !hint_known(hint) || !key[0]) {
+        write_key_result("fail", hint);
+        memset(key, 0, sizeof key);
+        return;
+    }
+    home = getenv("HOME");
+    if (!home || !home[0]) home = "/boot/home";
+    snprintf(dir, sizeof dir, "%s/.halcode", home);
+    mkdir(dir, 0700);
+    snprintf(file, sizeof file, "%s/%s_key", dir, hint);
+    snprintf(tmp, sizeof tmp, "%s/.keytmp.%s", dir, hint);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        write_key_result("fail", hint);
+        memset(key, 0, sizeof key);
+        return;
+    }
+    n = strlen(key);
+    if (write(fd, key, n) != (ssize_t)n || write(fd, "\n", 1) != 1) {
+        close(fd);
+        unlink(tmp);
+        write_key_result("fail", hint);
+        memset(key, 0, sizeof key);
+        return;
+    }
+    fchmod(fd, 0600);
+    close(fd);
+    memset(key, 0, sizeof key);
+    if (rename(tmp, file) != 0) {
+        unlink(tmp);
+        write_key_result("fail", hint);
+        return;
+    }
+    chmod(file, 0600);
+    write_key_result("ok", hint);
+}
+
+static void load_key_env(void) {
+    static const char *names[] = {
+        "deepseek_key", "DEEPSEEK_API_KEY",
+        "anthropic_key", "ANTHROPIC_API_KEY",
+        "xai_key", "XAI_API_KEY",
+        "gemini_key", "GEMINI_API_KEY",
+        NULL
+    };
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/boot/home";
+    for (int i = 0; names[i]; i += 2) {
+        char path[512];
+        char buf[256];
+        FILE *f;
+        size_t n;
+        snprintf(path, sizeof path, "%s/.halcode/%s", home, names[i]);
+        f = fopen(path, "r");
+        if (!f) continue;
+        n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) n--;
+        buf[n] = 0;
+        if (n) setenv(names[i + 1], buf, 1);
+    }
+}
+
+static int have_file(const char *path) {
+    return access(path, X_OK) == 0 || access(path, R_OK) == 0;
+}
+
+static void find_root(void) {
+    const char *env = getenv("HALCODE_ROOT");
+    if (env && env[0] && access(env, R_OK) == 0) {
+        snprintf(g_root, sizeof g_root, "%s", env);
+    } else if (access("/boot/home/HalCode-Haiku/HalCode9000.x", R_OK) == 0) {
+        snprintf(g_root, sizeof g_root, "/boot/home/HalCode-Haiku");
+    } else {
+        snprintf(g_root, sizeof g_root, "/boot/home/HalCode-Haiku");
+    }
+    snprintf(g_bin, sizeof g_bin, "%s/HalCode9000.x", g_root);
+    snprintf(g_deskbin, sizeof g_deskbin, "%s/shell/halcode_desk.x", g_root);
+    if (access("/boot/home/sys_compat_run", X_OK) == 0)
+        snprintf(g_runner, sizeof g_runner, "/boot/home/sys_compat_run");
+    else
+        snprintf(g_runner, sizeof g_runner, "sys_compat_run");
+}
+
+static pid_t spawn_compat(const char *in_path, const char *out_path,
+                          const char *err_path, char *const av[]) {
+    pid_t p = fork();
+    if (p != 0) return p;
+    if (chdir(g_root) != 0) _exit(127);
+    if (in_path) {
+        int fd = open(in_path, O_RDONLY);
+        if (fd >= 0) {
+            dup2(fd, 0);
+            if (fd > 2) close(fd);
+        }
+    }
+    if (out_path) {
+        int fd = open(out_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            dup2(fd, 1);
+            if (fd > 2) close(fd);
+        }
+    }
+    if (err_path) {
+        int fd = open(err_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            dup2(fd, 2);
+            if (fd > 2) close(fd);
+        }
+    }
+    load_key_env();
+    execv(g_runner, av);
+    _exit(127);
+}
+
+static void ensure_desk(void) {
+    char *av[3];
+    static time_t next_try;
+    reap_if_dead(&g_desk);
+    if (pid_alive(g_desk)) return;
+    if (!have_file(g_deskbin)) return;
+    if (next_try != 0 && time(NULL) < next_try) return;
+    next_try = time(NULL) + 2;
+    av[0] = g_runner;
+    av[1] = g_deskbin;
+    av[2] = NULL;
+    g_desk = spawn_compat(NULL, "/tmp/halcode_app/desk.log",
+                          "/tmp/halcode_app/desk.log", av);
+}
+
+static void ensure_host(void) {
+    char *av[4];
+    reap_if_dead(&g_host);
+    if (pid_alive(g_host)) return;
+    if (!have_file(g_bin)) return;
+    av[0] = g_runner;
+    av[1] = g_bin;
+    av[2] = (char *)"--host";
+    av[3] = NULL;
+    g_host = spawn_compat("/dev/null", "/tmp/halcode_app/host.log",
+                          "/tmp/halcode_app/host.log", av);
+}
+
+static void read_model(char *spec, size_t n) {
+    FILE *mf = fopen(path_model, "r");
+    spec[0] = 0;
+    if (!mf) return;
+    if (!fgets(spec, (int)n, mf)) spec[0] = 0;
+    fclose(mf);
+    char *nl = strchr(spec, '\n');
+    if (nl) *nl = 0;
+    nl = strchr(spec, '\r');
+    if (nl) *nl = 0;
+}
+
+static void cancel_turn(const char *why) {
+    unlink(path_go);
+    stop_pid(&g_agent);
+    write_reply(why);
+    unlink("/tmp/halcode_app/wait.txt");
+    g_go_wait = 0;
+}
+
+static void agent_finish_locked(void) {
+    int st;
+    struct stat sb;
+    time_t now = time(NULL);
+    off_t n = 0;
+    pid_t w;
+    if (g_agent <= 0) return;
+    if (stat("/tmp/halcode_app/agent.err", &sb) == 0) n += sb.st_size;
+    if (stat("/tmp/halcode_app/think.txt", &sb) == 0) n += sb.st_size;
+    if (stat(path_reply, &sb) == 0) n += sb.st_size;
+    if (n != g_prog_n) {
+        g_prog_n = n;
+        g_agent_prog = now;
+    }
+    if (g_agent_term > 0) {
+        w = waitpid(g_agent, &st, WNOHANG);
+        if (w == g_agent || now - g_agent_term >= 2) {
+            if (w != g_agent) {
+                kill(g_agent, SIGKILL);
+                waitpid(g_agent, &st, WNOHANG);
+            }
+            g_agent = -1;
+            g_agent_term = 0;
+        }
+        return;
+    }
+    if (now - g_agent_prog > 180 || now - g_agent_t0 > 900) {
+        kill(g_agent, SIGTERM);
+        g_agent_term = now;
+        unlink("/tmp/halcode_app/wait.txt");
+        if ((stat(path_reply, &sb) != 0 || sb.st_size <= 0)
+            && !reply_taken_this_turn())
+            write_reply("hal: agent timed out");
+        return;
+    }
+    w = waitpid(g_agent, &st, WNOHANG);
+    if (w == g_agent) {
+        g_agent = -1;
+        unlink("/tmp/halcode_app/wait.txt");
+        if ((stat(path_reply, &sb) != 0 || sb.st_size <= 0)
+            && !reply_taken_this_turn())
+            write_reply("hal: empty reply");
+    }
+}
+
+static void agent_tick(void) {
+    char spec[160];
+    char *av[5];
+    /* --host at idle panicked this guest. Start it only after a send. */
+    if (access(path_go, F_OK) != 0) {
+        agent_finish_locked();
+        return;
+    }
+    if (pid_alive(g_agent)) {
+        unlink(path_go);
+        write_reply("hal: busy — a turn is already running. Escape stops it.");
+        return;
+    }
+    read_model(spec, sizeof spec);
+    if (!spec[0]) {
+        unlink(path_go);
+        write_reply("select a model first");
+        unlink("/tmp/halcode_app/wait.txt");
+        g_go_wait = 0;
+        return;
+    }
+    if (access("/tmp/halcode_app/ready.txt", F_OK) != 0) {
+        reap_if_dead(&g_host);
+        if (!pid_alive(g_host)) {
+            if (g_host_t0 != 0 && time(NULL) - g_host_t0 < 3) {
+                unlink(path_go);
+                write_reply("hal: agent host exited before the turn started");
+                unlink("/tmp/halcode_app/wait.txt");
+                g_go_wait = 0;
+                g_host_t0 = 0;
+                return;
+            }
+            ensure_host();
+            g_host_t0 = time(NULL);
+        }
+        if (g_go_wait == 0) g_go_wait = time(NULL);
+        /* RegisterTool spends ~10s per missing tool before StartProxy.
+         * Relmem, Pgmem, and MCP can burn the whole window. Wait until
+         * ready.txt appears, and give up only after this long. */
+        if (time(NULL) - g_go_wait < 45) return;
+    }
+    g_go_wait = 0;
+    unlink(path_go);
+    av[0] = g_runner;
+    av[1] = g_bin;
+    av[2] = (char *)"--agent";
+    av[3] = spec;
+    av[4] = NULL;
+    g_agent = spawn_compat(path_prompt, "/tmp/halcode_app/agent.out",
+                           "/tmp/halcode_app/agent.err", av);
+    if (g_agent < 0) {
+        write_reply("hal: could not start the agent");
+        unlink("/tmp/halcode_app/wait.txt");
+        return;
+    }
+    g_agent_t0 = time(NULL);
+    g_agent_prog = g_agent_t0;
+    g_agent_term = 0;
+    g_prog_n = -1;
+}
+
+static void shutdown_children(void) {
+    unlink(path_go);
+    stop_pid(&g_agent);
+    stop_pid(&g_host);
+    stop_pid(&g_desk);
+}
 
 static void write_ptr(const char *kind, int fx, int fy, int fw, int fh) {
     char buf[64];
@@ -281,7 +697,13 @@ public:
         case B_HOME: write_line(path_keys, "H"); return;
         case B_END: write_line(path_keys, "E"); return;
         case B_TAB: write_line(path_keys, "T"); return;
-        case B_ESCAPE: write_line(path_keys, "e"); return;
+        case B_ESCAPE:
+            if (pid_alive(g_agent) || access("/tmp/halcode_app/wait.txt", F_OK) == 0) {
+                cancel_turn("cancelled");
+                return;
+            }
+            write_line(path_keys, "e");
+            return;
         default: break;
         }
         if (numBytes == 1 && (unsigned char)ch >= 32 && (unsigned char)ch < 127) {
@@ -372,6 +794,7 @@ public:
         mb.bottom = mb.top + 18;
         BMenuBar *bar = new BMenuBar(mb, "menu");
         BMenu *file = new BMenu("File");
+        file->AddItem(new BMenuItem("Stop turn", new BMessage(MSG_STOP)));
         file->AddItem(new BMenuItem("Quit", new BMessage(MSG_QUIT), 'Q'));
         bar->AddItem(file);
         BMenu *edit = new BMenu("Edit");
@@ -396,6 +819,7 @@ public:
     ~HalWindow() { delete fPoll; }
 
     bool QuitRequested() {
+        shutdown_children();
         write_cmd("quit");
         be_app->PostMessage(B_QUIT_REQUESTED);
         return true;
@@ -404,9 +828,16 @@ public:
     void MessageReceived(BMessage *msg) {
         switch (msg->what) {
         case MSG_POLL:
+            poll_keysave();
+            ensure_desk();
+            agent_tick();
             if (fView) fView->Poll();
             return;
+        case MSG_STOP:
+            cancel_turn("cancelled");
+            return;
         case MSG_QUIT:
+            shutdown_children();
             write_cmd("quit");
             be_app->PostMessage(B_QUIT_REQUESTED);
             return;
@@ -421,10 +852,10 @@ public:
             return;
         case MSG_HELP:
             (new BAlert("keymap",
-                "Enter sends the line. Backspace, arrows, Home, End, and Tab "
-                "go to the desk. Command+C copies, Command+V pastes, "
-                "Command+Q quits. The desk draws the chat. This window only "
-                "shows its frame.",
+                "Pick a model before Enter. In Models, click API KEY, "
+                "paste the provider key, and press Enter. It is saved in "
+                "~/.halcode/ and is not shown again. Escape, or File → "
+                "Stop turn, cancels the running turn. Command+Q quits.",
                 "OK"))->Go();
             return;
         default:
@@ -441,6 +872,10 @@ class HalApp : public BApplication {
 public:
     HalApp() : BApplication("application/x-vnd.2paws-HalCode") {}
     void ReadyToRun() {
+        find_root();
+        unlink(path_go);
+        unlink("/tmp/halcode_app/wait.txt");
+        ensure_desk();
         BRect screen = BScreen(B_MAIN_SCREEN_ID).Frame();
         float w = 1100, h = 720;
         float x = screen.left + (screen.Width() - w) / 2;

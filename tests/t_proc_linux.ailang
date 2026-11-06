@@ -1,0 +1,31 @@
+// Linux Platform.Proc: spawn /bin/true, confirm it exists, wait for status 0.
+LibraryImport.Arena
+Import.Platform.ProcLinux
+Import.Platform.SignalLinux
+
+SubRoutine.Main {
+    r = PlatformSignal_Ignore(13)
+    IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(1) }
+    argv = Allocate(24)
+    StoreValue(argv, "/bin/sleep")
+    StoreValue(Add(argv, 8), "30")
+    StoreValue(Add(argv, 16), 0)
+    envp = Allocate(8)
+    StoreValue(envp, 0)
+    pid = PlatformProc_Spawn("/bin/sleep", argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(2) }
+    alive = PlatformProc_Exists(pid)
+    IfCondition NotEqual(alive, 1) ThenBlock: { ProcessExit(3) }
+    r = PlatformProc_Kill(pid, 15)
+    IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(4) }
+    st = Allocate(8)
+    StoreValue(st, 99)
+    wr = PlatformProc_Wait(pid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(5) }
+    wst = Dereference(st)
+    kind = BitwiseAnd(wst, 127)
+    IfCondition NotEqual(kind, 15) ThenBlock: { ProcessExit(6) }
+    ProcessExit(0)
+}
+
+RunTask(Main)

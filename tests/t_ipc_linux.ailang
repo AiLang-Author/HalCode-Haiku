@@ -1,0 +1,45 @@
+// Two Linux processes, one Unix socket, one length-prefixed message.
+LibraryImport.Arena
+Import.Platform.IPCLinux
+
+SubRoutine.Main {
+    path = "/tmp/hc.plat.linux.sock"
+    SystemCall(87, path, 0, 0, 0, 0)
+    id = PlatformIPC_Listen(path, 4)
+    IfCondition LessThan(id, 0) ThenBlock: { ProcessExit(1) }
+    pid = SystemCall(57, 0, 0, 0, 0, 0)
+    IfCondition LessThan(pid, 0) ThenBlock: { ProcessExit(2) }
+    IfCondition EqualTo(pid, 0) ThenBlock: {
+        SystemCall(3, id, 0, 0, 0, 0)
+        c = PlatformIPC_Connect(path)
+        IfCondition LessThan(c, 0) ThenBlock: { ProcessExit(20) }
+        msg = Allocate(4)
+        SetByte(msg, 0, 112)
+        SetByte(msg, 1, 111)
+        SetByte(msg, 2, 110)
+        SetByte(msg, 3, 103)
+        r = PlatformIPC_Send(c, 9, msg, 4)
+        IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(21) }
+        ProcessExit(0)
+    }
+    client = PlatformIPC_Accept(id)
+    IfCondition LessThan(client, 0) ThenBlock: { ProcessExit(3) }
+    codep = Allocate(8)
+    StoreValue(codep, 0)
+    buf = Allocate(8)
+    n = PlatformIPC_Recv(client, codep, buf, 8)
+    IfCondition NotEqual(n, 4) ThenBlock: { ProcessExit(4) }
+    b = GetByte(buf, 0)
+    IfCondition NotEqual(b, 112) ThenBlock: { ProcessExit(5) }
+    b = GetByte(buf, 3)
+    IfCondition NotEqual(b, 103) ThenBlock: { ProcessExit(6) }
+    st = Allocate(8)
+    wr = SystemCall(61, pid, st, 0, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(7) }
+    PlatformIPC_Close(client)
+    PlatformIPC_Close(id)
+    SystemCall(87, path, 0, 0, 0, 0)
+    ProcessExit(0)
+}
+
+RunTask(Main)

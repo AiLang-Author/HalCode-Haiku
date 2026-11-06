@@ -1,0 +1,75 @@
+// Platform.Proc and Platform.IPC on Haiku.
+// No args: spawn /bin/true, ignore SIGPIPE, then load this binary as
+// "child" and read "pong" from the port hc.plat1.
+// Arg "child": connect to that port and send the four bytes.
+LibraryImport.Arena
+Import.Platform.ProcHaiku
+Import.Platform.IPCHaiku
+Import.Platform.SignalHaiku
+
+SubRoutine.Main {
+    IfCondition GreaterThan(HaikuRT.argc, 1) ThenBlock: {
+        ap = Add(HaikuRT.argv, 8)
+        s = Dereference(ap)
+        b0 = GetByte(s, 0)
+        IfCondition EqualTo(b0, 99) ThenBlock: {
+            id = PlatformIPC_Connect("hc.plat1")
+            IfCondition LessThan(id, 1) ThenBlock: { ProcessExit(30) }
+            msg = HaikuAnonMap(8, 3)
+            IfCondition LessThan(msg, 1) ThenBlock: { ProcessExit(31) }
+            SetByte(msg, 0, 112)
+            SetByte(msg, 1, 111)
+            SetByte(msg, 2, 110)
+            SetByte(msg, 3, 103)
+            r = PlatformIPC_Send(id, 9, msg, 4)
+            IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(32) }
+            ProcessExit(0)
+        }
+    }
+    r = PlatformSignal_Ignore(13)
+    IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(1) }
+    argv = Allocate(24)
+    StoreValue(argv, "/bin/sleep")
+    StoreValue(Add(argv, 8), "30")
+    StoreValue(Add(argv, 16), 0)
+    envp = Allocate(8)
+    StoreValue(envp, 0)
+    pid = PlatformProc_Spawn("/bin/sleep", argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(2) }
+    alive = PlatformProc_Exists(pid)
+    IfCondition NotEqual(alive, 1) ThenBlock: { ProcessExit(3) }
+    r = PlatformProc_Kill(pid, 15)
+    IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(4) }
+    st = Allocate(8)
+    StoreValue(st, 99)
+    wr = PlatformProc_Wait(pid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(5) }
+    wst = HaikuRT_Ld32(st)
+    IfCondition NotEqual(wst, 15) ThenBlock: { ProcessExit(6) }
+    id = PlatformIPC_Listen("hc.plat1", 4)
+    IfCondition LessThan(id, 1) ThenBlock: { ProcessExit(14) }
+    childv = Allocate(24)
+    StoreValue(childv, "/boot/home/t_platform")
+    StoreValue(Add(childv, 8), "child")
+    StoreValue(Add(childv, 16), 0)
+    cid = PlatformProc_Spawn("/boot/home/t_platform", childv, envp)
+    IfCondition LessThan(cid, 1) ThenBlock: { ProcessExit(7) }
+    codep = Allocate(8)
+    StoreValue(codep, 0)
+    buf = HaikuAnonMap(8, 3)
+    n = PlatformIPC_Recv(id, codep, buf, 8)
+    IfCondition NotEqual(n, 4) ThenBlock: { ProcessExit(8) }
+    code = HaikuRT_Ld32(codep)
+    IfCondition NotEqual(code, 9) ThenBlock: { ProcessExit(9) }
+    b = GetByte(buf, 0)
+    IfCondition NotEqual(b, 112) ThenBlock: { ProcessExit(10) }
+    wr = PlatformProc_Wait(cid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(11) }
+    wst = HaikuRT_Ld32(st)
+    IfCondition NotEqual(wst, 0) ThenBlock: { ProcessExit(12) }
+    r = PlatformIPC_Close(id)
+    IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(13) }
+    ProcessExit(0)
+}
+
+RunTask(Main)

@@ -1,0 +1,17 @@
+// Linux agent keeps the clone-based fan pool.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+Function.PlatformFan_Init {
+    Output: Integer
+    Body: {
+        ReturnValue(CCFan_Init())
+    }
+}
+
+Function.PlatformFan_Shutdown {
+    Body: {
+        CCFan_Shutdown()
+        ReturnValue(0)
+    }
+}

@@ -1,0 +1,118 @@
+// Launch cc_read through PlatformProc_SpawnWorker and speak the
+// existing socket framing (4-byte big-endian length plus JSON).
+// Exit 2 if @halcode/Read is already taken, so a live tool is left alone.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+Import.Platform.Proc
+
+SubRoutine.Main {
+    pfd = Socket.Create(1, 1)
+    pr = Socket.ConnectUnix(pfd, "@halcode/Read")
+    IfCondition GreaterEqual(pr, 0) ThenBlock: {
+        SystemCall(3, pfd, 0, 0, 0, 0)
+        ProcessExit(2)
+    }
+    SystemCall(3, pfd, 0, 0, 0, 0)
+
+    argv = Allocate(32)
+    StoreValue(argv, "/tmp/cc_read_ipc.x")
+    StoreValue(Add(argv, 8), 0)
+    envp = Allocate(8)
+    StoreValue(envp, 0)
+    pid = PlatformProc_SpawnWorker("/tmp/cc_read_ipc.x", argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(1) }
+
+    ts = Allocate(16)
+    StoreValue(ts, 0)
+    StoreValue(Add(ts, 8), 50000000)
+    fd = 0
+    ok = 0
+    tries = 0
+    WhileLoop LessThan(tries, 40) {
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            fd = Socket.Create(1, 1)
+            cr = Socket.ConnectUnix(fd, "@halcode/Read")
+            IfCondition GreaterEqual(cr, 0) ThenBlock: { ok = 1 }
+            IfCondition LessThan(cr, 0) ThenBlock: {
+                SystemCall(3, fd, 0, 0, 0, 0)
+                SystemCall(35, ts, 0, 0, 0, 0)
+            }
+        }
+        tries = Add(tries, 1)
+    }
+    grp = Subtract(0, pid)
+    IfCondition EqualTo(ok, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(3)
+    }
+
+    req = JSON.NewObject()
+    JSON.SetString(req, "method", "schema")
+    s = JSON.SerializeObject(req)
+    Socket.SendMsg(fd, s)
+    resp = Socket.RecvMsg(fd)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(4)
+    }
+    parsed = ParseJSON(resp)
+    IfCondition EqualTo(parsed, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+    obj = JSON.AsObject(parsed)
+    method = JSON.GetString(obj, "method")
+    IfCondition EqualTo(method, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+    cmp = StringCompare(method, "schema_response")
+    IfCondition NotEqual(cmp, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+
+    req2 = JSON.NewObject()
+    JSON.SetString(req2, "method", "call")
+    JSON.SetString(req2, "id", "t1")
+    args = JSON.NewObject()
+    JSON.SetString(args, "path", "/tmp/hc_read_sample.txt")
+    JSON.SetObject(req2, "args", args)
+    s2 = JSON.SerializeObject(req2)
+    Socket.SendMsg(fd, s2)
+    resp2 = Socket.RecvMsg(fd)
+    IfCondition EqualTo(resp2, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(6)
+    }
+    parsed2 = ParseJSON(resp2)
+    IfCondition EqualTo(parsed2, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(6)
+    }
+    obj2 = JSON.AsObject(parsed2)
+    content = JSON.GetString(obj2, "content")
+    IfCondition EqualTo(content, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(7)
+    }
+    cmp2 = StringCompare(content, "HELLO_READ")
+    IfCondition NotEqual(cmp2, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(7)
+    }
+
+    PlatformProc_Kill(grp, 15)
+    st = Allocate(8)
+    StoreValue(st, 99)
+    wr = PlatformProc_Wait(pid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(8) }
+    SystemCall(3, fd, 0, 0, 0, 0)
+    ProcessExit(0)
+}
+
+RunTask(Main)

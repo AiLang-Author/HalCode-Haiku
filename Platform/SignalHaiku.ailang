@@ -1,0 +1,38 @@
+// Haiku signal platform. Linux signal numbers. HaikuRT maps them.
+// SIG_IGN is 1 and SIG_DFL is 0 in the handler slot.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+
+Function.PlatformSignal_Set {
+    Input: sig: Integer
+    Input: handler: Integer
+    Output: Integer
+    Body: {
+        act = Allocate(32)
+        MemorySet(act, 0, 32)
+        StoreValue(act, handler)
+        r = SystemCall(13, sig, act, 0, 8)
+        Deallocate(act, 32)
+        ReturnValue(r)
+    }
+}
+
+Function.PlatformSignal_Ignore {
+    Input: sig: Integer
+    Output: Integer
+    Body: {
+        r = PlatformSignal_Set(sig, 1)
+        ReturnValue(r)
+    }
+}
+
+Function.PlatformSignal_Default {
+    Input: sig: Integer
+    Output: Integer
+    Body: {
+        r = PlatformSignal_Set(sig, 0)
+        ReturnValue(r)
+    }
+}

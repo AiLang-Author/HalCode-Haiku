@@ -638,6 +638,13 @@ Function.Auth_ReadKeyFile {
             path2  = StringConcat(stem2, "_key")
             fd = SystemCall(AuthSys.SYS_OPEN, path2, 0, 0, 0, 0)
             IfCondition LessThan(fd, 0) ThenBlock: {
+                // Haiku agent environ is only PATH and HOME. When that read
+                // misses, HOME becomes /root and the desk key is skipped.
+                stemh = StringConcat("/boot/home/.halcode/", hint)
+                pathh = StringConcat(stemh, "_key")
+                fd = SystemCall(AuthSys.SYS_OPEN, pathh, 0, 0, 0, 0)
+            }
+            IfCondition LessThan(fd, 0) ThenBlock: {
                 // Legacy fallback to api_key only for the anthropic hint —
                 // other providers must NOT pick up the Anthropic key by mistake.
                 IfCondition EqualTo(StringCompare(hint, "anthropic"), 0) ThenBlock: {

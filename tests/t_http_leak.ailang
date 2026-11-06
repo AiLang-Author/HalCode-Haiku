@@ -1,0 +1,50 @@
+// Two overlapping HTTP reads. The file request must reach EOF while the
+// second curl is still connected. A leaked stdout write end hangs the read.
+LibraryImport.Arena
+LibraryImport.HTTP
+Import.Platform.Proc
+Import.Platform.HTTP
+
+SubRoutine.Main {
+    fd = SystemCall(2, "/tmp/p4_one.txt", 577, 420, 0, 0)
+    IfCondition LessThan(fd, 0) ThenBlock: { ProcessExit(1) }
+    SystemCall(1, fd, "ONE\n", 4, 0, 0)
+    SystemCall(3, fd, 0, 0, 0, 0)
+
+    h1 = PlatformHTTP_GetStream("file:///tmp/p4_one.txt", 0, 2000, 5000)
+    IfCondition EqualTo(h1, 0) ThenBlock: { ProcessExit(2) }
+    h2 = PlatformHTTP_GetStream("http://127.0.0.1:8766/hold", 0, 5000, 30000)
+    IfCondition EqualTo(h2, 0) ThenBlock: { ProcessExit(3) }
+    pid2 = Dereference(Add(h2, HHandleOff.PID))
+    alive = PlatformProc_Exists(pid2)
+    IfCondition NotEqual(alive, 1) ThenBlock: { ProcessExit(4) }
+
+    buf = Allocate(16)
+    got = 0
+    eof = 0
+    tries = 0
+    WhileLoop LessThan(tries, 8) {
+        n = HTTP.ReadLineTimeout(h1, buf, 15, 500)
+        IfCondition GreaterEqual(n, 3) ThenBlock: {
+            IfCondition EqualTo(GetByte(buf, 0), 79) ThenBlock: { got = 1 }
+        }
+        IfCondition EqualTo(n, -1) ThenBlock: {
+            eof = 1
+            tries = 8
+        }
+        tries = Add(tries, 1)
+    }
+    IfCondition NotEqual(got, 1) ThenBlock: { ProcessExit(5) }
+    IfCondition NotEqual(eof, 1) ThenBlock: { ProcessExit(6) }
+    PlatformHTTP_TakeStatus(h1)
+    code = HTTP.GetExitCode(h1)
+    IfCondition NotEqual(code, 0) ThenBlock: { ProcessExit(7) }
+
+    PlatformProc_Kill(pid2, 9)
+    HTTP.CloseStream(h1)
+    HTTP.CloseStream(h2)
+    PrintMessage("HTTP_OK\n")
+    ProcessExit(0)
+}
+
+RunTask(Main)

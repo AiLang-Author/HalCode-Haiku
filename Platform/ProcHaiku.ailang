@@ -1,0 +1,248 @@
+// Haiku process platform. Spawn is load_image plus resume_thread.
+// argv[0] is the image path. Wait and Kill are the Linux numbers,
+// which HaikuRT turns into wait_for_child and send_signal.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+// Copy a C string, including the NUL. Returns the byte count, or -1.
+Function.PlatformProc_CString {
+    Input: dst: Address
+    Input: src: Address
+    Output: Integer
+    Body: {
+        n = 0
+        WhileLoop LessThan(n, 4096) {
+            b = GetByte(src, n)
+            SetByte(dst, n, b)
+            IfCondition EqualTo(b, 0) ThenBlock: {
+                ReturnValue(Add(n, 1))
+            }
+            n = Add(n, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// Count pointers until the NULL slot. Caps at 64.
+Function.PlatformProc_Count {
+    Input: vec: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(vec, 0) ThenBlock: { ReturnValue(0) }
+        n = 0
+        WhileLoop LessThan(n, 64) {
+            slot = Multiply(n, 8)
+            p = Add(vec, slot)
+            s = Dereference(p)
+            IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(n) }
+            n = Add(n, 1)
+        }
+        ReturnValue(n)
+    }
+}
+
+// Returns the new team's main thread id, or a negative error.
+Function.PlatformProc_Spawn {
+    Input: path: Address
+    Input: argv: Address
+    Input: envp: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(-22) }
+        argc = PlatformProc_Count(argv)
+        IfCondition LessThan(argc, 1) ThenBlock: { ReturnValue(-22) }
+        envc = PlatformProc_Count(envp)
+        buf = HaikuAnonMap(65536, 3)
+        IfCondition LessThan(buf, 1) ThenBlock: { ReturnValue(-12) }
+        slots = Add(argc, envc)
+        slots = Add(slots, 2)
+        off = Multiply(slots, 8)
+        i = 0
+        WhileLoop LessThan(i, argc) {
+            slot = Multiply(i, 8)
+            srcp = Add(argv, slot)
+            src = Dereference(srcp)
+            dst = Add(buf, off)
+            n = PlatformProc_CString(dst, src)
+            IfCondition LessThan(n, 1) ThenBlock: { ReturnValue(-12) }
+            StoreValue(Add(buf, slot), dst)
+            off = Add(off, n)
+            i = Add(i, 1)
+        }
+        zslot = Multiply(argc, 8)
+        StoreValue(Add(buf, zslot), 0)
+        base = Add(argc, 1)
+        i = 0
+        WhileLoop LessThan(i, envc) {
+            slot = Multiply(i, 8)
+            srcp = Add(envp, slot)
+            src = Dereference(srcp)
+            dst = Add(buf, off)
+            n = PlatformProc_CString(dst, src)
+            IfCondition LessThan(n, 1) ThenBlock: { ReturnValue(-12) }
+            sloti = Add(base, i)
+            slotb = Multiply(sloti, 8)
+            StoreValue(Add(buf, slotb), dst)
+            off = Add(off, n)
+            i = Add(i, 1)
+        }
+        endi = Add(base, envc)
+        endb = Multiply(endi, 8)
+        StoreValue(Add(buf, endb), 0)
+        tid = HaikuSyscall(40, buf, off, argc, envc, 10, 1, -1, 0)
+        tid = HaikuRT_R32(tid)
+        IfCondition LessThan(tid, 1) ThenBlock: { ReturnValue(tid) }
+        rr = HaikuSyscall(55, tid)
+        rr = HaikuRT_R32(rr)
+        IfCondition LessThan(rr, 0) ThenBlock: { ReturnValue(rr) }
+        ReturnValue(tid)
+    }
+}
+
+// Mark fd close-on-exec. load_image closes those in the child.
+Function.PlatformProc_Cloexec {
+    Input: fd: Integer
+    Body: {
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(72, fd, 2, 1, 0, 0)
+        ReturnValue(0)
+    }
+}
+
+// Duplicate fd to a number >= 10 and mark the copy close-on-exec.
+Function.PlatformProc_DupAbove {
+    Input: fd: Integer
+    Output: Integer
+    Body: {
+        n = SystemCall(72, fd, 0, 10, 0, 0)
+        IfCondition GreaterEqual(n, 0) ThenBlock: {
+            SystemCall(72, n, 2, 1, 0, 0)
+        }
+        ReturnValue(n)
+    }
+}
+
+// Close one child pipe end after the spawn. Numbers 0, 1 and 2 are the
+// restored standard descriptors, so they stay open. Equal ends close once.
+Function.PlatformProc_CloseChild {
+    Input: fd: Integer
+    Input: other: Integer
+    Input: third: Integer
+    Body: {
+        IfCondition LessThan(fd, 3) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(fd, other) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(fd, third) ThenBlock: { ReturnValue(0) }
+        SystemCall(3, fd, 0, 0, 0, 0)
+        ReturnValue(0)
+    }
+}
+
+// Put fd0, fd1 and fd2 on the child's standard descriptors, then
+// load_image. A negative descriptor leaves that slot as it is.
+// The caller marks every pipe end it keeps close-on-exec first.
+// Safe only while no other thread touches descriptors 0, 1 or 2.
+Function.PlatformProc_SpawnStdio {
+    Input: path: Address
+    Input: argv: Address
+    Input: envp: Address
+    Input: fd0: Integer
+    Input: fd1: Integer
+    Input: fd2: Integer
+    Output: Integer
+    Body: {
+        s0 = PlatformProc_DupAbove(0)
+        s1 = PlatformProc_DupAbove(1)
+        s2 = PlatformProc_DupAbove(2)
+        IfCondition LessThan(s0, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition LessThan(s1, 0) ThenBlock: {
+            SystemCall(3, s0, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+        IfCondition LessThan(s2, 0) ThenBlock: {
+            SystemCall(3, s0, 0, 0, 0, 0)
+            SystemCall(3, s1, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+        IfCondition GreaterEqual(fd0, 0) ThenBlock: {
+            SystemCall(33, fd0, 0, 0, 0, 0)
+            SystemCall(72, 0, 2, 0, 0, 0)
+        }
+        IfCondition GreaterEqual(fd1, 0) ThenBlock: {
+            SystemCall(33, fd1, 1, 0, 0, 0)
+            SystemCall(72, 1, 2, 0, 0, 0)
+        }
+        IfCondition GreaterEqual(fd2, 0) ThenBlock: {
+            SystemCall(33, fd2, 2, 0, 0, 0)
+            SystemCall(72, 2, 2, 0, 0, 0)
+        }
+        IfCondition GreaterEqual(fd0, 3) ThenBlock: { PlatformProc_Cloexec(fd0) }
+        IfCondition GreaterEqual(fd1, 3) ThenBlock: { PlatformProc_Cloexec(fd1) }
+        IfCondition GreaterEqual(fd2, 3) ThenBlock: { PlatformProc_Cloexec(fd2) }
+        tid = PlatformProc_Spawn(path, argv, envp)
+        SystemCall(33, s0, 0, 0, 0, 0)
+        SystemCall(3, s0, 0, 0, 0, 0)
+        SystemCall(33, s1, 1, 0, 0, 0)
+        SystemCall(3, s1, 0, 0, 0, 0)
+        SystemCall(33, s2, 2, 0, 0, 0)
+        SystemCall(3, s2, 0, 0, 0, 0)
+        PlatformProc_CloseChild(fd0, -1, -1)
+        PlatformProc_CloseChild(fd1, fd0, -1)
+        PlatformProc_CloseChild(fd2, fd0, fd1)
+        ReturnValue(tid)
+    }
+}
+
+// load_image copies the parent's fds. Point stdout and stderr at
+// /dev/null for that copy. There is still no parent-death signal.
+// setpgid is attempted because the loaded thread id is the team id.
+// A failed setpgid still returns the thread id.
+Function.PlatformProc_SpawnWorker {
+    Input: path: Address
+    Input: argv: Address
+    Input: envp: Address
+    Output: Integer
+    Body: {
+        nullfd = SystemCall(2, "/dev/null", 1, 0, 0, 0)
+        tid = -1
+        IfCondition GreaterEqual(nullfd, 0) ThenBlock: {
+            tid = PlatformProc_SpawnStdio(path, argv, envp, -1, nullfd, nullfd)
+        } ElseBlock: {
+            tid = PlatformProc_Spawn(path, argv, envp)
+        }
+        IfCondition LessThan(tid, 1) ThenBlock: { ReturnValue(tid) }
+        SystemCall(109, tid, tid, 0, 0, 0)
+        ReturnValue(tid)
+    }
+}
+
+Function.PlatformProc_Wait {
+    Input: pid: Integer
+    Input: status: Address
+    Input: options: Integer
+    Output: Integer
+    Body: {
+        r = SystemCall(61, pid, status, options, 0)
+        ReturnValue(r)
+    }
+}
+
+Function.PlatformProc_Kill {
+    Input: pid: Integer
+    Input: sig: Integer
+    Output: Integer
+    Body: {
+        r = SystemCall(62, pid, sig, 0, 0, 0)
+        ReturnValue(r)
+    }
+}
+
+// Signal 0. Zero means the team exists.
+Function.PlatformProc_Exists {
+    Input: pid: Integer
+    Output: Integer
+    Body: {
+        r = SystemCall(62, pid, 0, 0, 0, 0)
+        IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}

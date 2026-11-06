@@ -1,0 +1,23 @@
+// Haiku --agent uses the port dispatcher that --mcp already uses.
+// There is no AgentProxy and no Unix socket.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+Function.PlatformAgent_Attach {
+    Output: Integer
+    Body: {
+        CC_MCP_BootSchemas()
+        ReturnValue(1)
+    }
+}
+
+Function.PlatformAgent_Dispatch {
+    Input: name: Address
+    Input: args: Address
+    Input: id: Address
+    Input: err: Address
+    Output: Address
+    Body: {
+        ReturnValue(CC_MCP_DispatchOnDemand(name, args, id, err))
+    }
+}

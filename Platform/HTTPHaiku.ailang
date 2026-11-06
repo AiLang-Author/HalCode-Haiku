@@ -1,0 +1,355 @@
+// Haiku provider request. curl's stdin is the config, stdout is the
+// event stream, and stderr is the HCSTATUS line. Nothing secret is
+// put on the command line, in the environment, or on disk.
+// The stream handle matches Library.HTTP so ReadLine and CloseStream
+// stay shared. PlatformHTTP_TakeStatus fills the status fields after
+// the stream reaches EOF.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+// Quoted-config escaping: \ -> \\, " -> \", LF/CR/TAB -> \n \r \t.
+// Every other byte, including UTF-8, is copied unchanged.
+Function.HTTPHaiku_PutEsc {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: src: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        p = pos
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(src, i)
+            esc = 0
+            IfCondition EqualTo(ch, 92) ThenBlock: { esc = 92 }
+            IfCondition EqualTo(ch, 34) ThenBlock: { esc = 34 }
+            IfCondition EqualTo(ch, 10) ThenBlock: { esc = 110 }
+            IfCondition EqualTo(ch, 13) ThenBlock: { esc = 114 }
+            IfCondition EqualTo(ch, 9) ThenBlock: { esc = 116 }
+            IfCondition NotEqual(esc, 0) ThenBlock: {
+                SetByte(buf, p, 92)
+                p = Add(p, 1)
+                SetByte(buf, p, esc)
+                p = Add(p, 1)
+            } ElseBlock: {
+                SetByte(buf, p, ch)
+                p = Add(p, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(p)
+    }
+}
+
+Function.HTTPHaiku_Put {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: s: Address
+    Output: Integer
+    Body: {
+        p = pos
+        i = 0
+        WhileLoop 1 {
+            ch = GetByte(s, i)
+            IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            SetByte(buf, p, ch)
+            p = Add(p, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(p)
+    }
+}
+
+Function.HTTPHaiku_Cap {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Output: Integer
+    Body: {
+        ul = StringLength(url)
+        hl = 0
+        bl = 0
+        IfCondition NotEqual(headers_str, 0) ThenBlock: {
+            hl = StringLength(headers_str)
+        }
+        IfCondition NotEqual(body_str, 0) ThenBlock: {
+            bl = StringLength(body_str)
+        }
+        n = Add(ul, hl)
+        n = Add(n, bl)
+        n = Multiply(n, 2)
+        ReturnValue(Add(n, 512))
+    }
+}
+
+// url, one header line per non-empty input line, and the body.
+Function.HTTPHaiku_Config {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Input: with_post: Integer
+    Output: Address
+    Body: {
+        cap = HTTPHaiku_Cap(url, headers_str, body_str)
+        buf = Allocate(cap)
+        p = 0
+        p = HTTPHaiku_Put(buf, p, "url = \"")
+        p = HTTPHaiku_PutEsc(buf, p, url, StringLength(url))
+        p = HTTPHaiku_Put(buf, p, "\"\n")
+        IfCondition NotEqual(headers_str, 0) ThenBlock: {
+            i = 0
+            line_start = 0
+            WhileLoop 1 {
+                ch = GetByte(headers_str, i)
+                at_end = 0
+                IfCondition EqualTo(ch, 0) ThenBlock: { at_end = 1 }
+                IfCondition Or(EqualTo(ch, 10), EqualTo(at_end, 1)) ThenBlock: {
+                    line_len = Subtract(i, line_start)
+                    IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                        p = HTTPHaiku_Put(buf, p, "header = \"")
+                        p = HTTPHaiku_PutEsc(buf, p, Add(headers_str, line_start), line_len)
+                        p = HTTPHaiku_Put(buf, p, "\"\n")
+                    }
+                    line_start = Add(i, 1)
+                }
+                IfCondition EqualTo(at_end, 1) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+        }
+        IfCondition EqualTo(with_post, 1) ThenBlock: {
+            IfCondition NotEqual(body_str, 0) ThenBlock: {
+                p = HTTPHaiku_Put(buf, p, "data-binary = \"")
+                p = HTTPHaiku_PutEsc(buf, p, body_str, StringLength(body_str))
+                p = HTTPHaiku_Put(buf, p, "\"\n")
+            }
+        }
+        SetByte(buf, p, 0)
+        ReturnValue(buf)
+    }
+}
+
+Function.HTTPHaiku_Close3 {
+    Input: a: Integer
+    Input: b: Integer
+    Input: c: Integer
+    Body: {
+        IfCondition GreaterEqual(a, 0) ThenBlock: { SystemCall(3, a, 0, 0, 0, 0) }
+        IfCondition GreaterEqual(b, 0) ThenBlock: { SystemCall(3, b, 0, 0, 0, 0) }
+        IfCondition GreaterEqual(c, 0) ThenBlock: { SystemCall(3, c, 0, 0, 0, 0) }
+        ReturnValue(0)
+    }
+}
+
+// 1 when buf[i] starts HCSTATUS followed by a newline.
+Function.HTTPHaiku_Mark {
+    Input: buf: Address
+    Input: i: Integer
+    Input: used: Integer
+    Output: Integer
+    Body: {
+        need = Add(i, 9)
+        IfCondition GreaterThan(need, used) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, i), 72) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 1)), 67) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 2)), 83) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 3)), 84) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 4)), 65) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 5)), 84) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 6)), 85) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 7)), 83) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, Add(i, 8)), 10) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+Function.HTTPHaiku_Spawn {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Input: with_post: Integer
+    Input: conn_ms: Integer
+    Input: max_ms: Integer
+    Output: Address
+    Body: {
+        in_r = -1
+        in_w = -1
+        out_r = -1
+        out_w = -1
+        err_r = -1
+        err_w = -1
+        pf = Allocate(8)
+        pr = SystemCall(22, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)
+            ReturnValue(0)
+        }
+        in_r = Dereference(pf, "dword")
+        in_w = Dereference(Add(pf, 4), "dword")
+        pr = SystemCall(22, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)
+            HTTPHaiku_Close3(in_r, in_w, -1)
+            ReturnValue(0)
+        }
+        out_r = Dereference(pf, "dword")
+        out_w = Dereference(Add(pf, 4), "dword")
+        pr = SystemCall(22, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)
+            HTTPHaiku_Close3(in_r, in_w, out_r)
+            SystemCall(3, out_w, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+        err_r = Dereference(pf, "dword")
+        err_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+        PlatformProc_Cloexec(in_w)
+        PlatformProc_Cloexec(out_r)
+        PlatformProc_Cloexec(err_r)
+
+        conn_s = HTTP_MsToSecStr(conn_ms, 10)
+        max_s = HTTP_MsToSecStr(max_ms, 180)
+        IfCondition EqualTo(HConst.CURL_PATH, 0) ThenBlock: {
+            HConst.CURL_PATH = HTTP_CurlPath()
+        }
+        argv = Allocate(128)
+        StoreValue(argv, HConst.CURL_PATH)
+        StoreValue(Add(argv, 8), "-s")
+        StoreValue(Add(argv, 16), "-N")
+        StoreValue(Add(argv, 24), "--connect-timeout")
+        StoreValue(Add(argv, 32), conn_s)
+        StoreValue(Add(argv, 40), "-m")
+        StoreValue(Add(argv, 48), max_s)
+        StoreValue(Add(argv, 56), "-w")
+        StoreValue(Add(argv, 64), "%{stderr}HCSTATUS\n%{http_code}\n%{exitcode}\n%{errormsg}\n")
+        StoreValue(Add(argv, 72), "-K")
+        StoreValue(Add(argv, 80), "-")
+        StoreValue(Add(argv, 88), 0)
+
+        tid = PlatformProc_SpawnStdio(HConst.CURL_PATH, argv, 0, in_r, out_w, err_w)
+        Deallocate(argv, 128)
+        IfCondition LessThan(tid, 1) ThenBlock: {
+            HTTPHaiku_Close3(in_w, out_r, err_r)
+            ReturnValue(0)
+        }
+
+        cfg = HTTPHaiku_Config(url, headers_str, body_str, with_post)
+        cap = HTTPHaiku_Cap(url, headers_str, body_str)
+        cfg_len = StringLength(cfg)
+        cw = 0
+        WhileLoop LessThan(cw, cfg_len) {
+            w = SystemCall(1, in_w, Add(cfg, cw), Subtract(cfg_len, cw), 0, 0)
+            IfCondition LessEqual(w, 0) ThenBlock: { BreakLoop }
+            cw = Add(cw, w)
+        }
+        SystemCall(3, in_w, 0, 0, 0, 0)
+        MemorySet(cfg, 0, cap)
+        Deallocate(cfg, cap)
+        IfCondition LessThan(cw, cfg_len) ThenBlock: {
+            PlatformProc_Kill(tid, 9)
+            st = Allocate(8)
+            StoreValue(st, 0)
+            PlatformProc_Wait(tid, st, 0)
+            Deallocate(st, 8)
+            SystemCall(3, out_r, 0, 0, 0, 0)
+            SystemCall(3, err_r, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
+        h = Allocate(HConst.HANDLE_SZ)
+        MemorySet(h, 0, HConst.HANDLE_SZ)
+        StoreValue(Add(h, HHandleOff.STDIN_FD), -1, "dword")
+        StoreValue(Add(h, HHandleOff.STDOUT_FD), out_r, "dword")
+        StoreValue(Add(h, HHandleOff.PID), tid)
+        line_buf = Allocate(HConst.READ_BUF_SZ)
+        StoreValue(Add(h, HHandleOff.LINE_BUF), line_buf)
+        StoreValue(Add(h, HHandleOff.STATUS_FD), err_r, "dword")
+        StoreValue(Add(h, HHandleOff.CODE), -1)
+        ReturnValue(h)
+    }
+}
+
+Function.PlatformHTTP_GetStream {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: conn_ms: Integer
+    Input: max_ms: Integer
+    Output: Address
+    Body: {
+        ReturnValue(HTTPHaiku_Spawn(url, headers_str, 0, 0, conn_ms, max_ms))
+    }
+}
+
+Function.PlatformHTTP_PostStream {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Input: conn_ms: Integer
+    Input: max_ms: Integer
+    Output: Address
+    Body: {
+        ReturnValue(HTTPHaiku_Spawn(url, headers_str, body_str, 1, conn_ms, max_ms))
+    }
+}
+
+// Read the HCSTATUS record from curl's stderr and store it in the handle.
+Function.PlatformHTTP_TakeStatus {
+    Input: handle: Address
+    Body: {
+        IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(0) }
+        sfd = Dereference(Add(handle, HHandleOff.STATUS_FD), "dword")
+        IfCondition LessThan(sfd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(HConst.STATUS_BUF_SZ)
+        MemorySet(buf, 0, HConst.STATUS_BUF_SZ)
+        cap = Subtract(HConst.STATUS_BUF_SZ, 1)
+        used = 0
+        WhileLoop LessThan(used, cap) {
+            n = SystemCall(0, sfd, Add(buf, used), Subtract(cap, used), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SystemCall(3, sfd, 0, 0, 0, 0)
+        StoreValue(Add(handle, HHandleOff.STATUS_FD), -1, "dword")
+        StoreValue(Add(handle, HHandleOff.STATUS_BUF), buf)
+        at = -1
+        i = 0
+        WhileLoop LessThan(i, used) {
+            hit = HTTPHaiku_Mark(buf, i, used)
+            IfCondition EqualTo(hit, 1) ThenBlock: {
+                at = Add(i, 9)
+                i = used
+            } ElseBlock: {
+                i = Add(i, 1)
+            }
+        }
+        IfCondition LessThan(at, 0) ThenBlock: { ReturnValue(0) }
+        field = 0
+        start = at
+        j = at
+        WhileLoop And(LessEqual(j, used), LessThan(field, 3)) {
+            eol = 0
+            IfCondition EqualTo(j, used) ThenBlock: { eol = 1 }
+            IfCondition LessThan(j, used) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, j), 10) ThenBlock: { eol = 1 }
+            }
+            IfCondition EqualTo(eol, 1) ThenBlock: {
+                SetByte(buf, j, 0)
+                p = Add(buf, start)
+                IfCondition EqualTo(field, 0) ThenBlock: {
+                    StoreValue(Add(handle, HHandleOff.CODE), StringToInt(p))
+                }
+                IfCondition EqualTo(field, 1) ThenBlock: {
+                    StoreValue(Add(handle, HHandleOff.EXITCODE), StringToInt(p))
+                }
+                IfCondition EqualTo(field, 2) ThenBlock: {
+                    StoreValue(Add(handle, HHandleOff.ERRMSG), p)
+                }
+                field = Add(field, 1)
+                start = Add(j, 1)
+            }
+            j = Add(j, 1)
+        }
+        StoreValue(Add(handle, HHandleOff.ST_LOADED), 1, "dword")
+        ReturnValue(1)
+    }
+}

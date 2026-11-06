@@ -1,0 +1,186 @@
+// Linux process platform. Spawn is fork plus execve. The child does
+// not return. Wait, Kill and Exists are wait4 and kill.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+
+Function.PlatformProc_Spawn {
+    Input: path: Address
+    Input: argv: Address
+    Input: envp: Address
+    Output: Integer
+    Body: {
+        use_env = envp
+        IfCondition EqualTo(envp, 0) ThenBlock: {
+            use_env = Allocate(8)
+            StoreValue(use_env, 0)
+        }
+        pid = SystemCall(57, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(59, path, argv, use_env)
+            SystemCall(60, 127, 0, 0, 0, 0)
+        }
+        ReturnValue(pid)
+    }
+}
+
+// What CC_LaunchTool and IPCDispatch_Respawn do in the child, then exec.
+// Own process group, die with the parent, unblock SIGINT and SIGTERM,
+// and point stdout and stderr at /dev/null. The parent also sets the
+// process group, because the child may not have run yet.
+Function.PlatformProc_SpawnWorker {
+    Input: path: Address
+    Input: argv: Address
+    Input: envp: Address
+    Output: Integer
+    Body: {
+        use_env = envp
+        IfCondition EqualTo(envp, 0) ThenBlock: {
+            use_env = Allocate(8)
+            StoreValue(use_env, 0)
+        }
+        pid = SystemCall(57, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(pid) }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(109, 0, 0, 0, 0, 0)
+            SystemCall(157, 1, 15, 0, 0, 0)
+            sigmask = Allocate(8)
+            StoreValue(sigmask, 16386)
+            SystemCall(14, 1, sigmask, 0, 8, 0)
+            Deallocate(sigmask, 8)
+            devnull = SystemCall(2, "/dev/null", 1, 0, 0, 0)
+            IfCondition GreaterEqual(devnull, 0) ThenBlock: {
+                SystemCall(33, devnull, 1, 0, 0, 0)
+                SystemCall(33, devnull, 2, 0, 0, 0)
+                SystemCall(3, devnull, 0, 0, 0, 0)
+            }
+            SystemCall(59, path, argv, use_env)
+            SystemCall(60, 127, 0, 0, 0, 0)
+        }
+        SystemCall(109, pid, pid, 0, 0, 0)
+        ReturnValue(pid)
+    }
+}
+
+// Mark fd close-on-exec. The child of a later spawn must not inherit
+// a pipe end the parent still needs.
+Function.PlatformProc_Cloexec {
+    Input: fd: Integer
+    Body: {
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(72, fd, 2, 1, 0, 0)
+        ReturnValue(0)
+    }
+}
+
+// Duplicate fd to a number >= 10 and mark the copy close-on-exec.
+Function.PlatformProc_DupAbove {
+    Input: fd: Integer
+    Output: Integer
+    Body: {
+        n = SystemCall(72, fd, 0, 10, 0, 0)
+        IfCondition GreaterEqual(n, 0) ThenBlock: {
+            SystemCall(72, n, 2, 1, 0, 0)
+        }
+        ReturnValue(n)
+    }
+}
+
+// Fork, point the child's standard descriptors at fd0/fd1/fd2, and exec.
+// A negative descriptor leaves that slot unchanged. The parent closes
+// every child end that is >= 3. The caller marks the ends it keeps
+// close-on-exec before the call, so the child's exec drops them.
+Function.PlatformProc_SpawnStdio {
+    Input: path: Address
+    Input: argv: Address
+    Input: envp: Address
+    Input: fd0: Integer
+    Input: fd1: Integer
+    Input: fd2: Integer
+    Output: Integer
+    Body: {
+        use_env = envp
+        IfCondition EqualTo(envp, 0) ThenBlock: {
+            use_env = Allocate(8)
+            StoreValue(use_env, 0)
+        }
+        pid = SystemCall(57, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(pid) }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            IfCondition GreaterEqual(fd0, 0) ThenBlock: {
+                SystemCall(33, fd0, 0, 0, 0, 0)
+            }
+            IfCondition GreaterEqual(fd1, 0) ThenBlock: {
+                SystemCall(33, fd1, 1, 0, 0, 0)
+            }
+            IfCondition GreaterEqual(fd2, 0) ThenBlock: {
+                SystemCall(33, fd2, 2, 0, 0, 0)
+            }
+            IfCondition GreaterEqual(fd0, 3) ThenBlock: {
+                SystemCall(3, fd0, 0, 0, 0, 0)
+            }
+            IfCondition GreaterEqual(fd1, 3) ThenBlock: {
+                IfCondition NotEqual(fd1, fd0) ThenBlock: {
+                    SystemCall(3, fd1, 0, 0, 0, 0)
+                }
+            }
+            IfCondition GreaterEqual(fd2, 3) ThenBlock: {
+                IfCondition NotEqual(fd2, fd0) ThenBlock: {
+                    IfCondition NotEqual(fd2, fd1) ThenBlock: {
+                        SystemCall(3, fd2, 0, 0, 0, 0)
+                    }
+                }
+            }
+            SystemCall(59, path, argv, use_env)
+            SystemCall(60, 127, 0, 0, 0, 0)
+        }
+        IfCondition GreaterEqual(fd0, 3) ThenBlock: {
+            SystemCall(3, fd0, 0, 0, 0, 0)
+        }
+        IfCondition GreaterEqual(fd1, 3) ThenBlock: {
+            IfCondition NotEqual(fd1, fd0) ThenBlock: {
+                SystemCall(3, fd1, 0, 0, 0, 0)
+            }
+        }
+        IfCondition GreaterEqual(fd2, 3) ThenBlock: {
+            IfCondition NotEqual(fd2, fd0) ThenBlock: {
+                IfCondition NotEqual(fd2, fd1) ThenBlock: {
+                    SystemCall(3, fd2, 0, 0, 0, 0)
+                }
+            }
+        }
+        ReturnValue(pid)
+    }
+}
+
+Function.PlatformProc_Wait {
+    Input: pid: Integer
+    Input: status: Address
+    Input: options: Integer
+    Output: Integer
+    Body: {
+        r = SystemCall(61, pid, status, options, 0)
+        ReturnValue(r)
+    }
+}
+
+Function.PlatformProc_Kill {
+    Input: pid: Integer
+    Input: sig: Integer
+    Output: Integer
+    Body: {
+        r = SystemCall(62, pid, sig, 0, 0, 0)
+        ReturnValue(r)
+    }
+}
+
+Function.PlatformProc_Exists {
+    Input: pid: Integer
+    Output: Integer
+    Body: {
+        r = SystemCall(62, pid, 0, 0, 0, 0)
+        IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}

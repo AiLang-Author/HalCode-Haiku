@@ -7,6 +7,8 @@
 # Usage:
 #   ./setup.sh                  # interactive (recommended)
 #   ./setup.sh --skip-postgres  # skip PostgreSQL setup
+#   On Haiku, PostgreSQL is installed by scripts/haiku_postgres.sh and
+#   started from ~/config/settings/boot/UserBootscript.
 #   ./setup.sh --skip-olympus   # skip OlympusRepo setup
 #   ./setup.sh --skip-keys      # skip API key prompts (re-run later)
 # =============================================================================
@@ -66,7 +68,8 @@ OLYMPUS_DEFAULT_DIR="$HOME/OlympusRepo"
 banner
 
 OS="unknown"
-if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+if [[ "$(uname -s 2>/dev/null || true)" == "Haiku" ]]; then OS="haiku"
+elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
   if /usr/bin/grep -qi microsoft /proc/version 2>/dev/null; then OS="wsl2"
   else OS="linux"; fi
 elif [[ "$OSTYPE" == "darwin"* ]]; then OS="macos"; fi
@@ -88,6 +91,10 @@ echo ""
 
 if [[ "$SKIP_POSTGRES" -eq 1 ]]; then
   warn "Skipping PostgreSQL setup (--skip-postgres)."
+elif [[ "$OS" == "haiku" ]]; then
+  info "Haiku: install PostgreSQL and register it with UserBootscript."
+  "$SCRIPT_DIR/scripts/haiku_postgres.sh" install
+  success "PostgreSQL is installed and will start at boot."
 else
   PG_OK=0
   if command -v psql &>/dev/null && pg_isready -h 127.0.0.1 &>/dev/null 2>&1; then

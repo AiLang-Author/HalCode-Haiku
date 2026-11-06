@@ -1,0 +1,133 @@
+// Linux Ailang tool runner. The compiler and analyzer stay ailang.x
+// and analyzer.x. Compile argv is binary, source, output. The child
+// is fork plus execve with a null envp, so it inherits the environment.
+// SpawnStdio is not used here: a null envp there is an empty environment.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+
+Function.PlatformAilang_FindCompiler {
+    Output: Address
+    Body: {
+        ReturnValue(CCAlg_Resolve("ailang.x"))
+    }
+}
+
+Function.PlatformAilang_FindAnalyzer {
+    Output: Address
+    Body: {
+        ReturnValue(CCAlg_Resolve("analyzer.x"))
+    }
+}
+
+// Four pointers: binary, source, output, NULL. The caller allocates
+// at least 48 bytes so the Haiku fill, which inserts --haiku, fits.
+Function.PlatformAilang_FillCompile {
+    Input: argv: Address
+    Input: binary: Address
+    Input: source: Address
+    Input: output: Address
+    Body: {
+        StoreValue(argv, binary)
+        StoreValue(Add(argv, 8), source)
+        StoreValue(Add(argv, 16), output)
+        StoreValue(Add(argv, 24), 0)
+        ReturnValue(0)
+    }
+}
+
+Function.PlatformAilang_FillAnalyze {
+    Input: argv: Address
+    Input: binary: Address
+    Input: source: Address
+    Body: {
+        StoreValue(argv, binary)
+        StoreValue(Add(argv, 8), source)
+        StoreValue(Add(argv, 16), 0)
+        ReturnValue(0)
+    }
+}
+
+// Capture stdout and stderr into out_buf. out_buf has room for one
+// extra NUL past out_cap. Stores the exit code at exitp.
+// Returns the byte count, or -1 when fork or the pipe fails.
+Function.PlatformAilang_Run {
+    Input: binary: Address
+    Input: argv: Address
+    Input: out_buf: Address
+    Input: out_cap: Integer
+    Input: exitp: Address
+    Output: Integer
+    Body: {
+        pf = Allocate(8)
+        pr = SystemCall(22, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)
+            ReturnValue(-1)
+        }
+        pipe_r = Dereference(pf, "dword")
+        pipe_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+
+        pid = SystemCall(57, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(3, pipe_r, 0, 0, 0, 0)
+            SystemCall(3, pipe_w, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(3, pipe_r, 0, 0, 0, 0)
+            SystemCall(33, pipe_w, 1, 0, 0, 0)
+            SystemCall(33, pipe_w, 2, 0, 0, 0)
+            SystemCall(3, pipe_w, 0, 0, 0, 0)
+            SystemCall(59, binary, argv, 0)
+            SystemCall(60, 127, 0, 0, 0, 0)
+        }
+
+        SystemCall(3, pipe_w, 0, 0, 0, 0)
+        used = 0
+        WhileLoop 1 {
+            free_room = Subtract(out_cap, used)
+            IfCondition LessEqual(free_room, 0) ThenBlock: { BreakLoop }
+            want = 4096
+            IfCondition GreaterThan(want, free_room) ThenBlock: { want = free_room }
+            n = SystemCall(0, pipe_r, Add(out_buf, used), want)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SetByte(out_buf, used, 0)
+        SystemCall(3, pipe_r, 0, 0, 0, 0)
+
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        raw_status = 0
+        reaped = 0
+        wi = 0
+        WhileLoop LessThan(wi, 600) {
+            wr = SystemCall(61, pid, status_buf, 1, 0, 0)
+            IfCondition GreaterThan(wr, 0) ThenBlock: {
+                raw_status = Dereference(status_buf, "dword")
+                reaped = 1
+                BreakLoop
+            }
+            IfCondition LessThan(wr, 0) ThenBlock: { BreakLoop }
+            ts = Allocate(16)
+            StoreValue(ts, 0)
+            StoreValue(Add(ts, 8), 100000000)
+            SystemCall(35, ts, 0, 0, 0, 0)
+            Deallocate(ts, 16)
+            wi = Add(wi, 1)
+        }
+        IfCondition EqualTo(reaped, 0) ThenBlock: {
+            SystemCall(62, pid, 9, 0, 0, 0)
+            SystemCall(61, pid, status_buf, 0, 0, 0)
+            raw_status = Dereference(status_buf, "dword")
+        }
+        Deallocate(status_buf, 8)
+        code = BitwiseAnd(RightShift(raw_status, 8), 255)
+        StoreValue(exitp, code)
+        ReturnValue(used)
+    }
+}

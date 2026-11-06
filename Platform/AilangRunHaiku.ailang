@@ -1,0 +1,140 @@
+// Haiku Ailang tool runner. The names are ailang_haiku and
+// analyzer_haiku, so a stale ailang.x on PATH is never chosen.
+// Compile argv inserts --haiku. The child is load_image through
+// PlatformProc_SpawnStdio. A null envp is an empty environment;
+// the compiler then finds Librarys beside argv[0].
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+
+// Installed path first, then PATH under the haiku name only.
+Function.PlatformAilang_FindNamed {
+    Input: leaf: Address
+    Output: Address
+    Body: {
+        home = CCAlg_Env("HOME")
+        IfCondition NotEqual(home, 0) ThenBlock: {
+            mid = StringConcat(home, "/config/non-packaged/bin/")
+            cand = StringConcat(mid, leaf)
+            IfCondition EqualTo(CCAlg_FileExists(cand), 1) ThenBlock: {
+                ReturnValue(cand)
+            }
+        }
+        ReturnValue(CCAlg_Resolve(leaf))
+    }
+}
+
+Function.PlatformAilang_FindCompiler {
+    Output: Address
+    Body: {
+        ReturnValue(PlatformAilang_FindNamed("ailang_haiku"))
+    }
+}
+
+Function.PlatformAilang_FindAnalyzer {
+    Output: Address
+    Body: {
+        ReturnValue(PlatformAilang_FindNamed("analyzer_haiku"))
+    }
+}
+
+// Five pointers: binary, --haiku, source, output, NULL.
+Function.PlatformAilang_FillCompile {
+    Input: argv: Address
+    Input: binary: Address
+    Input: source: Address
+    Input: output: Address
+    Body: {
+        StoreValue(argv, binary)
+        StoreValue(Add(argv, 8), "--haiku")
+        StoreValue(Add(argv, 16), source)
+        StoreValue(Add(argv, 24), output)
+        StoreValue(Add(argv, 32), 0)
+        ReturnValue(0)
+    }
+}
+
+Function.PlatformAilang_FillAnalyze {
+    Input: argv: Address
+    Input: binary: Address
+    Input: source: Address
+    Body: {
+        StoreValue(argv, binary)
+        StoreValue(Add(argv, 8), source)
+        StoreValue(Add(argv, 16), 0)
+        ReturnValue(0)
+    }
+}
+
+// Same capture contract as the Linux runner. The read end is
+// close-on-exec before load_image so the child does not hold it open.
+Function.PlatformAilang_Run {
+    Input: binary: Address
+    Input: argv: Address
+    Input: out_buf: Address
+    Input: out_cap: Integer
+    Input: exitp: Address
+    Output: Integer
+    Body: {
+        pf = Allocate(8)
+        pr = SystemCall(22, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)
+            ReturnValue(-1)
+        }
+        pipe_r = Dereference(pf, "dword")
+        pipe_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+        PlatformProc_Cloexec(pipe_r)
+
+        pid = PlatformProc_SpawnStdio(binary, argv, 0, -1, pipe_w, pipe_w)
+        IfCondition LessThan(pid, 1) ThenBlock: {
+            SystemCall(3, pipe_r, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        used = 0
+        WhileLoop 1 {
+            free_room = Subtract(out_cap, used)
+            IfCondition LessEqual(free_room, 0) ThenBlock: { BreakLoop }
+            want = 4096
+            IfCondition GreaterThan(want, free_room) ThenBlock: { want = free_room }
+            n = SystemCall(0, pipe_r, Add(out_buf, used), want)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SetByte(out_buf, used, 0)
+        SystemCall(3, pipe_r, 0, 0, 0, 0)
+
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        raw_status = 0
+        reaped = 0
+        wi = 0
+        WhileLoop LessThan(wi, 600) {
+            wr = PlatformProc_Wait(pid, status_buf, 1)
+            IfCondition GreaterThan(wr, 0) ThenBlock: {
+                raw_status = Dereference(status_buf, "dword")
+                reaped = 1
+                BreakLoop
+            }
+            IfCondition LessThan(wr, 0) ThenBlock: { BreakLoop }
+            ts = Allocate(16)
+            StoreValue(ts, 0)
+            StoreValue(Add(ts, 8), 100000000)
+            SystemCall(35, ts, 0, 0, 0, 0)
+            Deallocate(ts, 16)
+            wi = Add(wi, 1)
+        }
+        IfCondition EqualTo(reaped, 0) ThenBlock: {
+            PlatformProc_Kill(pid, 9)
+            PlatformProc_Wait(pid, status_buf, 0)
+            raw_status = Dereference(status_buf, "dword")
+        }
+        Deallocate(status_buf, 8)
+        code = BitwiseAnd(RightShift(raw_status, 8), 255)
+        StoreValue(exitp, code)
+        ReturnValue(used)
+    }
+}

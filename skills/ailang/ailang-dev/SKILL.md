@@ -81,6 +81,6 @@ JSON objects are **SHash**, arrays are **Array**. See `ailang-lib-json`.
 
 cc_tools: abstract `@halcode/Name`, `Socket.Create(1, 1)` = AF_UNIX + SOCK_STREAM, then `SendMsg`/`RecvMsg` (4-byte BE length + JSON). Not SEQPACKET. Not `/tmp/*.sock`.
 
-## WSL2 (this machine)
+## Broad finds
 
-Never `find /`, `/mnt`, or `/mnt/c` — hangs on NTFS. Scope find. Pipe unbounded output.
+Never `find /`, `/mnt`, or `/mnt/c`. Scope find to a project directory. Pipe unbounded output. This is a path rule. It does not mean the machine is WSL2 or a compatibility bridge.

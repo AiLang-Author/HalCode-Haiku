@@ -21,6 +21,8 @@ LibraryImport.Arena
 LibraryImport.Socket
 LibraryImport.JSON
 LibraryImport.StringUtils
+Import.Platform.Proc
+Import.Platform.IPC
 
 FixedPool.IPCDConst {
     "TABLE_CAP":     Initialize=2560  // 64 slots × 40 bytes
@@ -98,11 +100,11 @@ Function.IPCDispatch.Shutdown {
                 r_pid = Dereference(Add(IPCDState.respawn_pids, Multiply(r_i, 8)))
                 IfCondition GreaterThan(r_pid, 0) ThenBlock: {
                     StoreValue(r_ws, 0)
-                    r_wr = SystemCall(61, r_pid, r_ws, 1, 0, 0)
+                    r_wr = PlatformProc_Wait(r_pid, r_ws, 1)
                     IfCondition EqualTo(r_wr, 0) ThenBlock: {
                         IPCDispatch_SignalPid(r_pid, 9)
                         StoreValue(r_ws, 0)
-                        SystemCall(61, r_pid, r_ws, 0, 0, 0)
+                        PlatformProc_Wait(r_pid, r_ws, 0)
                     }
                     StoreValue(Add(IPCDState.respawn_pids, Multiply(r_i, 8)), 0)
                 }
@@ -145,6 +147,7 @@ Function.IPCDispatch.StartProxy {
         }
         IPCDState.proxy_client_cnt = 0
         IPCD_Log("[proxy] AgentProxy listening\n")
+        ReturnValue(1)
     }
 }
 
@@ -286,11 +289,11 @@ Function.IPCDispatch.ConnectProxy {
             IPCD_Log("[proxy-agent] socket create failed\n")
             ReturnValue(0)
         }
-        // Fail fast: GUI host / TUI parent should already be listening.
-        // 8 × 100ms — do not hang 5s when leftover --mcp has no AgentProxy.
+        // Host boot to AgentProxy is about 1–2s. 8×100ms lost that race
+        // (same window IPCDispatch_ReconnectProxy already waits through).
         _att = 0
         _cr = -1
-        WhileLoop And(LessThan(_att, 8), LessThan(_cr, 0)) {
+        WhileLoop And(LessThan(_att, 40), LessThan(_cr, 0)) {
             _cr = Socket.ConnectUnix(fd, "@halcode/AgentProxy")
             IfCondition LessThan(_cr, 0) ThenBlock: {
                 Socket.Close(fd)
@@ -387,21 +390,11 @@ Function.IPCDispatch.RegisterTool {
         IPCD_Log(name)
         IPCD_Log("\n")
 
-        fd = Socket.Create(1, 1)
-        IfCondition LessThan(fd, 0) ThenBlock: {
-            IPCD_Log("[ipcd] FAIL socket_create ")
-            IPCD_Log(name)
-            IPCD_Log("\n")
-            ReturnValue(0)
-        }
-
-        // Retry connect — there's a race between fork/exec of cc_*_ipc and
-        // its bind+listen. The 2s global sleep covers most cases but not
-        // ALL 7 services on slower hosts. Up to 100 tries × 100ms = 10s extra.
+        // Retry connect. The worker may still be binding. PlatformIPC_Connect
+        // opens a new socket, or finds the port, on every attempt.
         attempts = 0
-        cr = -1
+        fd = -1
         WhileLoop LessThan(attempts, 100) {
-            
             log_msg = StringConcat("[ipcd] attempt ", NumberToString(attempts))
             log_msg = StringConcat(log_msg, " to connect to ")
             log_msg = StringConcat(log_msg, name)
@@ -409,32 +402,22 @@ Function.IPCDispatch.RegisterTool {
             log_msg = StringConcat(log_msg, sock_path)
             log_msg = StringConcat(log_msg, "\n")
             IPCD_Log(log_msg)
-
-            cr = Socket.ConnectUnix(fd, sock_path)
-            
-            IfCondition GreaterEqual(cr, 0) ThenBlock: {
-                BreakLoop
-            } ElseBlock: {
-                // Need a fresh socket for each retry attempt — a failed
-                // connect can leave the fd in an unusable state.
-                IPCD_Log("[ipcd] connect failed, retrying...\n")
-                Socket.Close(fd)
-                fd = Socket.Create(1, 1)
-                ts = Allocate(16)
-                StoreValue(Add(ts, 0), 0)
-                StoreValue(Add(ts, 8), 100000000)   // 100ms
-                SystemCall(35, ts, 0, 0, 0, 0)
-                Deallocate(ts, 16)
-                attempts = Add(attempts, 1)
-            }
+            fd = PlatformIPC_Connect(sock_path)
+            IfCondition GreaterEqual(fd, 0) ThenBlock: { BreakLoop }
+            IPCD_Log("[ipcd] connect failed, retrying...\n")
+            ts = Allocate(16)
+            StoreValue(Add(ts, 0), 0)
+            StoreValue(Add(ts, 8), 100000000)
+            SystemCall(35, ts, 0, 0, 0, 0)
+            Deallocate(ts, 16)
+            attempts = Add(attempts, 1)
         }
-        IfCondition LessThan(cr, 0) ThenBlock: {
+        IfCondition LessThan(fd, 0) ThenBlock: {
             IPCD_Log("[ipcd] FAIL connect ")
             IPCD_Log(name)
             IPCD_Log(" at ")
             IPCD_Log(sock_path)
             IPCD_Log(" (after retries)\n")
-            Socket.Close(fd)
             ReturnValue(0)
         }
 
@@ -442,14 +425,14 @@ Function.IPCDispatch.RegisterTool {
         req = JSON.NewObject()
         JSON.SetString(req, "method", "schema")
         req_str = JSON.SerializeObject(req)
-        Socket.SendMsg(fd, req_str)
-
-        resp_str = Socket.RecvMsg(fd)
+        PlatformIPC_SendMsg(fd, req_str)
+        PlatformIPC_SetRecvTimeout(fd, 5000)
+        resp_str = PlatformIPC_RecvMsg(fd)
         IfCondition EqualTo(resp_str, 0) ThenBlock: {
             IPCD_Log("[ipcd] FAIL no_response ")
             IPCD_Log(name)
             IPCD_Log("\n")
-            Socket.Close(fd)
+            PlatformIPC_Close(fd)
             ReturnValue(0)
         }
 
@@ -458,7 +441,7 @@ Function.IPCDispatch.RegisterTool {
             IPCD_Log("[ipcd] FAIL parse ")
             IPCD_Log(name)
             IPCD_Log("\n")
-            Socket.Close(fd)
+            PlatformIPC_Close(fd)
             ReturnValue(0)
         }
         obj = JSON.AsObject(parsed)
@@ -466,7 +449,7 @@ Function.IPCDispatch.RegisterTool {
             IPCD_Log("[ipcd] FAIL as_object ")
             IPCD_Log(name)
             IPCD_Log("\n")
-            Socket.Close(fd)
+            PlatformIPC_Close(fd)
             ReturnValue(0)
         }
         schema_obj = JSON.GetObject(obj, "schema")
@@ -474,7 +457,7 @@ Function.IPCDispatch.RegisterTool {
             IPCD_Log("[ipcd] FAIL get_schema ")
             IPCD_Log(name)
             IPCD_Log("\n")
-            Socket.Close(fd)
+            PlatformIPC_Close(fd)
             ReturnValue(0)
         }
 
@@ -572,7 +555,7 @@ Function.IPCDispatch_ReapZombies {
         ws = Allocate(8)
         WhileLoop 1 {
             StoreValue(ws, 0)
-            wr = SystemCall(61, -1, ws, 1, 0, 0)
+            wr = PlatformProc_Wait(Subtract(0, 1), ws, 1)
             IfCondition LessEqual(wr, 0) ThenBlock: { BreakLoop }
         }
         Deallocate(ws, 8)
@@ -595,12 +578,8 @@ Function.IPCDispatch_TryConnect {
     Output: Integer
     Body: {
         IfCondition EqualTo(sock_path, 0) ThenBlock: { ReturnValue(-1) }
-        tmp_fd = Socket.Create(1, 1)
-        IfCondition LessThan(tmp_fd, 0) ThenBlock: { ReturnValue(-1) }
-        cr = Socket.ConnectUnix(tmp_fd, sock_path)
-        IfCondition GreaterEqual(cr, 0) ThenBlock: { ReturnValue(tmp_fd) }
-        Socket.Close(tmp_fd)
-        ReturnValue(-1)
+        tmp_fd = PlatformIPC_Connect(sock_path)
+        ReturnValue(tmp_fd)
     }
 }
 
@@ -642,8 +621,8 @@ Function.IPCDispatch_SignalPid {
     Input: sig: Integer
     Body: {
         IfCondition LessEqual(pid, 0) ThenBlock: { ReturnValue(0) }
-        SystemCall(62, pid, sig, 0, 0, 0)
-        SystemCall(62, Subtract(0, pid), sig, 0, 0, 0)
+        PlatformProc_Kill(pid, sig)
+        PlatformProc_Kill(Subtract(0, pid), sig)
     }
 }
 
@@ -690,7 +669,7 @@ Function.IPCDispatch_ReapRespawns {
             pid = Dereference(Add(IPCDState.respawn_pids, slot))
             IfCondition GreaterThan(pid, 0) ThenBlock: {
                 StoreValue(ws, 0)
-                wr = SystemCall(61, pid, ws, 1, 0, 0)
+                wr = PlatformProc_Wait(pid, ws, 1)
                 IfCondition GreaterThan(wr, 0) ThenBlock: {
                     StoreValue(Add(IPCDState.respawn_pids, slot), 0)
                 }
@@ -814,33 +793,19 @@ Function.IPCDispatch_Respawn {
         IfCondition EqualTo(envp, 0) ThenBlock: {
             IPCD_Log("[ipcd] respawn FAIL build_envp\n")
         }
-        pid = SystemCall(57, 0, 0, 0, 0, 0)
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            SystemCall(109, 0, 0, 0, 0, 0)
-            SystemCall(157, 1, 15, 0, 0, 0)
-            // Silence stdout/stderr so the worker never clobbers the TUI.
-            devnull = SystemCall(2, "/dev/null", 1, 0, 0, 0)
-            IfCondition GreaterEqual(devnull, 0) ThenBlock: {
-                SystemCall(33, devnull, 1, 0, 0, 0)
-                SystemCall(33, devnull, 2, 0, 0, 0)
-                SystemCall(3, devnull, 0, 0, 0, 0)
-            }
-            argv = Allocate(32)
-            StoreValue(argv, bin)
-            StoreValue(Add(argv, 8), name)
-            StoreValue(Add(argv, 16), sock_path)
-            StoreValue(Add(argv, 24), 0)
-            SystemCall(59, bin, argv, envp)
-            SystemCall(60, 127, 0, 0, 0, 0)
-        }
-        IfCondition LessThan(pid, 0) ThenBlock: {
+        argv = Allocate(32)
+        StoreValue(argv, bin)
+        StoreValue(Add(argv, 8), name)
+        StoreValue(Add(argv, 16), sock_path)
+        StoreValue(Add(argv, 24), 0)
+        // SpawnWorker owns the process group, parent-death signal, and
+        // silenced stdio on Linux. Haiku load_image has no parent-death
+        // signal; Shutdown still has to kill the team.
+        pid = PlatformProc_SpawnWorker(bin, argv, envp)
+        IfCondition LessThan(pid, 1) ThenBlock: {
             IPCD_Log("[ipcd] respawn fork failed\n")
             ReturnValue(0)
         }
-        // Own process group so shutdown can signal shells this worker forks.
-        SystemCall(109, pid, pid, 0, 0, 0)
-        // Track the PID so IPCDispatch.Shutdown can SIGTERM/reap it — the
-        // respawn path previously leaked workers on exit (WSL2 PDEATHSIG gap).
         IPCDispatch_RememberPid(pid)
         IPCD_Log("[ipcd] respawned ")
         IPCD_Log(name)

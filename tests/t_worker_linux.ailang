@@ -1,0 +1,41 @@
+// SpawnWorker: silenced stdout, and a kill of the process group.
+LibraryImport.Arena
+Import.Platform.Proc
+
+SubRoutine.Main {
+    argv = Allocate(24)
+    StoreValue(argv, "/bin/echo")
+    StoreValue(Add(argv, 8), "SHOULD_NOT_APPEAR")
+    StoreValue(Add(argv, 16), 0)
+    envp = Allocate(8)
+    StoreValue(envp, 0)
+    pid = PlatformProc_SpawnWorker("/bin/echo", argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(1) }
+    st = Allocate(8)
+    StoreValue(st, 99)
+    wr = PlatformProc_Wait(pid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(2) }
+    wst = Dereference(st)
+    kind = BitwiseAnd(wst, 127)
+    IfCondition NotEqual(kind, 0) ThenBlock: { ProcessExit(3) }
+
+    StoreValue(argv, "/bin/sleep")
+    StoreValue(Add(argv, 8), "30")
+    StoreValue(Add(argv, 16), 0)
+    pid = PlatformProc_SpawnWorker("/bin/sleep", argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(4) }
+    alive = PlatformProc_Exists(pid)
+    IfCondition NotEqual(alive, 1) ThenBlock: { ProcessExit(5) }
+    grp = Subtract(0, pid)
+    r = PlatformProc_Kill(grp, 15)
+    IfCondition NotEqual(r, 0) ThenBlock: { ProcessExit(6) }
+    StoreValue(st, 99)
+    wr = PlatformProc_Wait(pid, st, 0)
+    IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(7) }
+    wst = Dereference(st)
+    kind = BitwiseAnd(wst, 127)
+    IfCondition NotEqual(kind, 15) ThenBlock: { ProcessExit(8) }
+    ProcessExit(0)
+}
+
+RunTask(Main)

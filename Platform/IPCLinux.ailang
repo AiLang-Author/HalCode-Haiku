@@ -1,0 +1,143 @@
+// Linux IPC platform. AF_UNIX stream sockets with a 4-byte big-endian
+// length in front of each message, which is the framing HalCode uses.
+// The port message code is not on the wire. Recv stores code 1.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.Socket
+
+Function.PlatformIPC_Listen {
+    Input: name: Address
+    Input: capacity: Integer
+    Output: Integer
+    Body: {
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(fd) }
+        r = Socket.BindUnix(fd, name)
+        IfCondition LessThan(r, 0) ThenBlock: { ReturnValue(r) }
+        r = Socket.Listen(fd, capacity)
+        IfCondition LessThan(r, 0) ThenBlock: { ReturnValue(r) }
+        ReturnValue(fd)
+    }
+}
+
+Function.PlatformIPC_Accept {
+    Input: id: Integer
+    Output: Integer
+    Body: {
+        c = Socket.Accept(id)
+        ReturnValue(c)
+    }
+}
+
+Function.PlatformIPC_Connect {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(fd) }
+        r = Socket.ConnectUnix(fd, name)
+        IfCondition LessThan(r, 0) ThenBlock: {
+            Socket.Close(fd)
+            ReturnValue(r)
+        }
+        ReturnValue(fd)
+    }
+}
+
+Function.PlatformIPC_Send {
+    Input: id: Integer
+    Input: code: Integer
+    Input: buf: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        hdr = Allocate(4)
+        b = BitwiseAnd(RightShift(len, 24), 255)
+        SetByte(hdr, 0, b)
+        b = BitwiseAnd(RightShift(len, 16), 255)
+        SetByte(hdr, 1, b)
+        b = BitwiseAnd(RightShift(len, 8), 255)
+        SetByte(hdr, 2, b)
+        b = BitwiseAnd(len, 255)
+        SetByte(hdr, 3, b)
+        n = Socket.Send(id, hdr, 4)
+        Deallocate(hdr, 4)
+        IfCondition NotEqual(n, 4) ThenBlock: { ReturnValue(-1) }
+        n = Socket.Send(id, buf, len)
+        IfCondition NotEqual(n, len) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(0)
+    }
+}
+
+Function.PlatformIPC_Recv {
+    Input: id: Integer
+    Input: codep: Address
+    Input: buf: Address
+    Input: cap: Integer
+    Output: Integer
+    Body: {
+        hdr = Allocate(4)
+        n = Socket.RecvExact(id, hdr, 4)
+        IfCondition LessThan(n, 4) ThenBlock: {
+            Deallocate(hdr, 4)
+            ReturnValue(-1)
+        }
+        b3 = GetByte(hdr, 0)
+        b2 = GetByte(hdr, 1)
+        b1 = GetByte(hdr, 2)
+        b0 = GetByte(hdr, 3)
+        Deallocate(hdr, 4)
+        len = LeftShift(b3, 24)
+        len = BitwiseOr(len, LeftShift(b2, 16))
+        len = BitwiseOr(len, LeftShift(b1, 8))
+        len = BitwiseOr(len, b0)
+        IfCondition LessEqual(len, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition GreaterThan(len, cap) ThenBlock: { ReturnValue(-1) }
+        n = Socket.RecvExact(id, buf, len)
+        IfCondition NotEqual(n, len) ThenBlock: { ReturnValue(-1) }
+        StoreValue(codep, 1)
+        ReturnValue(n)
+    }
+}
+
+Function.PlatformIPC_Close {
+    Input: id: Integer
+    Output: Integer
+    Body: {
+        r = SystemCall(3, id, 0, 0, 0, 0)
+        ReturnValue(r)
+    }
+}
+
+// Same bytes Socket.SendMsg puts on the wire.
+Function.PlatformIPC_SetRecvTimeout {
+    Input: id: Integer
+    Input: ms: Integer
+    Output: Integer
+    Body: {
+        Socket.SetRecvTimeout(id, ms)
+        ReturnValue(0)
+    }
+}
+
+Function.PlatformIPC_SendMsg {
+    Input: id: Integer
+    Input: msg: Address
+    Output: Integer
+    Body: {
+        n = Socket.SendMsg(id, msg)
+        ReturnValue(n)
+    }
+}
+
+// Same allocation Socket.RecvMsg returns: a NUL-terminated body, 0, or -1.
+Function.PlatformIPC_RecvMsg {
+    Input: id: Integer
+    Output: Address
+    Body: {
+        s = Socket.RecvMsg(id)
+        ReturnValue(s)
+    }
+}

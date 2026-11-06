@@ -1,0 +1,21 @@
+// Linux --agent still attaches tools through @halcode/AgentProxy.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+Function.PlatformAgent_Attach {
+    Output: Integer
+    Body: {
+        ReturnValue(IPCDispatch.ConnectProxy())
+    }
+}
+
+Function.PlatformAgent_Dispatch {
+    Input: name: Address
+    Input: args: Address
+    Input: id: Address
+    Input: err: Address
+    Output: Address
+    Body: {
+        ReturnValue(IPCDispatch.Dispatch(name, args, id, err))
+    }
+}

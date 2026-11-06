@@ -30,6 +30,12 @@ Import.Applications.HalCode9000.UI
 Import.Applications.HalCode9000.IPCDispatch
 Import.Applications.HalCode9000.backends.Backend
 Import.Applications.HalCode9000.Auth
+Import.Applications.HalCode9000.Platform.Proc
+Import.Applications.HalCode9000.Platform.Signal
+Import.Applications.HalCode9000.Platform.IPC
+Import.Applications.HalCode9000.Platform.HTTP
+Import.Applications.HalCode9000.Platform.Fan
+Import.Applications.HalCode9000.Platform.Agent
 
 FixedPool.CCSys {
     "SYS_READ":      Initialize=0
@@ -597,7 +603,7 @@ Function.CC_SessionInit {
         }
         IfCondition GreaterThan(sh_pid, 0) ThenBlock: {
             wstat = Allocate(8)
-            SystemCall(CCSys.SYS_WAIT4, sh_pid, wstat, 0, 0, 0)
+            PlatformProc_Wait(sh_pid, wstat, 0)
             Deallocate(wstat, 8)
         }
 
@@ -853,61 +859,29 @@ Function.CC_LaunchTool {
         IfCondition EqualTo(envp, 0) ThenBlock: {
             CC_LaunchLog("[launch] FAIL build_envp\n")
         }
-        pid = SystemCall(CCSys.SYS_FORK, 0, 0, 0, 0, 0)
+        // argv is built in the parent. Linux fork shares it. Haiku
+        // load_image copies the strings. Process group, parent-death,
+        // signal unblock, and /dev/null stdio live in SpawnWorker.
+        // There is no child-side log: stdout is already /dev/null, and
+        // Haiku never runs this parent code inside the new team.
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0), binary_path)
+        IfCondition And(NotEqual(tool_name, 0), NotEqual(tool_socket, 0)) ThenBlock: {
+            StoreValue(Add(argv, 8), tool_name)
+            StoreValue(Add(argv, 16), tool_socket)
+            StoreValue(Add(argv, 24), 0)
+        } ElseBlock: {
+            StoreValue(Add(argv, 8), 0)
+            StoreValue(Add(argv, 16), 0)
+            StoreValue(Add(argv, 24), 0)
+        }
+        pid = PlatformProc_SpawnWorker(binary_path, argv, envp)
         IfCondition LessThan(pid, 0) ThenBlock: {
-            CC_LaunchLog("[launch] FAIL fork ")
+            CC_LaunchLog("[launch] FAIL spawn ")
             CC_LaunchLog(binary_path)
             CC_LaunchLog("\n")
             ReturnValue(-1)
         }
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            // Child — log BEFORE dup2 so logger still has stderr if needed.
-            CC_LaunchLog("[launch] CHILD pre_exec ")
-            CC_LaunchLog(binary_path)
-            CC_LaunchLog("\n")
-            // Own process group so shutdown reaches shells this tool forks.
-            SystemCall(CCSys.SYS_SETPGID, 0, 0, 0, 0, 0)
-            // Die automatically when parent exits for any reason (crash, kill, etc.)
-            SystemCall(CCSys.SYS_PRCTL, CCSys.PR_SET_PDEATHSIG, CCSys.SIGTERM, 0, 0, 0)
-            // The host blocks SIGINT|SIGTERM for its signalfd. A child that
-            // keeps that mask never runs the parent's death signal, holds
-            // @halcode/<Tool>, and spins in Accept. Unblock both.
-            sigmask = Allocate(8)
-            StoreValue(sigmask, 16386)
-            SystemCall(CCSys.SYS_RT_SIGPROCMASK, 1, sigmask, 0, 8, 0)
-            Deallocate(sigmask, 8)
-            // Silence stdout/stderr, exec
-            devnull = SystemCall(CCSys.SYS_OPEN, "/dev/null", 1, 0, 0, 0)
-            IfCondition GreaterEqual(devnull, 0) ThenBlock: {
-                SystemCall(CCSys.SYS_DUP2, devnull, 1, 0, 0, 0)
-                SystemCall(CCSys.SYS_DUP2, devnull, 2, 0, 0, 0)
-                SystemCall(CCSys.SYS_CLOSE, devnull, 0, 0, 0, 0)
-            }
-            // Pass name+socket as argv[1]/argv[2] so tools can self-configure.
-            // Tools that predate this pattern ignore the extra args safely.
-            argv = Allocate(32)
-            StoreValue(Add(argv, 0), binary_path)
-            IfCondition And(NotEqual(tool_name, 0), NotEqual(tool_socket, 0)) ThenBlock: {
-                StoreValue(Add(argv, 8),  tool_name)
-                StoreValue(Add(argv, 16), tool_socket)
-                StoreValue(Add(argv, 24), 0)
-            } ElseBlock: {
-                StoreValue(Add(argv, 8),  0)
-                StoreValue(Add(argv, 16), 0)
-                StoreValue(Add(argv, 24), 0)
-            }
-            ret = SystemCall(CCSys.SYS_EXECVE, binary_path, argv, envp)
-            // execve returned -> failed
-            CC_LaunchLog("[launch] CHILD EXECVE_FAILED ret=")
-            CC_LaunchLog(NumberToString(ret))
-            CC_LaunchLog(" for ")
-            CC_LaunchLog(binary_path)
-            CC_LaunchLog("\n")
-            SystemCall(CCSys.SYS_EXIT, 127, 0, 0, 0, 0)
-        }
-        // Parent — record PID. setpgid from both sides covers the race
-        // where the child has not run yet.
-        SystemCall(CCSys.SYS_SETPGID, pid, pid, 0, 0, 0)
         IfCondition LessThan(CCRunState.child_count, CCConst.MAX_CHILDREN) ThenBlock: {
             slot = Multiply(CCRunState.child_count, 8)
             StoreValue(Add(CCRunState.child_pids, slot), pid)
@@ -931,8 +905,8 @@ Function.CC_KillAllChildren {
             slot = Multiply(i, 8)
             pid = Dereference(Add(CCRunState.child_pids, slot))
             IfCondition GreaterThan(pid, 0) ThenBlock: {
-                SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGTERM, 0, 0, 0)
-                SystemCall(CCSys.SYS_KILL, Subtract(0, pid), CCSys.SIGTERM, 0, 0, 0)
+                PlatformProc_Kill(pid, CCSys.SIGTERM)
+                PlatformProc_Kill(Subtract(0, pid), CCSys.SIGTERM)
             }
             i = Add(i, 1)
         }
@@ -953,12 +927,12 @@ Function.CC_KillAllChildren {
             pid = Dereference(Add(CCRunState.child_pids, slot))
             IfCondition GreaterThan(pid, 0) ThenBlock: {
                 StoreValue(status_buf, 0)
-                wr = SystemCall(CCSys.SYS_WAIT4, pid, status_buf, 1, 0, 0)
+                wr = PlatformProc_Wait(pid, status_buf, 1)
                 // 1 = WNOHANG
                 IfCondition EqualTo(wr, 0) ThenBlock: {
                     // Child still alive — escalate to SIGKILL (the whole group).
-                    SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGKILL, 0, 0, 0)
-                    SystemCall(CCSys.SYS_KILL, Subtract(0, pid), CCSys.SIGKILL, 0, 0, 0)
+                    PlatformProc_Kill(pid, CCSys.SIGKILL)
+                    PlatformProc_Kill(Subtract(0, pid), CCSys.SIGKILL)
                 }
                 IfCondition EqualTo(wr, -10) ThenBlock: {
                     StoreValue(Add(CCRunState.child_pids, slot), 0)
@@ -978,7 +952,7 @@ Function.CC_KillAllChildren {
             pid = Dereference(Add(CCRunState.child_pids, slot))
             IfCondition GreaterThan(pid, 0) ThenBlock: {
                 StoreValue(status_buf, 0)
-                SystemCall(CCSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+                PlatformProc_Wait(pid, status_buf, 0)
                 StoreValue(Add(CCRunState.child_pids, slot), 0)
             }
             i = Add(i, 1)
@@ -1090,8 +1064,8 @@ Function.CC_KillIfOrphanTool {
                     j = Add(j, 1)
                 }
                 IfCondition And(EqualTo(saw, 1), EqualTo(pp, 1)) ThenBlock: {
-                    SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGKILL, 0, 0, 0)
-                    SystemCall(CCSys.SYS_KILL, Subtract(0, pid), CCSys.SIGKILL, 0, 0, 0)
+                    PlatformProc_Kill(pid, CCSys.SIGKILL)
+                    PlatformProc_Kill(Subtract(0, pid), CCSys.SIGKILL)
                     killed = 1
                 }
             }
@@ -1611,7 +1585,7 @@ Function.CC_RunTurn {
                 UI.ChatPrintDim(retry_msg)
             }
 
-            handle = HTTP.PostStream(url, headers, body, 10000, 900000)
+            handle = PlatformHTTP_PostStream(url, headers, body, 10000, 900000)
             IfCondition EqualTo(handle, 0) ThenBlock: {
                 Arena_ScratchEnd()
                 CC_DebugLog("HTTP.PostStream FAILED (curl spawn error).\n")
@@ -1726,6 +1700,7 @@ Function.CC_RunTurn {
 
             // Capture response status/diagnostics BEFORE CloseStream: the strings
             // point into the stream handle. -1 = unknown (e.g. interrupted).
+            PlatformHTTP_TakeStatus(handle)
             http_status = HTTP.GetStatus(handle)
             http_retry_after = HTTP.GetRetryAfter(handle)
             CC_CopyStrBounded(CCHttpDiag.buf, HTTP.GetRequestId(handle), 128)
@@ -1945,7 +1920,7 @@ Function.CC_RunTurn {
                             CC_DebugLog("[STEP H7] Allocating err_holder and calling IPCDispatch.Dispatch\n")
                             err_holder = Allocate(8)
                             StoreValue(err_holder, 0, "dword")
-                            content = IPCDispatch.Dispatch(tname, tinput, tid, err_holder)
+                            content = PlatformAgent_Dispatch(tname, tinput, tid, err_holder)
                             CC_DebugLog("[STEP H8] IPCDispatch.Dispatch returned!\n")
                             is_err = Dereference(err_holder, "dword")
                             Deallocate(err_holder, 8)
@@ -2168,7 +2143,7 @@ Function.CC_RunModelScraper {
         }
         IfCondition GreaterThan(sh_pid, 0) ThenBlock: {
             wstat = Allocate(8)
-            SystemCall(CCSys.SYS_WAIT4, sh_pid, wstat, 0, 0, 0)
+            PlatformProc_Wait(sh_pid, wstat, 0)
             Deallocate(wstat, 8)
         }
         CC_WriteStdout("\n  Provider model definitions refreshed successfully.\n\n")
@@ -4343,7 +4318,7 @@ Function.CC_RegisterToolsOnly {
         CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
         MemorySet(CCRunState.child_pids, 0, Multiply(CCConst.MAX_CHILDREN, 8))
         CCRunState.child_count = 0
-        proxy_ok = IPCDispatch.ConnectProxy()
+        proxy_ok = PlatformAgent_Attach()
         CC_AgentLog(StringConcat("[init] ConnectProxy=", NumberToString(proxy_ok)))
         IfCondition EqualTo(proxy_ok, 0) ThenBlock: {
             CC_AgentLog("[init] no AgentProxy — tools not attached")
@@ -4712,7 +4687,7 @@ Function.CC_ReapChildren {
             pid = Dereference(Add(CCRunState.child_pids, slot))
             IfCondition GreaterThan(pid, 0) ThenBlock: {
                 StoreValue(st, 0)
-                wr = SystemCall(CCSys.SYS_WAIT4, pid, st, 1, 0, 0)
+                wr = PlatformProc_Wait(pid, st, 1)
                 IfCondition GreaterThan(wr, 0) ThenBlock: {
                     StoreValue(Add(CCRunState.child_pids, slot), 0)
                 }
@@ -4775,7 +4750,7 @@ Function.CC_HostShutdown {
         st = Allocate(8)
         WhileLoop 1 {
             StoreValue(st, 0)
-            wr = SystemCall(CCSys.SYS_WAIT4, -1, st, 1, 0, 0)
+            wr = PlatformProc_Wait(Subtract(0, 1), st, 1)
             IfCondition LessEqual(wr, 0) ThenBlock: { BreakLoop }
         }
         Deallocate(st, 8)
@@ -4802,8 +4777,15 @@ Function.CC_RunHostMode {
         CC_WriteStdout("[host] StartProxy\n")
         IPCDispatch.StartProxy()
         IPCDState.host_ctl = CC_HostCtlOpen()
-        CC_WriteAppFile("/tmp/halcode_app/ready.txt", "1")
-        CC_WriteStdout("[host] ready.txt\n")
+        // The shell starts --agent about 2s after the host even when this
+        // file is missing. Writing it after a failed bind made the agent
+        // connect immediately to a socket that was never listening.
+        IfCondition GreaterEqual(IPCDState.proxy_listen_fd, 0) ThenBlock: {
+            CC_WriteAppFile("/tmp/halcode_app/ready.txt", "1")
+            CC_WriteStdout("[host] ready.txt\n")
+        } ElseBlock: {
+            CC_WriteStdout("[host] AgentProxy bind failed — ready.txt withheld\n")
+        }
         CC_RestorePgmemUi(0)
         CC_WritePickupSnapshot()
         CC_WriteStdout("[host] pgmem pickup written\n")
@@ -5051,7 +5033,7 @@ Function.CC_RunAgentMode {
         History.AppendUser(prompt)
 
         CC_AgentLog("[worker] CCFan init")
-        fan_ok = CCFan_Init()
+        fan_ok = PlatformFan_Init()
         fan_sum = 0
         IfCondition EqualTo(fan_ok, 1) ThenBlock: {
             fan_sum = CCFan_SelfTest()
@@ -5075,6 +5057,11 @@ Function.CC_RunAgentMode {
                 agent_keep_going = 0
             }
 
+            // A failed API call leaves the user prompt as the last message.
+            // Treating that as "tool results came back" retried the same
+            // dead request until the 25-turn cap and painted the drop
+            // string once per retry. Only continue after a successful turn.
+            IfCondition EqualTo(turn_ok, 1) ThenBlock: {
             // Tool results are appended as role:"user" messages by
             // Backend.AppendToolResultsToHistory. If the last history entry
             // has role "user", the model made tool calls this round and needs
@@ -5093,6 +5080,7 @@ Function.CC_RunAgentMode {
                     }
                 }
             }
+            }
             agent_turn = Add(agent_turn, 1)
         }
 
@@ -5100,18 +5088,9 @@ Function.CC_RunAgentMode {
             CC_AgentLog("[worker] WARNING: hit max turn cap (25) — stopping")
         }
 
-        CC_AgentLog("[worker] CCFan shutdown")
-        CCFan_Shutdown()
-
-        UI.Shutdown()
-
-        // Restore stdout before writing result
-        IfCondition GreaterEqual(saved_stdout, 0) ThenBlock: {
-            SystemCall(CCSys.SYS_DUP2, saved_stdout, 1, 0, 0, 0)
-            SystemCall(CCSys.SYS_CLOSE, saved_stdout, 0, 0, 0, 0)
-        }
-
-        // Walk history backward to find the last assistant message
+        // Reply file first. CCFan_Shutdown joins the workers, and a missed
+        // CHILD_CLEARTID leaves that join blocked. The desk paints reply.txt
+        // even if the process is still inside the join.
         msgs = History.GetMessagesArray()
         cnt = History.Count()
         i = Subtract(cnt, 1)
@@ -5142,6 +5121,18 @@ Function.CC_RunAgentMode {
         CC_WriteAppFile("/tmp/halcode_app/reply.tmp", result)
         SystemCall(CCSys.SYS_RENAME, "/tmp/halcode_app/reply.tmp", "/tmp/halcode_app/reply.txt", 0, 0, 0)
         CC_AgentLog("[worker] wrote reply.txt")
+
+        CC_AgentLog("[worker] CCFan shutdown")
+        PlatformFan_Shutdown()
+
+        UI.Shutdown()
+
+        // Restore stdout before writing the result to the terminal.
+        IfCondition GreaterEqual(saved_stdout, 0) ThenBlock: {
+            SystemCall(CCSys.SYS_DUP2, saved_stdout, 1, 0, 0, 0)
+            SystemCall(CCSys.SYS_CLOSE, saved_stdout, 0, 0, 0, 0)
+        }
+
         CC_AgentLog("[worker] think dump was during CC_SessionLogResponse (before Reset)")
         CC_WriteStdout(result)
         CC_WriteStdout("\n")
@@ -5517,9 +5508,11 @@ Function.CC_MCP_HandleToolsList {
 // fetch its schema, then kill it immediately. No persistent workers.
 Function.CC_MCP_BootSchemas {
     Body: {
-        CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
-        MemorySet(CCRunState.child_pids, 0, Multiply(CCConst.MAX_CHILDREN, 8))
-        CCRunState.child_count = 0
+        IfCondition EqualTo(CCRunState.child_pids, 0) ThenBlock: {
+            CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
+            MemorySet(CCRunState.child_pids, 0, Multiply(CCConst.MAX_CHILDREN, 8))
+            CCRunState.child_count = 0
+        }
         MCPToolTable.entries = Allocate(768)   // 32 slots × 24 bytes
         MemorySet(MCPToolTable.entries, 0, 768)
         MCPToolTable.count = 0
@@ -5562,10 +5555,10 @@ Function.CC_MCP_BootSchemas {
                     IfCondition GreaterThan(pid, 0) ThenBlock: {
                         IPCDispatch.RegisterTool(tnam, tsoc, bin)
                         // Kill this worker — we only needed its schema
-                        SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGTERM, 0, 0, 0)
+                        PlatformProc_Kill(pid, CCSys.SIGTERM)
                         _ws = Allocate(8)
                         StoreValue(_ws, 0)
-                        SystemCall(CCSys.SYS_WAIT4, pid, _ws, 0, 0, 0)
+                        PlatformProc_Wait(pid, _ws, 0)
                         Deallocate(_ws, 8)
                     }
                 }
@@ -5627,15 +5620,13 @@ Function.CC_MCP_DispatchOnDemand {
             ReturnValue(StringConcat("failed to launch: ", tname))
         }
 
-        // Connect to worker socket (retry loop — worker needs time to bind)
-        cfd = Socket.Create(1, 1)
+        // Connect to the worker. PlatformIPC_Connect retries with a new
+        // socket, or finds the Haiku port, on every attempt.
         attempts = 0
-        cr = -1
+        cfd = -1
         WhileLoop LessThan(attempts, 100) {
-            cr = Socket.ConnectUnix(cfd, tsoc)
-            IfCondition GreaterEqual(cr, 0) ThenBlock: { BreakLoop }
-            Socket.Close(cfd)
-            cfd = Socket.Create(1, 1)
+            cfd = PlatformIPC_Connect(tsoc)
+            IfCondition GreaterEqual(cfd, 0) ThenBlock: { BreakLoop }
             _ts = Allocate(16)
             StoreValue(Add(_ts, 0), 0)
             StoreValue(Add(_ts, 8), 100000000)
@@ -5643,10 +5634,10 @@ Function.CC_MCP_DispatchOnDemand {
             Deallocate(_ts, 16)
             attempts = Add(attempts, 1)
         }
-        IfCondition LessThan(cr, 0) ThenBlock: {
-            SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGKILL, 0, 0, 0)
+        IfCondition LessThan(cfd, 0) ThenBlock: {
+            PlatformProc_Kill(pid, CCSys.SIGKILL)
             _ws = Allocate(8) StoreValue(_ws, 0)
-            SystemCall(CCSys.SYS_WAIT4, pid, _ws, 0, 0, 0) Deallocate(_ws, 8)
+            PlatformProc_Wait(pid, _ws, 0) Deallocate(_ws, 8)
             StoreValue(out_is_error_ptr, 1, "dword")
             ReturnValue(StringConcat("connect failed: ", tname))
         }
@@ -5661,29 +5652,28 @@ Function.CC_MCP_DispatchOnDemand {
             JSON.SetObject(req, "args", targs)
         }
         req_str = JSON.SerializeObject(req)
-        sr = Socket.SendMsg(cfd, req_str)
+        sr = PlatformIPC_SendMsg(cfd, req_str)
         IfCondition LessThan(sr, 0) ThenBlock: {
-            Socket.Close(cfd)
-            SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGKILL, 0, 0, 0)
+            PlatformIPC_Close(cfd)
+            PlatformProc_Kill(pid, CCSys.SIGKILL)
             _ws = Allocate(8) StoreValue(_ws, 0)
-            SystemCall(CCSys.SYS_WAIT4, pid, _ws, 0, 0, 0) Deallocate(_ws, 8)
+            PlatformProc_Wait(pid, _ws, 0) Deallocate(_ws, 8)
             StoreValue(out_is_error_ptr, 1, "dword")
             ReturnValue(StringConcat("send failed: ", tname))
         }
 
-        // Wait for response with 60s timeout
-        Socket.SetRecvTimeout(cfd, 60000)
-        resp_str = Socket.RecvMsg(cfd)
-        Socket.Close(cfd)
+        PlatformIPC_SetRecvTimeout(cfd, 60000)
+        resp_str = PlatformIPC_RecvMsg(cfd)
+        PlatformIPC_Close(cfd)
 
         // Kill the worker
-        SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGTERM, 0, 0, 0)
+        PlatformProc_Kill(pid, CCSys.SIGTERM)
         _ws = Allocate(8) StoreValue(_ws, 0)
         // Non-blocking reap first
-        wr = SystemCall(CCSys.SYS_WAIT4, pid, _ws, 1, 0, 0)
+        wr = PlatformProc_Wait(pid, _ws, 1)
         IfCondition EqualTo(wr, 0) ThenBlock: {
-            SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGKILL, 0, 0, 0)
-            SystemCall(CCSys.SYS_WAIT4, pid, _ws, 0, 0, 0)
+            PlatformProc_Kill(pid, CCSys.SIGKILL)
+            PlatformProc_Wait(pid, _ws, 0)
         }
         Deallocate(_ws, 8)
         // Remove from child_pids tracking
@@ -5829,15 +5819,10 @@ SubRoutine.Main {
     // SIGTERM: external kill -15 is ignored; use /quit or kill -9 to force exit.
     // Without SIGINT/SIGTERM ignored, the process dies before CC_KillAllChildren
     // can reap children, leaving zombie tool services.
-    sigact = Allocate(32)
-    StoreValue(Add(sigact, 0), 1)    // sa_handler = SIG_IGN (1)
-    StoreValue(Add(sigact, 8), 0)    // sa_flags = 0
-    StoreValue(Add(sigact, 16), 0)   // sa_restorer = 0
-    StoreValue(Add(sigact, 24), 0)   // sa_mask = 0
-    SystemCall(13, 13, sigact, 0, 8, 0)  // rt_sigaction(SIGPIPE=13, &act, NULL, 8)
-    SystemCall(13, 2, sigact, 0, 8, 0)   // rt_sigaction(SIGINT=2,  &act, NULL, 8)
-    SystemCall(13, 15, sigact, 0, 8, 0)  // rt_sigaction(SIGTERM=15, &act, NULL, 8)
-    Deallocate(sigact, 32)
+    // SIG_IGN. PlatformSignal writes the same rt_sigaction record.
+    PlatformSignal_Ignore(13)
+    PlatformSignal_Ignore(2)
+    PlatformSignal_Ignore(15)
 
     // MCP server mode: ./HalCode9000.x --mcp
     // On-demand architecture: workers are spawned per tool call and killed after.
@@ -5846,14 +5831,8 @@ SubRoutine.Main {
     IfCondition EqualTo(mcp_flag, 1) ThenBlock: {
         // Restore default SIGINT/SIGTERM so Claude Code can kill us cleanly.
         // MCP mode has no persistent children to protect.
-        mcp_sigact = Allocate(32)
-        StoreValue(Add(mcp_sigact, 0), 0)    // sa_handler = SIG_DFL (0)
-        StoreValue(Add(mcp_sigact, 8), 0)
-        StoreValue(Add(mcp_sigact, 16), 0)
-        StoreValue(Add(mcp_sigact, 24), 0)
-        SystemCall(13, 2, mcp_sigact, 0, 8, 0)   // rt_sigaction(SIGINT=2)
-        SystemCall(13, 15, mcp_sigact, 0, 8, 0)  // rt_sigaction(SIGTERM=15)
-        Deallocate(mcp_sigact, 32)
+        PlatformSignal_Default(2)
+        PlatformSignal_Default(15)
 
         CC_ChdirToBinDir()
         CC_KillStaleTools()
@@ -5889,14 +5868,8 @@ SubRoutine.Main {
     // Boots cc_tools + AgentProxy like the TUI, pickups pgmem, stays up.
     host_flag = CC_HasArg("--host")
     IfCondition EqualTo(host_flag, 1) ThenBlock: {
-        host_sigact = Allocate(32)
-        StoreValue(Add(host_sigact, 0), 0)
-        StoreValue(Add(host_sigact, 8), 0)
-        StoreValue(Add(host_sigact, 16), 0)
-        StoreValue(Add(host_sigact, 24), 0)
-        SystemCall(13, 2, host_sigact, 0, 8, 0)
-        SystemCall(13, 15, host_sigact, 0, 8, 0)
-        Deallocate(host_sigact, 32)
+        PlatformSignal_Default(2)
+        PlatformSignal_Default(15)
         CC_RunHostMode()
         SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
     }
@@ -5905,14 +5878,8 @@ SubRoutine.Main {
     // Must be detected before the splash so nothing writes to stdout.
     agent_spec = CC_ReadArgValue("--agent")
     IfCondition NotEqual(agent_spec, 0) ThenBlock: {
-        ag_sig = Allocate(32)
-        StoreValue(Add(ag_sig, 0), 0)
-        StoreValue(Add(ag_sig, 8), 0)
-        StoreValue(Add(ag_sig, 16), 0)
-        StoreValue(Add(ag_sig, 24), 0)
-        SystemCall(13, 2, ag_sig, 0, 8, 0)
-        SystemCall(13, 15, ag_sig, 0, 8, 0)
-        Deallocate(ag_sig, 32)
+        PlatformSignal_Default(2)
+        PlatformSignal_Default(15)
         CC_AgentLog("[init] agent mode detected SIGTERM=DFL")
         prompt_buf = Allocate(CCConst.INPUT_BUF_SZ)
         CC_AgentLog("[init] reading stdin")
@@ -5924,6 +5891,9 @@ SubRoutine.Main {
         }
         CC_AgentLog("[init] CC_SetupAgentProvider")
         cred = CC_SetupAgentProvider(agent_spec)
+        cred_n = 0
+        IfCondition NotEqual(cred, 0) ThenBlock: { cred_n = StringLength(cred) }
+        CC_AgentLog(StringConcat("[init] cred bytes=", NumberToString(cred_n)))
         CC_AgentLog("[init] SYSTEM_PROMPT assign")
         CCConst.SYSTEM_PROMPT = CC_EnsureSystemPrompt()
         CC_AgentLog("[init] History.Init")

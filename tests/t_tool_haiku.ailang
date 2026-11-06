@@ -1,0 +1,165 @@
+// Spawn one native tool, ask for its schema, then one call.
+// argv: tool_path port_name file_path needle
+// file_path "-" does schema only. Exit 2 if that port already exists.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
+
+LibraryImport.Arena
+LibraryImport.JSON
+Import.Platform.ProcHaiku
+Import.Platform.IPCHaiku
+
+Function.ToolHas {
+    Input: hay: Address
+    Input: needle: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(hay, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(needle, 0) ThenBlock: { ReturnValue(0) }
+        hl = StringLength(hay)
+        nl = StringLength(needle)
+        IfCondition GreaterThan(nl, hl) ThenBlock: { ReturnValue(0) }
+        last = Subtract(hl, nl)
+        i = 0
+        WhileLoop LessEqual(i, last) {
+            j = 0
+            ok = 1
+            WhileLoop LessThan(j, nl) {
+                idx = Add(i, j)
+                hb = GetByte(hay, idx)
+                nb = GetByte(needle, j)
+                IfCondition NotEqual(hb, nb) ThenBlock: { ok = 0 }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(ok, 1) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+SubRoutine.Main {
+    IfCondition LessThan(HaikuRT.argc, 5) ThenBlock: { ProcessExit(9) }
+    p1 = Add(HaikuRT.argv, 8)
+    tool = Dereference(p1)
+    p2 = Add(HaikuRT.argv, 16)
+    port = Dereference(p2)
+    p3 = Add(HaikuRT.argv, 24)
+    fpath = Dereference(p3)
+    p4 = Add(HaikuRT.argv, 32)
+    needle = Dereference(p4)
+
+    existing = PlatformIPC_Connect(port)
+    IfCondition GreaterThan(existing, 0) ThenBlock: { ProcessExit(2) }
+
+    argv = Allocate(32)
+    StoreValue(argv, tool)
+    StoreValue(Add(argv, 8), 0)
+    envp = Allocate(8)
+    StoreValue(envp, 0)
+    pid = PlatformProc_SpawnWorker(tool, argv, envp)
+    IfCondition LessThan(pid, 1) ThenBlock: { ProcessExit(1) }
+
+    ts = Allocate(16)
+    StoreValue(ts, 0)
+    StoreValue(Add(ts, 8), 50000000)
+    fd = 0
+    ok = 0
+    tries = 0
+    WhileLoop LessThan(tries, 40) {
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            fd = PlatformIPC_Connect(port)
+            IfCondition GreaterThan(fd, 0) ThenBlock: { ok = 1 }
+            IfCondition LessEqual(fd, 0) ThenBlock: {
+                SystemCall(35, ts, 0, 0, 0, 0)
+            }
+        }
+        tries = Add(tries, 1)
+    }
+    grp = Subtract(0, pid)
+    IfCondition EqualTo(ok, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(3)
+    }
+
+    req = JSON.NewObject()
+    JSON.SetString(req, "method", "schema")
+    s = JSON.SerializeObject(req)
+    PlatformIPC_SendMsg(fd, s)
+    resp = PlatformIPC_RecvMsg(fd)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(4)
+    }
+    parsed = ParseJSON(resp)
+    IfCondition EqualTo(parsed, 0) ThenBlock: {
+        PrintMessage(resp)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+    obj = JSON.AsObject(parsed)
+    method = JSON.GetString(obj, "method")
+    IfCondition EqualTo(method, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+    cmp = StringCompare(method, "schema_response")
+    IfCondition NotEqual(cmp, 0) ThenBlock: {
+        PrintMessage(resp)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(5)
+    }
+
+    skip = GetByte(fpath, 0)
+    IfCondition EqualTo(skip, 45) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        st = Allocate(8)
+        StoreValue(st, 99)
+        wr = PlatformProc_Wait(pid, st, 0)
+        IfCondition LessThan(wr, 1) ThenBlock: { ProcessExit(8) }
+        PrintMessage("SCHEMA_OK\n")
+        ProcessExit(0)
+    }
+
+    req2 = JSON.NewObject()
+    JSON.SetString(req2, "method", "call")
+    JSON.SetString(req2, "id", "t1")
+    args = JSON.NewObject()
+    JSON.SetString(args, "path", fpath)
+    JSON.SetObject(req2, "args", args)
+    s2 = JSON.SerializeObject(req2)
+    PlatformIPC_SendMsg(fd, s2)
+    resp2 = PlatformIPC_RecvMsg(fd)
+    IfCondition EqualTo(resp2, 0) ThenBlock: {
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(6)
+    }
+    parsed2 = ParseJSON(resp2)
+    IfCondition EqualTo(parsed2, 0) ThenBlock: {
+        PrintMessage(resp2)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(6)
+    }
+    obj2 = JSON.AsObject(parsed2)
+    content = JSON.GetString(obj2, "content")
+    found = ToolHas(content, needle)
+    IfCondition NotEqual(found, 1) ThenBlock: {
+        PrintMessage(resp2)
+        PrintMessage("\n")
+        PlatformProc_Kill(grp, 15)
+        ProcessExit(7)
+    }
+
+    PlatformProc_Kill(grp, 15)
+    st2 = Allocate(8)
+    StoreValue(st2, 99)
+    wr2 = PlatformProc_Wait(pid, st2, 0)
+    IfCondition LessThan(wr2, 1) ThenBlock: { ProcessExit(8) }
+    PrintMessage("TOOL_OK\n")
+    ProcessExit(0)
+}
+
+RunTask(Main)
